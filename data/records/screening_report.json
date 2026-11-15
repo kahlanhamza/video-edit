@@ -1,0 +1,74 @@
+{
+  "raw_mcneil_jax": {
+    "watermark": false,
+    "detail": "Agency on-screen graphics only: Axon Fleet timestamp + JSO unit graphics = part of raw feed"
+  },
+  "raw_tiger_dui_2017": {
+    "watermark": false,
+    "detail": "Raw dashcam with agency timestamp overlay; no third-party marks"
+  },
+  "raw_okchief_dui": {
+    "watermark": false,
+    "detail": "Raw dashcam; agency overlays only"
+  },
+  "raw_stop_sep13_p1": {
+    "watermark": false,
+    "detail": "Raw bodycam; agency overlays only"
+  },
+  "raw_stop_sep13_p2": {
+    "watermark": false,
+    "detail": "Raw bodycam; agency overlays only"
+  },
+  "raw_gibson_arrest": {
+    "watermark": false,
+    "detail": "Clean of third-party marks BUT VLM flagged baked-in text narration (agency title cards) at t=25s; DROPPED from pool per ADR-0002 raw-only"
+  },
+  "raw_mcneil_dup_v1": {
+    "watermark": true,
+    "detail": "rejected (round-1 POLICE ACTIVITY)"
+  },
+  "raw_pit_maneuver": {
+    "watermark": true,
+    "detail": "POLICE ACTIVITY channel logo bottom-right on all frames"
+  },
+  "raw_drunk_teen_crash": {
+    "watermark": true,
+    "detail": "POLICE ACTIVITY logo w/ shark icon"
+  },
+  "raw_wi_il_100mph": {
+    "watermark": true,
+    "detail": "POLICE ACTIVITY logo + City of Pleasant Prairie PD"
+  },
+  "raw_yanked_out": {
+    "watermark": true,
+    "detail": "POLICE ACTIVITY logo"
+  },
+  "raw_limo_chase": {
+    "watermark": true,
+    "detail": "POLICE ACTIVITY logo above raw dashcam timestamp"
+  },
+  "raw_tvi_crash": {
+    "watermark": true,
+    "detail": "POLICE ACTIVITY logo + Moore PD emblem"
+  },
+  "raw_santiago_arrest": {
+    "watermark": true,
+    "detail": "'PRODUCED BY MARION COUNTY SHERIFF'S OFFICE' added titles"
+  },
+  "raw_eustis_cop": {
+    "watermark": true,
+    "detail": "third-party watermark"
+  },
+  "raw_tiger_2026": {
+    "watermark": true,
+    "detail": "third-party watermark"
+  },
+  "raw_tiktok_challenge": {
+    "watermark": true,
+    "detail": "third-party watermark"
+  },
+  "raw_woods_domestic": {
+    "watermark": true,
+    "detail": "third-party watermark"
+  }
+}
