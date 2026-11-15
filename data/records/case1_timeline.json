@@ -1,4 +1,5 @@
 {
+  "v": 10,
   "timeline": [
     {
       "type": "hook",
@@ -23,11 +24,12 @@
       },
       "narr_offset": 0.3,
       "speed": 0.45,
-      "in": 289.8,
-      "out": 295.64555625,
-      "out_dur": 13.790125000000002,
+      "in": 290.0,
+      "out": 296.20555625,
+      "out_dur": 13.79,
       "punch": true,
       "grade": "eq=saturation=0.88:contrast=1.05",
+      "motion": 28.083,
       "note": "cold open over hook: officers restraining person with dreadlocks on ground",
       "t0": 3.5,
       "dur": 13.79
@@ -35,15 +37,15 @@
     {
       "type": "forward",
       "clip_i": 0,
-      "in": 295.64555625,
-      "out": 319.64555625,
+      "in": 296.2055,
+      "out": 306.2055,
       "note": "act entry",
       "t0": 17.29,
-      "dur": 24.0,
+      "dur": 10.0,
       "lowerthird": "Jacksonville Sheriff's Office | Jacksonville, Florida"
     },
     {
-      "type": "replay",
+      "type": "flashback",
       "clip_i": 0,
       "name": "beat_1",
       "narr": {
@@ -54,23 +56,25 @@
         "text": "The Jacksonville Sheriff's cruiser approaches an SUV stopped on the road. The officer has initiated a traffic stop, likely for suspected phone use while driving. The situation appears routine at this stage, just another interaction between law enforcement and a motorist."
       },
       "narr_offset": 0.3,
-      "speed": 0.45,
-      "in": 320.64555625,
-      "out": 329.31100000000004,
-      "out_dur": 20.056541666666668,
+      "speed": 0.75,
+      "in": 38.0,
+      "out": 53.04240625,
+      "out_dur": 20.057,
       "punch": true,
-      "grade": "eq=saturation=0.88:contrast=1.05",
-      "note": "cue 'officer in vehicle approaching stopped SUV' -> officer in vehicle approaching stopped SUV on road (hits=3)",
-      "t0": 41.29,
+      "grade": "eq=saturation=0.45:contrast=1.02,colorbalance=bs=0.12:bm=0.05",
+      "motion": 22.15,
+      "note": "cue 'officer in vehicle approaching stopped SUV' -> officer in vehicle approaching stopped SUV on road (hits=3) [rewind]",
+      "t0": 27.29,
       "dur": 20.057
     },
     {
       "type": "forward",
       "clip_i": 0,
-      "in": 329.31100000000004,
-      "out": 351.31100000000004,
-      "t0": 61.347,
-      "dur": 22.0
+      "in": 53.04275,
+      "out": 63.04275,
+      "note": "resume",
+      "t0": 47.347,
+      "dur": 10.0
     },
     {
       "type": "replay",
@@ -84,23 +88,25 @@
         "text": "The SUV comes to a complete stop beside the police vehicle with flashing lights activated. Both vehicles are positioned on the roadside, creating the standard setup for a traffic stop. The driver remains inside the vehicle as the officer prepares to approach."
       },
       "narr_offset": 0.3,
-      "speed": 0.45,
-      "in": 352.31100000000004,
-      "out": 362.32685625000005,
-      "out_dur": 23.057458333333333,
+      "speed": 0.75,
+      "in": 228.0,
+      "out": 245.29309375,
+      "out_dur": 23.057,
       "punch": true,
       "grade": "eq=saturation=0.88:contrast=1.05",
+      "motion": 16.419,
       "note": "cue 'vehicle stopped beside police car' -> vehicle stopped beside police car with flashing lights (hits=2)",
-      "t0": 83.347,
+      "t0": 57.347,
       "dur": 23.057
     },
     {
       "type": "forward",
       "clip_i": 0,
-      "in": 362.32685625000005,
-      "out": 384.32685625000005,
-      "t0": 106.404,
-      "dur": 22.0
+      "in": 245.29275,
+      "out": 255.29275,
+      "note": "resume",
+      "t0": 80.404,
+      "dur": 10.0
     },
     {
       "type": "replay",
@@ -114,26 +120,28 @@
         "text": "The officer opens the driver's door during the traffic stop. This is a critical moment where the interaction could go either way peacefully or escalate. The driver's response will determine the path this encounter takes."
       },
       "narr_offset": 0.3,
-      "speed": 0.45,
-      "in": 385.32685625000005,
-      "out": 394.92991250000006,
-      "out_dur": 22.140125,
+      "speed": 0.75,
+      "in": 279.0,
+      "out": 295.60509375,
+      "out_dur": 22.14,
       "punch": true,
       "grade": "eq=saturation=0.88:contrast=1.05",
+      "motion": 33.9,
       "note": "cue 'officer opens car door' -> officer opens car door during traffic stop (hits=2)",
-      "t0": 128.404,
+      "t0": 90.404,
       "dur": 22.14
     },
     {
       "type": "forward",
       "clip_i": 0,
-      "in": 394.92991250000006,
-      "out": 414.043,
-      "t0": 150.544,
-      "dur": 19.113
+      "in": 295.605,
+      "out": 305.605,
+      "note": "resume",
+      "t0": 112.544,
+      "dur": 10.0
     },
     {
-      "type": "replay",
+      "type": "flashback",
       "clip_i": 0,
       "name": "beat_4",
       "narr": {
@@ -144,24 +152,34 @@
         "text": "Officers are now restraining a person with dreadlocks on the ground. The situation has clearly escalated from a simple traffic stop to a physical altercation. Multiple officers are involved in controlling the individual who was initially behind the wheel."
       },
       "narr_offset": 0.3,
-      "speed": 0.45,
-      "in": 412.043,
-      "out": 414.043,
-      "out_dur": 19.636791666666667,
+      "speed": 0.75,
+      "in": 290.0,
+      "out": 304.72759375,
+      "out_dur": 19.637,
       "punch": true,
-      "grade": "eq=saturation=0.88:contrast=1.05",
-      "note": "cue 'officers restraining person with dreadlocks' -> officers restraining person with dreadlocks on ground (hits=3)",
-      "t0": 169.657,
+      "grade": "eq=saturation=0.45:contrast=1.02,colorbalance=bs=0.12:bm=0.05",
+      "motion": 28.083,
+      "note": "cue 'officers restraining person with dreadlocks' -> officers restraining person with dreadlocks on ground (hits=3) [rewind]",
+      "t0": 122.544,
       "dur": 19.637
+    },
+    {
+      "type": "forward",
+      "clip_i": 0,
+      "in": 304.72775,
+      "out": 316.72775,
+      "note": "resume",
+      "t0": 142.181,
+      "dur": 12.0
     },
     {
       "type": "forward",
       "clip_i": 1,
       "in": 219.0,
-      "out": 243.0,
+      "out": 229.0,
       "note": "act entry",
-      "t0": 189.294,
-      "dur": 24.0,
+      "t0": 154.181,
+      "dur": 10.0,
       "lowerthird": "Jupiter Police Department | Jupiter, Florida"
     },
     {
@@ -176,23 +194,25 @@
         "text": "A world-famous golfer is found asleep at the wheel of a damaged Mercedes. The officer has arrived on scene to investigate what appears to be a possible DUI situation. The famous athlete's career has been built on precision, yet here he is in a vulnerable position."
       },
       "narr_offset": 0.3,
-      "speed": 0.45,
+      "speed": 1.0,
       "in": 273.0,
-      "out": 283.1224875,
-      "out_dur": 23.294416666666667,
+      "out": 296.2944166666667,
+      "out_dur": 23.294,
       "punch": true,
       "grade": "eq=saturation=0.88:contrast=1.05",
+      "motion": 0.985,
       "note": "cue 'officer speaks with man on roadside' -> officer speaks with man on roadside at night (hits=2)",
-      "t0": 213.294,
+      "t0": 164.181,
       "dur": 23.294
     },
     {
       "type": "forward",
       "clip_i": 1,
-      "in": 283.1224875,
-      "out": 305.1224875,
-      "t0": 236.588,
-      "dur": 22.0
+      "in": 296.294,
+      "out": 306.294,
+      "note": "resume",
+      "t0": 187.475,
+      "dur": 10.0
     },
     {
       "type": "replay",
@@ -206,23 +226,25 @@
         "text": "The man approaches the officer standing on the dark roadside. The golfer seems cooperative at this stage, though the damaged vehicle suggests something has already occurred. The officer is likely gathering basic information about what happened."
       },
       "narr_offset": 0.3,
-      "speed": 0.45,
+      "speed": 1.0,
       "in": 329.0,
-      "out": 336.68339375,
-      "out_dur": 17.874208333333335,
+      "out": 346.87420833333334,
+      "out_dur": 17.874,
       "punch": true,
       "grade": "eq=saturation=0.88:contrast=1.05",
+      "motion": 1.112,
       "note": "cue 'man approaches officer standing' -> man approaches officer standing on dark roadside (hits=2)",
-      "t0": 258.588,
+      "t0": 197.475,
       "dur": 17.874
     },
     {
       "type": "forward",
       "clip_i": 1,
-      "in": 336.68339375,
-      "out": 358.68339375,
-      "t0": 276.462,
-      "dur": 22.0
+      "in": 346.874,
+      "out": 356.874,
+      "note": "resume",
+      "t0": 215.349,
+      "dur": 10.0
     },
     {
       "type": "replay",
@@ -236,26 +258,28 @@
         "text": "The officer stands on the roadside near the man at night. The famous golfer's career has been defined by his ability to control his body and movements with incredible precision. Now he's being asked to perform basic coordination tests."
       },
       "narr_offset": 0.3,
-      "speed": 0.45,
+      "speed": 1.0,
       "in": 643.0,
-      "out": 653.96273125,
-      "out_dur": 25.161625,
+      "out": 668.161625,
+      "out_dur": 25.162,
       "punch": true,
       "grade": "eq=saturation=0.88:contrast=1.05",
+      "motion": 1.24,
       "note": "cue 'officer stands on roadside near man' -> officer stands on roadside near man at night (hits=2)",
-      "t0": 298.462,
+      "t0": 225.349,
       "dur": 25.162
     },
     {
       "type": "forward",
       "clip_i": 1,
-      "in": 653.96273125,
-      "out": 675.96273125,
-      "t0": 323.624,
-      "dur": 22.0
+      "in": 668.162,
+      "out": 678.162,
+      "note": "resume",
+      "t0": 250.511,
+      "dur": 10.0
     },
     {
-      "type": "replay",
+      "type": "flashback",
       "clip_i": 1,
       "name": "beat_8",
       "narr": {
@@ -266,23 +290,25 @@
         "text": "The officer stands beside the man on the dark roadside. They're likely discussing the field sobriety tests that will determine the next steps. The golfer's reputation for control makes this situation particularly ironic, given the circumstances."
       },
       "narr_offset": 0.3,
-      "speed": 0.45,
-      "in": 676.96273125,
-      "out": 686.02145625,
-      "out_dur": 20.930500000000002,
+      "speed": 1.0,
+      "in": 655.0,
+      "out": 675.9305,
+      "out_dur": 20.931,
       "punch": true,
-      "grade": "eq=saturation=0.88:contrast=1.05",
-      "note": "cue 'officer stands beside man' -> officer stands beside man on dark roadside (hits=1)",
-      "t0": 345.624,
+      "grade": "eq=saturation=0.45:contrast=1.02,colorbalance=bs=0.12:bm=0.05",
+      "motion": 0.526,
+      "note": "cue 'officer stands beside man' -> officer stands beside man on dark roadside (hits=1) [rewind]",
+      "t0": 260.511,
       "dur": 20.931
     },
     {
       "type": "forward",
       "clip_i": 1,
-      "in": 686.02145625,
-      "out": 708.02145625,
-      "t0": 366.555,
-      "dur": 22.0
+      "in": 675.931,
+      "out": 685.931,
+      "note": "resume",
+      "t0": 281.442,
+      "dur": 10.0
     },
     {
       "type": "replay",
@@ -296,32 +322,34 @@
         "text": "Officers are now detaining a handcuffed man at night. The famous golfer who once commanded millions in endorsements is now in custody. The tests have been administered, and the results have led to this moment of detention."
       },
       "narr_offset": 0.3,
-      "speed": 0.45,
+      "speed": 1.0,
       "in": 1667.0,
-      "out": 1675.93953125,
-      "out_dur": 20.665625000000002,
+      "out": 1687.665625,
+      "out_dur": 20.666,
       "punch": true,
       "grade": "eq=saturation=0.88:contrast=1.05",
+      "motion": 2.579,
       "note": "cue 'officers detain handcuffed man' -> officers detain handcuffed man at night (hits=3)",
-      "t0": 388.555,
+      "t0": 291.442,
       "dur": 20.666
     },
     {
       "type": "forward",
       "clip_i": 1,
-      "in": 1675.93953125,
-      "out": 1705.6395312500001,
-      "t0": 409.221,
-      "dur": 29.7
+      "in": 1687.666,
+      "out": 1699.666,
+      "note": "resume",
+      "t0": 312.108,
+      "dur": 12.0
     },
     {
       "type": "forward",
       "clip_i": 2,
       "in": 0.0,
-      "out": 24.0,
+      "out": 10.0,
       "note": "act entry",
-      "t0": 438.921,
-      "dur": 24.0,
+      "t0": 324.108,
+      "dur": 10.0,
       "lowerthird": "LeFlore County law enforcement | LeFlore County, Oklahoma"
     },
     {
@@ -336,23 +364,25 @@
         "text": "A small-town police chief is pulled over by a state trooper. The man who once enforced the law now finds himself on the receiving end of a traffic stop. The irony isn't lost on anyone witnessing this exchange between two law enforcement officers."
       },
       "narr_offset": 0.3,
-      "speed": 0.45,
-      "in": 25.0,
-      "out": 33.12533125,
-      "out_dur": 18.856291666666667,
+      "speed": 1.0,
+      "in": 15.0,
+      "out": 33.856291666666664,
+      "out_dur": 18.856,
       "punch": true,
       "grade": "eq=saturation=0.88:contrast=1.05",
+      "motion": 2.479,
       "note": "cue 'person leaning into vehicle back seat' -> person leaning into vehicle back seat area (hits=4)",
-      "t0": 462.921,
+      "t0": 334.108,
       "dur": 18.856
     },
     {
       "type": "forward",
       "clip_i": 2,
-      "in": 33.12533125,
-      "out": 55.12533125,
-      "t0": 481.777,
-      "dur": 22.0
+      "in": 33.856,
+      "out": 43.856,
+      "note": "resume",
+      "t0": 352.964,
+      "dur": 10.0
     },
     {
       "type": "replay",
@@ -366,23 +396,25 @@
         "text": "The man in the purple shirt sits in a patrol car beside the trooper. The police chief is now in the back seat of the vehicle he might normally patrol. The tables have turned dramatically in this small Oklahoma community."
       },
       "narr_offset": 0.3,
-      "speed": 0.45,
+      "speed": 1.0,
       "in": 572.0,
-      "out": 581.4626,
+      "out": 593.828,
       "out_dur": 21.828,
       "punch": true,
       "grade": "eq=saturation=0.88:contrast=1.05",
+      "motion": 2.608,
       "note": "cue 'man in purple shirt sits in patrol car' -> man in purple shirt sits in patrol car beside trooper (hits=4)",
-      "t0": 503.777,
+      "t0": 362.964,
       "dur": 21.828
     },
     {
       "type": "forward",
       "clip_i": 2,
-      "in": 581.4626,
-      "out": 603.4626,
-      "t0": 525.605,
-      "dur": 22.0
+      "in": 593.828,
+      "out": 603.828,
+      "note": "resume",
+      "t0": 384.792,
+      "dur": 10.0
     },
     {
       "type": "replay",
@@ -396,23 +428,25 @@
         "text": "The camera views the empty rear seats of the patrol vehicle. The handcuffed police chief sits quietly beside the trooper who has stopped him. The silence in the vehicle speaks volumes about the gravity of this situation."
       },
       "narr_offset": 0.3,
-      "speed": 0.45,
+      "speed": 1.0,
       "in": 659.0,
-      "out": 669.91964375,
-      "out_dur": 25.065875000000002,
+      "out": 684.065875,
+      "out_dur": 25.066,
       "punch": true,
       "grade": "eq=saturation=0.88:contrast=1.05",
+      "motion": 0.102,
       "note": "cue 'camera views empty rear seats' -> camera views empty rear seats of patrol vehicle (hits=4)",
-      "t0": 547.605,
+      "t0": 394.792,
       "dur": 25.066
     },
     {
       "type": "forward",
       "clip_i": 2,
-      "in": 669.91964375,
-      "out": 691.91964375,
-      "t0": 572.671,
-      "dur": 22.0
+      "in": 684.066,
+      "out": 694.066,
+      "note": "resume",
+      "t0": 419.858,
+      "dur": 10.0
     },
     {
       "type": "replay",
@@ -426,23 +460,25 @@
         "text": "The handcuffed man sits in the patrol car beside the trooper. The police chief who once administered field sobriety tests is now being evaluated by his peers. The roles have completely reversed in this unexpected encounter."
       },
       "narr_offset": 0.3,
-      "speed": 0.45,
+      "speed": 1.0,
       "in": 1525.0,
-      "out": 1532.84224375,
-      "out_dur": 18.227208333333333,
+      "out": 1543.2272083333332,
+      "out_dur": 18.227,
       "punch": true,
       "grade": "eq=saturation=0.88:contrast=1.05",
+      "motion": 1.147,
       "note": "cue 'handcuffed man sits in patrol car' -> handcuffed man sits in patrol car beside trooper (hits=3)",
-      "t0": 594.671,
+      "t0": 429.858,
       "dur": 18.227
     },
     {
       "type": "forward",
       "clip_i": 2,
-      "in": 1532.84224375,
-      "out": 1554.84224375,
-      "t0": 612.898,
-      "dur": 22.0
+      "in": 1543.227,
+      "out": 1553.227,
+      "note": "resume",
+      "t0": 448.085,
+      "dur": 10.0
     },
     {
       "type": "replay",
@@ -456,30 +492,30 @@
         "text": "The handcuffed man checks his phone beside the trooper in the vehicle. Even in custody, the police chief maintains a degree of composure, attending to his phone. The troober watches, maintaining control of the situation that has unfolded."
       },
       "narr_offset": 0.3,
-      "speed": 0.45,
+      "speed": 1.0,
       "in": 2454.0,
-      "out": 2463.95113125,
-      "out_dur": 22.913625,
+      "out": 2476.913625,
+      "out_dur": 22.914,
       "punch": true,
       "grade": "eq=saturation=0.88:contrast=1.05",
+      "motion": 2.718,
       "note": "cue 'handcuffed man checks phone' -> handcuffed man checks phone beside trooper in vehicle (hits=3)",
-      "t0": 634.898,
+      "t0": 458.085,
       "dur": 22.914
     },
     {
       "type": "forward",
       "clip_i": 2,
-      "in": 2463.95113125,
-      "out": 2493.6511312499997,
-      "t0": 657.812,
-      "dur": 29.7
+      "in": 2476.914,
+      "out": 2488.914,
+      "note": "resume",
+      "t0": 480.999,
+      "dur": 12.0
     },
     {
       "type": "outro_replay",
       "clip_i": 2,
-      "in": 659.0,
-      "out": 670.77693125,
-      "out_dur": 28.170958333333335,
+      "name": "outro",
       "narr": {
         "name": "outro",
         "path": "/home/z/my-project/download/video-edit/output/audio/case1_outro.wav",
@@ -488,29 +524,33 @@
         "text": "Three different encounters, three different outcomes, all following a similar pattern. What begins as a routine traffic stop can escalate quickly when communication breaks down. Remember, everyone shown in these videos is presumed innocent until proven guilty in a court of law."
       },
       "narr_offset": 0.3,
-      "speed": 0.45,
+      "speed": 1.0,
+      "in": 15.0,
+      "out": 44.471000000000004,
+      "out_dur": 29.471,
       "punch": true,
       "grade": "eq=saturation=0.88:contrast=1.05",
-      "note": "outro over: camera views empty rear seats of patrol vehicle",
-      "t0": 687.512,
-      "dur": 28.171
+      "motion": 2.768,
+      "note": "outro over: person leaning into vehicle back seat area",
+      "t0": 492.999,
+      "dur": 29.471
     }
   ],
   "chapters": [
     {
       "clip": 1,
       "t_video": 17.3,
-      "t_source": 319.6
+      "t_source": 306.2
     },
     {
       "clip": 2,
-      "t_video": 189.3,
-      "t_source": 243.0
+      "t_video": 154.2,
+      "t_source": 229.0
     },
     {
       "clip": 3,
-      "t_video": 438.9,
-      "t_source": 24.0
+      "t_video": 324.1,
+      "t_source": 10.0
     }
   ]
 }

@@ -49,19 +49,25 @@ REPLAY_SPEED = 0.75            # muted narration replay — subtle, interpolated
 DEEP_SPEED = 0.45              # hook cold-open + flashback only
 FLASHBACK_SPEED = 0.45
 MIN_SPEED = 0.30               # speed-ladder floor (absorbs narration w/o pads)
-MOTION_FLOOR = 0.08            # below this a window plays REAL-TIME muted:
-                               # never slow-motion a still scene
+MOTION_FLOOR = 4.5             # raw 160x90 gray mean-diff/sec scale (0-255).
+                               # MEDIAN of 3s slices below this -> the window has
+                               # sustained stillness -> plays REAL-TIME muted
+                               # (never slow-motion a still scene, ADR-0011).
+                               # Calibrated on measured windows: real motion
+                               # scenes score 15-60, frozen scenes 0.1-1.1.
 MAX_FREEZE = 1.2               # frame-clone pad cap (v0.1.0 had 15.2s!)
 GAP_MAX = 12.0                 # silent forward stretches capped (was 30s)
 HOOK_SEC = 3.5                 # raw catchable opener, audio ON
 NARR_OFFSET = 0.3              # narration starts N sec into its replay
 FREEZE_GRADE = "eq=saturation=0.88:contrast=1.05"
 FLASHBACK_GRADE = ("eq=saturation=0.45:contrast=1.02,"
-                   "colorbalance=bs=0.12:ms=0.05")
+                   "colorbalance=bs=0.12:bm=0.05")
 PUNCH = 1.07                   # static punch-in for replay/flashback
 NO_CARDS = True                # ADR-0004: zero full-screen text cards
 SMOOTH_DUP_PCT = 15.0          # gate: max % near-identical consecutive frames
                                # inside any replay segment of the OUTPUT
+INTERP_PROVIDER = "framerate"  # ADR-0012; "rife" is phase-2 (issue #8)
+AUDIO_FADE = 0.03              # video-use pattern: 30ms fades kill concat pops
 
 # ---------------------------------------------------------------- voice (M3)
 TTS_VOICE = "kazi"

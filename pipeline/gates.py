@@ -106,6 +106,94 @@ def gate_narration_sync(art):
     return (len(bad) == 0, f"bad narration offsets: {bad}" if bad
             else "every narration starts inside its muted replay")
 
+# ------------------------------------------------------- output QC (ADR-0012)
+def _near_dup_pct(path, t0, dur=2.0):
+    """% of near-identical consecutive frames in a window of a rendered file."""
+    import tempfile, shutil
+    import numpy as np
+    from PIL import Image
+    tmp = tempfile.mkdtemp()
+    try:
+        r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", f"{t0:.2f}",
+                            "-t", f"{dur:.2f}", "-i", path,
+                            "-vf", "scale=320:180", "-vsync", "0",
+                            os.path.join(tmp, "%03d.png")],
+                           capture_output=True, text=True)
+        fs = sorted(f for f in os.listdir(tmp) if f.endswith(".png"))
+        dups, n, prev = 0, 0, None
+        for f in fs:
+            img = np.asarray(Image.open(os.path.join(tmp, f)).convert("L"),
+                             dtype=np.float32)
+            if prev is not None:
+                n += 1
+                if float(np.abs(img - prev).mean()) < 0.5:
+                    dups += 1
+            prev = img
+        return (100.0 * dups / n) if n else 0.0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+def gate_smooth_motion(art):
+    """Slowed segments must be interpolated, not frame-duplicated (ADR-0011)."""
+    vp, tl = art.get("video_path"), art.get("timeline") or []
+    if not vp or not os.path.exists(vp):
+        return False, "video missing"
+    slow = [s for s in tl if s.get("type") in ("replay", "flashback", "outro_replay")
+            and float(s.get("speed", 1.0)) < 0.999 and s["dur"] >= 3.0]
+    if not slow:
+        return True, "no slowed segments to check"
+    worst, worst_name = 0.0, ""
+    for s in slow:
+        pct = _near_dup_pct(vp, s["t0"] + s["dur"] / 2, 2.0)
+        if pct > worst:
+            worst, worst_name = pct, s.get("name", s["type"])
+    ok = worst < config.SMOOTH_DUP_PCT
+    return ok, (f"worst slowed segment '{worst_name}' at {worst:.0f}% dup frames "
+                f"(limit {config.SMOOTH_DUP_PCT:.0f}%, {len(slow)} slowed segs)"
+                if not ok else
+                f"{len(slow)} slowed segs all interpolated (<{worst:.0f}% dups)")
+
+def gate_bitrate(art):
+    vp = art.get("video_path")
+    if not vp or not os.path.exists(vp):
+        return False, "video missing"
+    r = subprocess.run(["ffprobe", "-v", "quiet", "-print_format", "json",
+                        "-show_format", vp], capture_output=True, text=True)
+    br = int(json.loads(r.stdout)["format"]["bit_rate"])
+    floor = int(config.BITRATE_FLOOR_MBPS * 1_000_000)
+    return (br >= floor,
+            f"{br/1e6:.2f} Mbps (floor {config.BITRATE_FLOOR_MBPS})"
+            if br >= floor else f"{br/1e6:.2f} Mbps BELOW floor {config.BITRATE_FLOOR_MBPS}")
+
+def gate_boundary_pop(art):
+    """video-use pattern: no audio pops at segment cuts (30ms fades, ADR-0012)."""
+    import numpy as np
+    vp, tl = art.get("video_path"), art.get("timeline") or []
+    if not vp or not os.path.exists(vp):
+        return False, "video missing"
+    bounds = [round(s["t0"], 2) for s in tl[1:]]
+    if not bounds:
+        return True, "no boundaries"
+    # PCM around every boundary, look for full-scale step spikes near the cut
+    pops = []
+    for t in bounds:
+        r = subprocess.run(
+            ["ffmpeg", "-v", "quiet", "-ss", f"{max(0.0, t-0.05):.2f}", "-t", "0.2",
+             "-i", vp, "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
+            capture_output=True)
+        x = np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32)
+        if x.size < 200:
+            continue
+        d = np.abs(np.diff(x))
+        peak = d.max()
+        base = np.percentile(d, 99.5) + 1e-6
+        # pop = step spike that dwarfs everything else in the window
+        if peak > 20 * base and peak > 12000:
+            pops.append(round(t, 2))
+    return (len(pops) == 0,
+            f"audio pops at boundaries: {pops}" if pops
+            else f"{len(bounds)} boundaries clean (30ms fades)")
+
 GATES = [
     ("imports", gate_imports, lambda: {}),
     ("guardrails", gate_guardrails, lambda: _load_artifacts()),
@@ -115,6 +203,9 @@ GATES = [
     ("render", gate_render, lambda: _load_artifacts()),
     ("no_black_cards", gate_no_black_cards, lambda: _load_artifacts()),
     ("narration_sync", gate_narration_sync, lambda: _load_artifacts()),
+    ("smooth_motion", gate_smooth_motion, lambda: _load_artifacts()),
+    ("bitrate", gate_bitrate, lambda: _load_artifacts()),
+    ("boundary_pop", gate_boundary_pop, lambda: _load_artifacts()),
 ]
 
 def _load_artifacts(case_id=1):
@@ -179,6 +270,50 @@ def self_test():
     ok, detail = gate_voice_pace({"audio": {"wpm_measured": 200, "voice": "x"}})
     assert not ok
     print(f"  [ok] voice_pace catches off-pace: {detail[:50]}")
+    # smooth_motion: build a real duplicated-frame clip -> must go RED
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        dupv = os.path.join(td, "dup.mp4")
+        # one static frame duplicated: color source = 100% duplicate frames
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "color=c=gray:size=320x180:rate=30", "-t", "5",
+                        "-c:v", "libx264", dupv], check=True, capture_output=True)
+        ok, detail = gate_smooth_motion(
+            {"video_path": dupv,
+             "timeline": [{"type": "replay", "name": "t", "speed": 0.45,
+                           "t0": 0.0, "dur": 5.0}]})
+        assert not ok, "smooth_motion failed to catch duplicated frames"
+        print(f"  [ok] smooth_motion catches duplication: {detail[:50]}")
+        # bitrate: tiny file is under the floor -> RED
+        ok, detail = gate_bitrate({"video_path": dupv})
+        assert not ok, "bitrate gate failed to catch thin file"
+        print(f"  [ok] bitrate catches under-floor: {detail[:50]}")
+        # boundary_pop: inject a full-scale step at t=1.0 -> RED
+        click = os.path.join(td, "click.mp4")
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                        "-i", "sine=frequency=440:sample_rate=16000:duration=2",
+                        "-af", "volume=0.5", "-c:a", "pcm_s16le", "-f", "s16le",
+                        os.path.join(td, "c.raw")], check=True, capture_output=True)
+        raw = bytearray(open(os.path.join(td, "c.raw"), "rb").read())
+        import numpy as _np
+        arr = _np.frombuffer(bytes(raw), dtype=_np.int16).astype(_np.int32)
+        off = 16000  # 1.0s, mono
+        # sustained DC step (the classic concat pop): survives AAC
+        arr[off:] = _np.clip(arr[off:] + 28000, -32768, 32767)
+        open(os.path.join(td, "c.raw"), "wb").write(arr.astype(_np.int16).tobytes())
+        subprocess.run(["ffmpeg", "-y", "-v", "error",
+                        "-f", "s16le", "-ar", "16000", "-ac", "1",
+                        "-i", os.path.join(td, "c.raw"),
+                        "-f", "lavfi",
+                        "-i", "color=c=black:size=320x180:rate=30",
+                        "-map", "0:a", "-map", "1:v",
+                        "-t", "2", click],
+                       check=True, capture_output=True)
+        ok, detail = gate_boundary_pop(
+            {"video_path": click,
+             "timeline": [{"type": "replay", "t0": 0.0}, {"type": "forward", "t0": 1.0}]})
+        assert not ok, "boundary_pop failed to catch injected click"
+        print(f"  [ok] boundary_pop catches injected click: {detail[:50]}")
     print("SELF-TEST GREEN: every gate can go RED")
 
 if __name__ == "__main__":
