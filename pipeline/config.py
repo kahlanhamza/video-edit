@@ -32,18 +32,27 @@ DEFAULT_TAGS = [
 ]
 
 # ---------------------------------------------------------------- video spec
-TARGET_MIN_SEC = 900
-TARGET_MAX_SEC = 1500
-DEMO_MIN_SEC = 480
-RES_W, RES_H, FPS = 1920, 1080, 30
-CRF = 21
-X264_PRESET = "veryfast"
+# ADR-0011: 720p canvas (1:1 for 720p sources, 1.5x worst-case upscale),
+# CRF 18 — v0.1.0 shipped 2.77 Mbps 1080p from a 474p source = mush.
+TARGET_MIN_SEC = 420
+TARGET_MAX_SEC = 900
+DEMO_MIN_SEC = 360
+RES_W, RES_H, FPS = 1280, 720, 30
+CRF = 18
+X264_PRESET = "medium"
 AUDIO_RATE = 48000
 FORWARD_BED_DB = -6.0          # raw audio during forward-play gaps
+BITRATE_FLOOR_MBPS = 2.5       # gate: encoded density on the final file
 
-# ---------------------------------------------------------------- editing (ADR-0004)
-REPLAY_SPEED = 0.45            # muted slow-mo under narration
-FLASHBACK_SPEED = 0.40
+# ---------------------------------------------------------------- editing (ADR-0004 + ADR-0011)
+REPLAY_SPEED = 0.75            # muted narration replay — subtle, interpolated
+DEEP_SPEED = 0.45              # hook cold-open + flashback only
+FLASHBACK_SPEED = 0.45
+MIN_SPEED = 0.30               # speed-ladder floor (absorbs narration w/o pads)
+MOTION_FLOOR = 0.08            # below this a window plays REAL-TIME muted:
+                               # never slow-motion a still scene
+MAX_FREEZE = 1.2               # frame-clone pad cap (v0.1.0 had 15.2s!)
+GAP_MAX = 12.0                 # silent forward stretches capped (was 30s)
 HOOK_SEC = 3.5                 # raw catchable opener, audio ON
 NARR_OFFSET = 0.3              # narration starts N sec into its replay
 FREEZE_GRADE = "eq=saturation=0.88:contrast=1.05"
@@ -51,6 +60,8 @@ FLASHBACK_GRADE = ("eq=saturation=0.45:contrast=1.02,"
                    "colorbalance=bs=0.12:ms=0.05")
 PUNCH = 1.07                   # static punch-in for replay/flashback
 NO_CARDS = True                # ADR-0004: zero full-screen text cards
+SMOOTH_DUP_PCT = 15.0          # gate: max % near-identical consecutive frames
+                               # inside any replay segment of the OUTPUT
 
 # ---------------------------------------------------------------- voice (M3)
 TTS_VOICE = "kazi"

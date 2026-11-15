@@ -47,3 +47,38 @@ printed, never committed. Tokens that appear in chat are burned; rotate.
 lane commits were lost to a sandbox recycle because `git push` was treated as
 a separate step. Effective immediately: every commit command chain ends with
 `git push origin main` and the lane is not done until the remote SHA matches.
+
+**ADR-0011 — Smooth motion, no still-scene slow-mo, tight gaps (v0.2.0 rework).**
+Owner rejected v0.1.0 as "laggy, not how professional editing works". Measured:
+replay sections played at 54-98% duplicate consecutive frames (naive
+`setpts`+`fps` duplication), one replay carried a 15.2s freeze pad, the outro
+was a 28s still image, 16 silent gaps averaged 23.2s, and a 474p source was
+stretched 2.5x to a 1080p canvas at 2.77 Mbps. Decisions, all measurable:
+(1) slowed content goes through `framerate` motion interpolation — measured
+2% duplicates vs 25% naive on the same window; (2) narration replays run at
+0.75x, deep 0.45x is reserved for the hook cold-open and flashbacks;
+(3) any window whose measured motion energy < 0.08 plays real-time muted —
+a still scene is never slowed; (4) frame-clone freeze is capped at 1.2s and
+the speed ladder (0.75 down to 0.30) absorbs the rest; (5) silent forward
+gaps are capped at 12s; (6) canvas is 1280x720 — 1:1 for 720p sources, 1.5x
+worst-case upscale — CRF 18; (7) two new gates enforce it on the OUTPUT:
+smooth-motion (<15% near-identical consecutive frames per replay segment)
+and a bitrate floor. Rationale: gates checked structure but not feel; feel is
+now also executable.
+
+**ADR-0012 — Adopt proven open-source patterns; keep ffmpeg-direct engine.**
+Deep research (docs/RESEARCH-opensource-video-engines.md) surveyed video-use,
+NarratoAI, MoneyPrinterTurbo, ShortGPT, Practical-RIFE, auto-editor and
+faster-whisper against our raw-footage commentary requirements. Adopted from
+video-use (MIT): render→self-eval loop as hard gates (smooth-motion,
+boundary-pop, bitrate on the OUTPUT), 30 ms audio fades at every segment cut,
+and EDL-formalized timeline JSON. Adopted now from ffmpeg: `framerate` blend
+interpolation for all slowed content (measured 2% duplicate frames vs 25%
+naive); Practical-RIFE (MIT) is the phase-2 provider behind
+`pipeline/interp.py` once onnxruntime CPU throughput is benchmarked — no
+torch on this box. NOT adopted: MoneyPrinterTurbo/ShortGPT (stock-footage
+sourcing model violates AC-1), NarratoAI engine (MoviePy slower than
+frame-exact ffmpeg; no semantic-anchor model), Remotion/Manim overlay stacks
+(over-engineering for static compliance overlays). Rationale: the wheel to
+stop reinventing is the QC loop and the fade/interp craft, not the sourcing
+and anchor model that differentiates the channel.
