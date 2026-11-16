@@ -1,0 +1,12 @@
+.git
+.venv
+.mypy_cache
+.pytest_cache
+.ruff_cache
+output
+tests
+docs
+apps/web
+gpu_services
+*.log
+.env
