@@ -334,14 +334,20 @@ def stage_subtitles(timeline, transcript: dict, project_id: str, deps: PipelineD
 
 
 def _project_redaction_regions(sessions: Any, asset_id: str) -> list[BlurRegion]:
-    """Studio-drawn blur boxes (perception_index.redaction_tracks_json) -> specs."""
+    """Studio-drawn blur boxes (perception_index.redaction_tracks_json) -> specs.
+
+    Tolerant reader: the studio API persists the flat studio shape
+    ({x, y, w, h, sigma, id, ...}); the canonical BlurRegion shape
+    ({bbox: {x, y, w, h}, scope, mode}) is accepted too. A region that
+    fails validation is skipped, never fatal to the render.
+    """
     from director_os.core.models import BBox
 
     with sessions() as s:
         row = s.get(PerceptionIndexRow, asset_id)
     regions: list[BlurRegion] = []
     for item in (row.redaction_tracks_json or {}).get("regions", []) if row else []:
-        bbox = item.get("bbox") or {}
+        bbox = item.get("bbox") or {k: item.get(k, 0) for k in ("x", "y", "w", "h")}
         try:
             regions.append(
                 BlurRegion(

@@ -15,6 +15,7 @@ dependencies = [
     "director-os-worker",
     "director-os-cli",
     "director-os-skills",
+    "modal>=1.6.4",
 ]
 
 [project.scripts]

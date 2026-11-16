@@ -206,3 +206,43 @@ def test_redaction_crud_and_clamping(project_with_asset):
     assert client.delete(f"/projects/{pid}/redactions/{region['id']}").status_code == 204
     assert client.get(f"/projects/{pid}/redactions").json() == []
     assert client.delete(f"/projects/{pid}/redactions/{region['id']}").status_code == 404
+
+
+def test_drawn_redaction_reaches_render_pipeline(project_with_asset):
+    """The studio stores the FLAT shape ({x, y, w, h}); the render pipeline must
+    read it (plus the canonical nested {bbox: {...}} shape) into BlurRegions."""
+    import director_os.api.main as api_main
+    from director_os.core.db import PerceptionIndexRow
+    from director_os.worker.pipeline import _project_redaction_regions
+
+    client, pid = project_with_asset
+    r = client.post(
+        f"/projects/{pid}/redactions", json={"x": 10, "y": 20, "w": 50, "h": 30, "sigma": 12}
+    )
+    assert r.status_code == 201
+
+    factory = api_main._session_factory
+    assert factory is not None
+    regions = _project_redaction_regions(factory, "a_studio")
+    assert len(regions) == 1
+    assert (regions[0].bbox.x, regions[0].bbox.y, regions[0].bbox.w, regions[0].bbox.h) == (
+        10,
+        20,
+        50,
+        30,
+    )
+    assert regions[0].sigma == 12 and regions[0].scope == "global"
+
+    # nested canonical shape accepted; corrupt entries skipped silently
+    with api_main_session() as s:
+        row = s.get(PerceptionIndexRow, "a_studio")
+        row.redaction_tracks_json = {
+            "regions": [
+                {"id": "n1", "bbox": {"x": 1, "y": 2, "w": 3, "h": 4}},
+                {"id": "bad", "x": 0, "y": 0, "w": 0, "h": 0},  # zero-size -> invalid
+                {"id": "flat2", "x": 5, "y": 5, "w": 10, "h": 10},
+            ]
+        }
+        s.commit()
+    regions = _project_redaction_regions(factory, "a_studio")
+    assert [r.track_id for r in regions] == ["n1", "flat2"]

@@ -58,25 +58,45 @@ Every R&D bug is a CI test — see `tests/unit/test_g1..g8`:
 7. Fonts matched as exact upright filenames (`Roboto-Bold.ttf`, never `Roboto-BoldItalic.ttf`).
 8. Licensing safety: no Remotion above small-team scale — FFmpeg + Pillow + Playwright.
 
+## Scripts
+
+| Script | Purpose |
+| --- | --- |
+| `scripts/e2e_smoke.py` | Full pipeline on a synthetic *spoken* fixture — live Gladia ASR, real render, QA audit |
+| `scripts/e2e_rerender.py` | Crash-resume semantics: reuse transcript/timeline, re-render only changed segments |
+| `scripts/llm_smoke_test.py` | Live AI Studio probe: model visibility + function-calling wire format |
+| `scripts/gen_youtube_refresh_token.py` | One-time interactive OAuth consent → `YOUTUBE_REFRESH_TOKEN` into `.env` |
+
 ## Status
 
 | Milestone | Scope | State |
 | --- | --- | --- |
 | M1 | Modular core engine + OTIO + segment caching | **closed** — 1080p demo (42s, 48kHz stereo), parallel segment fleet, ffprobe-validated cache (zero-change re-render: 4/4 hits, 0.1s) |
 | M2 | Native agentic tool runtime + durable orchestration | **core landed** — 8 typed director tools, checkpoint/rollback store, planner-executor with auto-rollback, durable 5-stage pipeline (crash resume, ASR never re-run), Gladia ASR, shot boundaries + audio events, edge-tts `generate_tts`, SKILL.md prompt injection, SSE job progress, YouTube Private-Draft publisher + Human Review Gate |
-| M3 | Director Studio Next.js UI | **closed** — cases, live SSE pipeline progress, timeline versions, checkpoint-first dispatch with rollback, **proxy scrub player (480p) + mouse-drawn blur canvas + editable subtitle grid**, Human Review Gate publish (Next.js 15, `apps/web`) |
+| M3 | Director Studio Next.js UI | **closed + acceptance-verified** — cases, live SSE pipeline progress, timeline versions, checkpoint-first dispatch with rollback, **proxy scrub player (480p) + mouse-drawn blur canvas + editable subtitle grid**, Human Review Gate publish (Next.js 15, `apps/web`). M3 acceptance was executed live in a real browser: a blur box drawn over the frame corner survived to the next render (cache-invalidation A/B + pixel proof) and an edited cue re-aligned via difflib without drift (see `docs/m3_acceptance/` evidence) |
 | M4 | Multimodal vision + Modal serverless GPU | **local surface landed** — `map_route` card, **Gemini vision client live behind the port (`VISION_API_KEY`)**, Modal GPU app scaffold (tokens configured) |
 | M5 | Cloud deployment + multi-channel hardening | **scaffolding landed** — compose healthchecks/restart policies, cost dashboard endpoint (durations + tokens), multi-channel publish fan-out with honest `not_configured` states, `.env.example` |
 
 Live credentials (verified 2026-11-17): **Gladia cloud ASR is end-to-end green**
 (real transcription + diarization through the v2 API, incl. the
-`language_behaviour` removal and utterance-word flattening drift fixes). The
-**LLM backends are live behind the existing `LLMBackend` port**: native Gemini
-(`LLM_API_KEY`, REST function-calling) and any OpenAI-compatible gateway
-(`LLM_BASE_URL`) — the sandbox IP is region-blocked by Google, so point
-`LLM_BASE_URL` at a reachable gateway when running there; the key itself
-validated. Remaining: YouTube refresh token (`YOUTUBE_REFRESH_TOKEN`) for real
-draft uploads, Modal GPU renders, and TikTok/Shorts/Reels API apps.
+`language_behaviour` removal and utterance-word flattening drift fixes).
+**Full pipeline e2e-verified with live ASR**: TTS-built spoken fixture → ingest
+(480p proxy + scrubsheet) → live Gladia transcription (25 words, diarized) →
+auto-cut → segment-cached render → subtitle trio → QA audit all green
+(`scripts/e2e_smoke.py`). The **LLM backends are live behind the existing
+`LLMBackend` port**: native Gemini (`LLM_API_KEY`, REST function-calling with
+the three Gemini 3.x REST traps handled — `parametersJsonSchema` full-JSON-Schema
+declarations, verbatim `thoughtSignature` replay across multi-step tool turns,
+`?key=` fallback on 401 `ACCESS_TOKEN_TYPE_UNSUPPORTED`) and any
+OpenAI-compatible gateway (`LLM_BASE_URL`). `POST /projects/{id}/agent/plan`
+runs the real provider loop. The sandbox IP is region-blocked by Google
+("User location is not supported"), so point `LLM_BASE_URL` at a reachable
+gateway when running there; the wire format itself is MockTransport-pinned.
+**Modal tokens validated** against the real API (`modal.App.lookup` auth round-
+trip; `modal` added to deps). Remaining: YouTube refresh token
+(`YOUTUBE_REFRESH_TOKEN` — run `scripts/gen_youtube_refresh_token.py` on any
+machine with a browser; Google removed the OOB flow so this needs an
+interactive consent screen), Modal GPU renders, and TikTok/Shorts/Reels API apps.
 
 Legacy note: the previous v0.2 bodycam-autopilot prototype is archived on the
 `legacy/v0.2-autopilot` branch. Do not build on it; PLAN.md supersedes it.
