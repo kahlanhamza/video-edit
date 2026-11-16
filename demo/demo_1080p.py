@@ -42,14 +42,32 @@ def make_demo_source(out: Path, seconds: int = 45) -> Path:
     out.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-f", "lavfi", "-i",
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
             f"testsrc2=size=1280x720:rate={FPS}:duration={seconds}",
-            "-f", "lavfi", "-i",
+            "-f",
+            "lavfi",
+            "-i",
             f"sine=frequency=220:duration={seconds},lowpass=f=600",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-ar", "48000", "-ac", "2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "26",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
             "-shortest",
             str(out),
         ],
@@ -186,9 +204,7 @@ def main() -> int:
     print("[5/5] QA probe")
     info = probe(report.final_path)
     assert_audio_law(info)
-    assert info.width == W and info.height == H, (
-        f"expected {W}x{H}, got {info.width}x{info.height}"
-    )
+    assert info.width == W and info.height == H, f"expected {W}x{H}, got {info.width}x{info.height}"
 
     print()
     print(f"FINAL  {report.final_path}")

@@ -330,9 +330,7 @@ def test_validation_failure_rolls_back_before_mutation(timeline, store):
 def test_scripted_backend_loop(timeline, store):
     reg = build_director_registry(DirectorToolbox(timeline, PROJECT))
     runner = PlannerExecutor(reg, store, PROJECT, agent="director_v3")
-    backend = ScriptedBackend(
-        [ToolStep(tool="timeline.remove_clip", args={"item_index": 1})]
-    )
+    backend = ScriptedBackend([ToolStep(tool="timeline.remove_clip", args={"item_index": 1})])
     run = runner.run(backend, timeline)
     assert run.ok
     assert backend.propose_calls == 1

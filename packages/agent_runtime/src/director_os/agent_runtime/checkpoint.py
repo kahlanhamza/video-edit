@@ -85,9 +85,7 @@ class CheckpointStore:
                 )
             ).scalar_one_or_none()
             if row is None:
-                raise CheckpointError(
-                    f"no version {version_num} for project {project_id}"
-                )
+                raise CheckpointError(f"no version {version_num} for project {project_id}")
             return ot_adapters.read_from_string(json.dumps(row.otio_json), "otio_json")
 
     def rollback(self, project_id: str, to_version_num: int) -> tuple[Any, int]:

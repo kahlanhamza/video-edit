@@ -56,8 +56,7 @@ def validate_chapters(chapters: list[Chapter]) -> None:
             raise ChapterError("chapter timestamps must be strictly ascending")
         if cur.start_s - prev.start_s < MIN_CHAPTER_S:
             raise ChapterError(
-                f"chapters must be >= {MIN_CHAPTER_S:.0f}s apart "
-                f"({prev.stamp} -> {cur.stamp})"
+                f"chapters must be >= {MIN_CHAPTER_S:.0f}s apart ({prev.stamp} -> {cur.stamp})"
             )
 
 
@@ -74,9 +73,7 @@ def build_description(base: str, chapters: list[Chapter], footer: str = "") -> s
         parts.append(footer)
     desc = "\n".join(parts)
     if len(desc) > MAX_DESCRIPTION_CHARS:
-        raise ChapterError(
-            f"description too long: {len(desc)} > {MAX_DESCRIPTION_CHARS} chars"
-        )
+        raise ChapterError(f"description too long: {len(desc)} > {MAX_DESCRIPTION_CHARS} chars")
     return desc
 
 

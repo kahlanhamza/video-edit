@@ -99,9 +99,7 @@ class GladiaClient:
         }
         if language:
             body["language"] = language
-        resp = self._http.post(
-            f"{self._base}/v2/transcription", headers=self._headers(), json=body
-        )
+        resp = self._http.post(f"{self._base}/v2/transcription", headers=self._headers(), json=body)
         self._raise_for_status(resp, "create job")
         data = resp.json()
         job_id = data.get("id")
@@ -136,8 +134,7 @@ class GladiaClient:
         raw_words = transcription.get("word_level_results") or transcription.get("words") or []
         if not raw_words:
             raise GladiaError(
-                "gladia response has no word-level results "
-                f"(keys: {sorted(transcription.keys())})"
+                f"gladia response has no word-level results (keys: {sorted(transcription.keys())})"
             )
 
         words: list[WordTiming] = []
@@ -178,9 +175,7 @@ class GladiaClient:
         if resp.status_code == 429:
             raise GladiaError(f"gladia rate-limited during {what} (429)")
         if resp.status_code >= 400:
-            raise GladiaError(
-                f"gladia {what} failed: HTTP {resp.status_code}: {resp.text[:300]}"
-            )
+            raise GladiaError(f"gladia {what} failed: HTTP {resp.status_code}: {resp.text[:300]}")
 
 
 def _to_seconds(value: Any) -> float | None:

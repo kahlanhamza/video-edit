@@ -94,9 +94,7 @@ class DirectorToolbox:
         clip = _master_clip(self.timeline, item_index)
         dur = item_duration_s(clip)
         if not 0.0 < at_local_s < dur:
-            raise ToolOperationError(
-                f"at_local_s {at_local_s:.2f}s outside clip 0..{dur:.2f}s"
-            )
+            raise ToolOperationError(f"at_local_s {at_local_s:.2f}s outside clip 0..{dur:.2f}s")
         sr = clip.source_range
         rate = sr.start_time.rate
         left = ot_schema.Clip(name=f"{clip.name or 'clip'}.a")
@@ -154,9 +152,7 @@ class DirectorToolbox:
         return {"ok": True, "detail": f"narration {item_index} -> {script_text[:48]!r}"}
 
     # ------------------------------------------------------------ privacy redaction
-    def add_blur_region(
-        self, item_index: int, bbox: list[int], sigma: int = 24
-    ) -> dict[str, Any]:
+    def add_blur_region(self, item_index: int, bbox: list[int], sigma: int = 24) -> dict[str, Any]:
         """Add a privacy blur box (canvas pixels [x, y, w, h]) to a raw clip."""
         clip = _master_clip(self.timeline, item_index)
         meta = clip.metadata.get("director_os")
