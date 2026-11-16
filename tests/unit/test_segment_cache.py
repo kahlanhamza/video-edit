@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from director_os.core.models import BBox, BlurRegion
 from director_os.otio_engine.segment_cache import (
     AudioRenderSpec,
@@ -76,6 +77,56 @@ def test_cache_store_roundtrip(tmp_path):
     assert cache.get(key) is None
     fake = tmp_path / "seg.mp4"
     fake.write_bytes(b"x" * 60_000)
-    stored = cache.put(fake, key)
+    # not a playable MP4 -> rejected, never enters the cache
+    from director_os.otio_engine.segment_cache import SegmentCacheError
+
+    with pytest.raises(SegmentCacheError, match="not a playable MP4"):
+        cache.put(fake, key)
+    assert cache.get(key) is None
+
+
+def test_tiny_valid_segment_is_cached(fixture_video, tmp_path):
+    """All-black narration chunks are legitimately small — byte floors must not
+    bounce them out of the cache on every pass (found in the 1080p demo)."""
+    import subprocess
+
+    cache = SegmentCache(tmp_path / "segments")
+    key = "black" + "0" * 36
+    tmp = tmp_path / "black.tmp.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=c=black:size=320x240:rate=30",
+            "-t", "2",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "34",
+            "-pix_fmt", "yuv420p",
+            "-an",
+            str(tmp),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    stored = cache.put(tmp, key, expect_dur_s=2.0)
+    assert stored.exists()
     assert cache.get(key) == stored
-    assert cache.count() == 1
+
+
+def test_truncated_encode_rejected(tmp_path):
+    import subprocess
+
+    cache = SegmentCache(tmp_path / "segments")
+    tmp = tmp_path / "trunc.tmp.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=2",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "34",
+            "-pix_fmt", "yuv420p", "-an",
+            str(tmp),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    with pytest.raises(Exception, match="truncated encode|duration"):
+        cache.put(tmp, "k" * 40, expect_dur_s=6.0)
+    assert not tmp.exists()

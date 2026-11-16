@@ -4,6 +4,11 @@ The cache key is a stable SHA-256 over the FULL render specification: source ran
 filter chains, blur regions, card *content* digests, codec + audio-law settings.
 Changing one narrator word, one blur sigma or one card pixel changes exactly one key —
 which is what makes "fix one word, re-render in seconds" true by construction.
+
+Acceptance on `put()` is ffprobe-based, not byte-count-based: an all-black narration
+segment is legitimately tiny (a few dozen KB), while a half-written encode from a
+killed worker must never enter the cache. A chunk is valid iff it is a playable
+MP4 whose duration matches the segment spec within tolerance.
 """
 
 from __future__ import annotations
@@ -17,7 +22,12 @@ from typing import Literal
 from director_os.core.models import AudioContract, BlurRegion
 from pydantic import BaseModel, Field
 
-MIN_SEGMENT_BYTES = 50_000
+MIN_SEGMENT_BYTES = 2_048
+DURATION_TOLERANCE = 0.25  # seconds; guards truncated tail frames
+
+
+class SegmentCacheError(RuntimeError):
+    pass
 
 
 class CardOverlaySpec(BaseModel):
@@ -92,10 +102,39 @@ class SegmentCache:
         p = self.path_for(key)
         return p if p.exists() and p.stat().st_size > MIN_SEGMENT_BYTES else None
 
-    def put(self, tmp_path: str | Path, key: str) -> Path:
+    def put(self, tmp_path: str | Path, key: str, expect_dur_s: float | None = None) -> Path:
+        """Admit a rendered chunk into the cache after ffprobe validation.
+
+        Rejected chunks raise `SegmentCacheError` and are deleted — a killed
+        worker's partial encode never becomes a cache entry.
+        """
+        tmp_path = Path(tmp_path)
         dest = self.path_for(key)
+        try:
+            _validate_chunk(tmp_path, expect_dur_s)
+        except SegmentCacheError:
+            tmp_path.unlink(missing_ok=True)
+            raise
         shutil.move(str(tmp_path), dest)
         return dest
 
     def count(self) -> int:
         return sum(1 for _ in self.root.glob("*.mp4"))
+
+
+def _validate_chunk(path: Path, expect_dur_s: float | None) -> None:
+    from director_os.core.qa_probe import probe  # local import avoids probe<->cache cycle risk
+
+    if not path.exists() or path.stat().st_size < MIN_SEGMENT_BYTES:
+        raise SegmentCacheError(f"chunk too small / missing: {path}")
+    try:
+        info = probe(path)
+    except Exception as e:  # garbage input -> ffprobe exits non-zero / malformed JSON
+        raise SegmentCacheError(f"chunk is not a playable MP4: {path} ({e})") from e
+    if not info.has_video:
+        raise SegmentCacheError(f"chunk has no video stream: {path}")
+    if expect_dur_s is not None and abs(info.duration_s - expect_dur_s) > DURATION_TOLERANCE:
+        raise SegmentCacheError(
+            f"chunk duration {info.duration_s:.2f}s != expected {expect_dur_s:.2f}s "
+            f"(truncated encode?)"
+        )

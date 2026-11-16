@@ -124,10 +124,14 @@ def render_segment(spec: SegmentRenderSpec, src_path: str | None, out_path: str 
 
 
 def render_one(seg: SegmentRender, cache: SegmentCache) -> Path:
-    """Render one DAG node into the segment cache (misses only) and return its path."""
+    """Render one DAG node into the segment cache (misses only) and return its path.
+
+    The chunk is admitted only after ffprobe validation (playable + expected
+    duration) — a truncated encode from a killed worker never enters the cache.
+    """
     tmp = cache.root / f"{seg.key}.tmp.mp4"
     render_segment(seg.spec, seg.src_path, tmp)
-    return cache.put(tmp, seg.key)
+    return cache.put(tmp, seg.key, expect_dur_s=seg.dur_s)
 
 
 def default_workers(n_misses: int) -> int:
