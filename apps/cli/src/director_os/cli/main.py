@@ -39,7 +39,7 @@ def main() -> None:
 
 @main.command()
 def version() -> None:
-    click.echo("DirectorOS 0.1.0 (M1: modular core engine + OTIO + segment caching)")
+    click.echo("DirectorOS 0.2.0 (M1 close-out: parallel segment fleet + full-res demo)")
 
 
 @main.command()
@@ -50,13 +50,26 @@ def version() -> None:
     show_default=True,
     help="Trim the demo master cut to this duration.",
 )
-@click.option("--width", default=640, show_default=True)
-@click.option("--height", default=360, show_default=True)
+@click.option(
+    "--preset",
+    type=click.Choice(["360p", "480p", "720p", "1080p"]),
+    default="1080p",
+    show_default=True,
+    help="Output resolution preset (M1 done-when: full 1080p MP4).",
+)
+@click.option(
+    "--workers",
+    type=int,
+    default=None,
+    help="Parallel segment encodes (default: auto, up to 4).",
+)
 @click.option("--fps", default=30, show_default=True)
-def render(source: str, max_seconds: float, width: int, height: int, fps: int) -> None:
-    """Render a local file or URL through the M1 engine (segment-cached)."""
+def render(source: str, max_seconds: float, preset: str, workers: int | None, fps: int) -> None:
+    """Render a local file or URL through the M1 engine (segment-cached, parallel)."""
+    sizes = {"360p": (640, 360), "480p": (854, 480), "720p": (1280, 720), "1080p": (1920, 1080)}
+    width, height = sizes[preset]
     settings = get_settings()
-    out_dir = settings.output_dir / "render_demo"
+    out_dir = settings.output_dir / f"render_demo_{preset}"
     settings.ingest_dir.mkdir(parents=True, exist_ok=True)
 
     click.echo("[1/6] ingest")
@@ -111,7 +124,7 @@ def render(source: str, max_seconds: float, width: int, height: int, fps: int) -
     click.echo(f"  {len(dag.segments)} segment(s), {dag.total_dur_s:.1f}s total")
 
     click.echo("[5/6] render + concat -c copy")
-    report = render_dag(dag, cache)
+    report = render_dag(dag, cache, max_workers=workers)
     click.echo(f"  rendered={report.rendered} cached={report.cached} -> {report.final_path}")
 
     click.echo("[6/6] QA probe (audio law + duration)")

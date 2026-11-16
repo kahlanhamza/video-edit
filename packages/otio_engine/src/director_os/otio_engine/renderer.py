@@ -3,17 +3,25 @@
 Every segment is rendered with the audio law flags (`-ar 48000 -ac 2` after any
 `-af` chain) and identical codec params, so the final concat is a lossless
 `-c copy`. Cache hits skip the encode entirely.
+
+Segments are independent render units (ADR-0003), so cache misses can be
+encoded in parallel — locally via a thread pool (each worker babysits one
+ffmpeg subprocess) or across the fleet via the Celery fan-out tasks in
+`director_os.worker.tasks`. Concat order always follows the DAG, never
+completion order, so output is byte-plan identical to the serial path.
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
 from director_os.core.ffmpeg_args import assert_audio_law, exact_slice_args
 from director_os.core.qa_probe import has_audio_stream
-from director_os.otio_engine.compiler import RenderDAG
+from director_os.otio_engine.compiler import RenderDAG, SegmentRender
 from director_os.otio_engine.filters import compose_filter_complex, plain_video_chain
 from director_os.otio_engine.segment_cache import SegmentCache, SegmentRenderSpec
 
@@ -115,6 +123,18 @@ def render_segment(spec: SegmentRenderSpec, src_path: str | None, out_path: str 
         raise RenderError(f"segment render failed ({out_path}):\n{r.stderr[-2000:]}")
 
 
+def render_one(seg: SegmentRender, cache: SegmentCache) -> Path:
+    """Render one DAG node into the segment cache (misses only) and return its path."""
+    tmp = cache.root / f"{seg.key}.tmp.mp4"
+    render_segment(seg.spec, seg.src_path, tmp)
+    return cache.put(tmp, seg.key)
+
+
+def default_workers(n_misses: int) -> int:
+    """Thread pool size: one ffmpeg encode per worker, capped at 4 (CPU encoders)."""
+    return max(1, min(4, n_misses, os.cpu_count() or 1))
+
+
 def concat_segments(parts: list[Path], out_path: str | Path) -> Path:
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -152,24 +172,43 @@ def render_dag(
     dag: RenderDAG,
     cache: SegmentCache,
     log=print,
+    max_workers: int | None = None,
 ) -> RenderReport:
-    rendered = cached = 0
+    """Execute the DAG: render cache misses (optionally parallel), concat in DAG order.
+
+    `max_workers=None` auto-sizes the pool; `max_workers=1` forces the serial path.
+    Parallelism only affects the encode step — concat order follows the DAG, so the
+    final timeline is identical regardless of worker count.
+    """
     parts: list[Path] = []
+    misses: list[SegmentRender] = []
+    cached = 0
     for seg in dag.segments:
         hit = cache.get(seg.key)
         if hit is not None:
             cached += 1
             log(f"  [cache] {seg.key[:12]} ({seg.dur_s:.1f}s)")
         else:
-            tmp = cache.root / f"{seg.key}.tmp.mp4"
-            render_segment(seg.spec, seg.src_path, tmp)
-            cache.put(tmp, seg.key)
-            rendered += 1
-            log(f"  [render] {seg.key[:12]} ({seg.dur_s:.1f}s)")
+            misses.append(seg)
         parts.append(cache.path_for(seg.key))
+
+    workers = max(1, min(max_workers or default_workers(len(misses)), len(misses) or 1))
+    if workers <= 1 or len(misses) <= 1:
+        for seg in misses:
+            render_one(seg, cache)
+            log(f"  [render] {seg.key[:12]} ({seg.dur_s:.1f}s)")
+    else:
+        log(f"  [fleet] encoding {len(misses)} segment(s) on {workers} workers")
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(render_one, seg, cache): seg for seg in misses}
+            for fut in futures:  # deterministic error reporting in DAG order
+                seg = futures[fut]
+                fut.result()
+                log(f"  [render] {seg.key[:12]} ({seg.dur_s:.1f}s)")
+
     concat_segments(parts, dag.final_path)
     return RenderReport(
-        rendered=rendered,
+        rendered=len(misses),
         cached=cached,
         final_path=dag.final_path,
         total_dur_s=dag.total_dur_s,
