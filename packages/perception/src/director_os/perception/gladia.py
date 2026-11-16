@@ -92,11 +92,9 @@ class GladiaClient:
         return audio_url
 
     def _create_job(self, audio_url: str, language: str | None = None) -> str:
-        body: dict[str, Any] = {
-            "audio_url": audio_url,
-            "diarization": True,
-            "language_behaviour": "single language" if language else "automatic multi language",
-        }
+        # v2 API (2026-11): `language_behaviour` was removed — `language` is
+        # optional and automatic multi-language detection is the default.
+        body: dict[str, Any] = {"audio_url": audio_url, "diarization": True}
         if language:
             body["language"] = language
         resp = self._http.post(f"{self._base}/v2/transcription", headers=self._headers(), json=body)
@@ -132,6 +130,16 @@ class GladiaClient:
         transcription = result.get("transcription") or {}
 
         raw_words = transcription.get("word_level_results") or transcription.get("words") or []
+        if not raw_words:
+            # v2 API (2026-11): word timings ride inside utterances — flatten them,
+            # inheriting each utterance's diarized speaker onto its words.
+            for utt in transcription.get("utterances") or []:
+                speaker = utt.get("speaker")
+                for w in utt.get("words") or []:
+                    # speaker "0" is a valid label and falsy — test None, not truthiness
+                    if speaker is not None and not w.get("speaker"):
+                        w["speaker"] = speaker
+                    raw_words.append(w)
         if not raw_words:
             raise GladiaError(
                 f"gladia response has no word-level results (keys: {sorted(transcription.keys())})"
@@ -188,7 +196,10 @@ def _to_seconds(value: Any) -> float | None:
 
 
 def _speaker(w: dict) -> str | None:
-    speaker = w.get("speaker") or w.get("speaker_label") or w.get("diarization_speaker")
+    # speaker "0" is a real label — never fall through on falsy zero
+    speaker = w.get("speaker")
+    if speaker is None:
+        speaker = w.get("speaker_label") or w.get("diarization_speaker")
     return str(speaker) if speaker is not None else None
 
 

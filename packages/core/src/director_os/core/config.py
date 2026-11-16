@@ -36,6 +36,15 @@ class Settings:
     r2_bucket: str
     # --- external services (M2)
     gladia_api_key: str
+    # --- agent runtime LLM (M2 close-out)
+    llm_api_key: str
+    llm_base_url: str
+    llm_model: str
+    # --- vision LLM (M4)
+    vision_api_key: str
+    # --- Modal GPU (M4)
+    modal_token_id: str
+    modal_token_secret: str
 
 
 def _load() -> Settings:
@@ -59,6 +68,12 @@ def _load() -> Settings:
         r2_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY", ""),
         r2_bucket=os.getenv("R2_BUCKET", "directoros"),
         gladia_api_key=os.getenv("GLADIA_API_KEY", ""),
+        llm_api_key=os.getenv("LLM_API_KEY", ""),
+        llm_base_url=os.getenv("LLM_BASE_URL", ""),
+        llm_model=os.getenv("LLM_MODEL", ""),
+        vision_api_key=os.getenv("VISION_API_KEY", ""),
+        modal_token_id=os.getenv("MODAL_TOKEN_ID", ""),
+        modal_token_secret=os.getenv("MODAL_TOKEN_SECRET", ""),
     )
 
 

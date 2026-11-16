@@ -15,7 +15,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    import httpx
 
 from pydantic import BaseModel, Field
 
@@ -80,3 +83,107 @@ class VisionAdapter:
             raise VisionError("no frames provided")
         insights = self._client.analyze(question, frames)
         return [i for i in insights if i.confidence >= min_confidence]
+
+
+class GeminiVisionClient:
+    """Real multimodal provider: Google AI Studio generateContent (VISION_API_KEY).
+
+    Frames ride as inline_data JPEG/PNG base64; the model answers with a JSON
+    array of insights — malformed output degrades to one low-confidence
+    observation instead of failing the pipeline.
+    """
+
+    provider = "gemini"
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "gemini-2.5-flash",
+        base_url: str = "https://generativelanguage.googleapis.com",
+        transport: httpx.BaseTransport | None = None,
+    ):
+        if not api_key:
+            raise VisionError("GeminiVisionClient requires VISION_API_KEY")
+        self._transport = transport
+        self.api_key = api_key
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.last_usage: dict[str, int] | None = None
+
+    def analyze(self, question: str, frames: Sequence[FrameRef]) -> list[SceneInsight]:
+        import base64
+        import json as _json
+
+        import httpx
+
+        parts: list[dict[str, Any]] = [
+            {
+                "text": (
+                    "You are the vision half of a documentary editor. "
+                    "Answer ONLY with a JSON array of objects: "
+                    '[{"timestamp_s": float, "kind": "observation|risk|'
+                    'redaction_candidate|event", "description": str, '
+                    '"confidence": float 0..1}]. Question: ' + question
+                )
+            }
+        ]
+        for f in frames:
+            data = base64.b64encode(f.image_path.read_bytes()).decode()
+            mime = "image/png" if f.image_path.suffix.lower() == ".png" else "image/jpeg"
+            parts.append(
+                {"text": f"frame at {f.timestamp_s}s:"},
+            )
+            parts.append({"inline_data": {"mime_type": mime, "data": data}})
+        with httpx.Client(transport=self._transport, timeout=90.0) as client:
+            r = client.post(
+                f"{self.base_url}/v1beta/models/{self.model}:generateContent",
+                headers={"x-goog-api-key": self.api_key},
+                json={
+                    "contents": [{"role": "user", "parts": parts}],
+                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048},
+                },
+            )
+        if r.status_code != 200:
+            raise VisionError(f"vision provider {r.status_code}: {r.text[:200]}")
+        data = r.json()
+        usage = data.get("usageMetadata", {})
+        self.last_usage = {
+            "tokens_in": int(usage.get("promptTokenCount", 0)),
+            "tokens_out": int(usage.get("candidatesTokenCount", 0)),
+        }
+        text = "".join(
+            p.get("text", "")
+            for p in data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+        ).strip()
+        try:
+            if text.startswith("```"):
+                text = text.strip("`").removeprefix("json").strip()
+            raw = _json.loads(text)
+            return [
+                SceneInsight(
+                    timestamp_s=float(i.get("timestamp_s", f.timestamp_s)),
+                    kind=str(i.get("kind", "observation")),
+                    description=str(i.get("description", ""))[:500],
+                    confidence=float(i.get("confidence", 0.5)),
+                )
+                for i in raw
+            ]
+        except (ValueError, TypeError, KeyError):
+            return [
+                SceneInsight(
+                    timestamp_s=frames[0].timestamp_s,
+                    kind="observation",
+                    description=text[:500] or "(empty vision response)",
+                    confidence=0.3,
+                )
+            ]
+
+
+def build_vision_client() -> VisionClient:
+    """VISION_API_KEY set -> real Gemini client; blank -> hermetic fake."""
+    from director_os.core.config import get_settings
+
+    key = get_settings().vision_api_key
+    if key:
+        return GeminiVisionClient(key)
+    return FakeVisionClient()

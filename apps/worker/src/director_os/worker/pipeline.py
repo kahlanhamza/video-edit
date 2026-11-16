@@ -34,7 +34,8 @@ from director_os.core.db import (
     make_session_factory,
 )
 from director_os.core.http import download
-from director_os.core.models import JobStage, ProjectStatus
+from director_os.core.models import BlurRegion, JobStage, ProjectStatus
+from director_os.core.proxy import ProxyBuildError, build_proxies
 from director_os.core.qa_probe import AuditReport, audit_technical, probe
 from director_os.otio_engine.compiler import compile_timeline
 from director_os.otio_engine.contract import CardMeta, RawClipMeta
@@ -97,7 +98,12 @@ def _set_status(s, project_id: str, status: ProjectStatus) -> None:
 
 # --------------------------------------------------------------------- stages
 def stage_ingest(source: Path, project_id: str, deps: PipelineDeps) -> str:
-    """Probe the local source into `media_assets`; reuse an existing asset."""
+    """Probe the local source into `media_assets`, build the studio proxy bundle.
+
+    Proxy generation (`ingest.build_proxies`, PLAN §3.3A) is idempotent: an
+    existing asset row short-circuits it, and a crashed run resumes because the
+    row only commits after the proxy artifacts are on disk.
+    """
     with deps.sessions() as s:
         row = s.execute(
             select(MediaAssetRow).where(
@@ -128,6 +134,17 @@ def stage_ingest(source: Path, project_id: str, deps: PipelineDeps) -> str:
             height=info.height or 0,
         )
         s.add(row)
+        s.flush()  # need asset_id before naming the proxy directory
+        try:
+            bundle = build_proxies(
+                source, deps.settings.output_dir / "pipeline" / project_id / "assets" / row.id
+            )
+        except (ProxyBuildError, FileNotFoundError) as e:
+            s.rollback()  # never persist an asset without its proxy bundle
+            raise PipelineError(f"proxy build failed: {e}") from e
+        row.r2_proxy_key = str(bundle.proxy_path)
+        row.r2_audio_key = str(bundle.audio_path)
+        deps.log(f"  [ingest] proxy 480p + scrubsheet + 64k audio -> assets/{row.id[:8]}")
         _set_status(s, project_id, ProjectStatus.ingested)
         s.commit()
         return row.id
@@ -261,17 +278,18 @@ def stage_subtitles(timeline, transcript: dict, project_id: str, deps: PipelineD
 
     No paid API and a pure function of (timeline rate, transcript), so crash-
     resume is satisfied by recomputation — the stage never blocks recovery.
-    Output lands next to the timeline: output/pipeline/<project>/subtitles.ass.
+    Output lands next to the timeline: output/pipeline/<project>/subtitles.{json,ass,srt}.
+    The JSON cue store is what the Director Studio subtitle grid reads/edits.
     """
-    from director_os.subtitles.ass_builder import CaptionBeat, WordTiming, build_ass
+    from director_os.subtitles.ass_builder import CaptionBeat, WordTiming
+    from director_os.subtitles.store import save_cues
 
     words = [w for w in transcript.get("words", []) if w.get("text")]
+    sub_dir = deps.settings.output_dir / "pipeline" / project_id
     if not words:
         deps.log("  [subtitles] transcript empty — skipping ass build")
-        out = deps.settings.output_dir / "pipeline" / project_id / "subtitles.ass"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text("", encoding="utf-8")
-        return out
+        save_cues(sub_dir, [])
+        return sub_dir / "subtitles.ass"
 
     beats: list[CaptionBeat] = []
     MAX_WORDS, MAX_S = 6, 3.5
@@ -309,11 +327,39 @@ def stage_subtitles(timeline, transcript: dict, project_id: str, deps: PipelineD
         run.append(w)
     _flush()
 
-    out = deps.settings.output_dir / "pipeline" / project_id / "subtitles.ass"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(build_ass(beats), encoding="utf-8")
-    deps.log(f"  [subtitles] {len(beats)} cue(s) -> {out.name}")
+    save_cues(sub_dir, beats)
+    out = sub_dir / "subtitles.ass"
+    deps.log(f"  [subtitles] {len(beats)} cue(s) -> subtitles.ass + srt + json")
     return out
+
+
+def _project_redaction_regions(sessions: Any, asset_id: str) -> list[BlurRegion]:
+    """Studio-drawn blur boxes (perception_index.redaction_tracks_json) -> specs."""
+    from director_os.core.models import BBox
+
+    with sessions() as s:
+        row = s.get(PerceptionIndexRow, asset_id)
+    regions: list[BlurRegion] = []
+    for item in (row.redaction_tracks_json or {}).get("regions", []) if row else []:
+        bbox = item.get("bbox") or {}
+        try:
+            regions.append(
+                BlurRegion(
+                    scope=item.get("scope", "global"),
+                    bbox=BBox(
+                        x=int(bbox.get("x", 0)),
+                        y=int(bbox.get("y", 0)),
+                        w=int(bbox.get("w", 0)),
+                        h=int(bbox.get("h", 0)),
+                    ),
+                    mode=item.get("mode", "static"),
+                    sigma=int(item.get("sigma", 24)),
+                    track_id=item.get("id"),
+                )
+            )
+        except (TypeError, ValueError):
+            continue  # a corrupt region must never kill the render
+    return regions
 
 
 def stage_render(
@@ -335,6 +381,7 @@ def stage_render(
         audio=deps.audio,
         out_dir=out_dir,
         audio_target_lufs=deps.settings.target_lufs,
+        global_blur_regions=_project_redaction_regions(deps.sessions, asset_id),
     )
     deps.log(f"  [render] {len(dag.segments)} segment(s), {dag.total_dur_s:.1f}s master")
     report = render_dag(dag, cache, log=deps.log, max_workers=deps.max_workers)

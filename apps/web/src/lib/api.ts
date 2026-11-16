@@ -38,6 +38,35 @@ export interface DispatchResult {
   detail: string;
 }
 
+export interface Asset {
+  id: string;
+  role: string;
+  duration_s: number;
+  width: number;
+  height: number;
+  has_proxy: boolean;
+}
+
+export interface Cue {
+  index: number;
+  text: string;
+  start_ms: number;
+  end_ms: number;
+  speaker: string;
+}
+
+export interface Redaction {
+  id: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  sigma: number;
+  label: string;
+  created_by: string;
+  created_at: string;
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const r = await fetch(`${API_BASE}${path}`, {
     headers: { "Content-Type": "application/json" },
@@ -92,7 +121,38 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
+  // --- M3 close-out: proxy player + subtitle grid + blur canvas
+  listAssets: (id: string) => req<Asset[]>(`/projects/${id}/assets`),
+  listSubtitles: (id: string) => req<Cue[]>(`/projects/${id}/subtitles`),
+  editSubtitle: (id: string, index: number, text: string, speaker?: string) =>
+    req<Cue>(`/projects/${id}/subtitles/${index}`, {
+      method: "PATCH",
+      body: JSON.stringify({ text, speaker: speaker ?? null }),
+    }),
+  listRedactions: (id: string) => req<Redaction[]>(`/projects/${id}/redactions`),
+  addRedaction: (
+    id: string,
+    box: { x: number; y: number; w: number; h: number; sigma?: number; label?: string },
+  ) =>
+    req<Redaction>(`/projects/${id}/redactions`, {
+      method: "POST",
+      body: JSON.stringify(box),
+    }),
+  deleteRedaction: (id: string, regionId: string) =>
+    req<void>(`/projects/${id}/redactions/${regionId}`, { method: "DELETE" }),
 };
+
+export function assetProxyUrl(assetId: string): string {
+  return `${API_BASE}/assets/${assetId}/proxy`;
+}
+
+export function assetScrubUrl(assetId: string): string {
+  return `${API_BASE}/assets/${assetId}/scrubsheet`;
+}
+
+export function srtDownloadUrl(projectId: string): string {
+  return `${API_BASE}/projects/${projectId}/subtitles/srt`;
+}
 
 export function sseUrl(projectId: string, jobId: string): string {
   return `${API_BASE}/projects/${projectId}/jobs/${jobId}/events?poll_s=0.5&max_seconds=600`;

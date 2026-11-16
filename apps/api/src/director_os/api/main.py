@@ -21,18 +21,22 @@ from director_os.api.youtube import (
     InMemoryYouTubePublisher,
     YouTubePublisher,
 )
+from director_os.core.config import get_settings
 from director_os.core.db import (
     AgentToolLogRow,
     JobRow,
+    MediaAssetRow,
+    PerceptionIndexRow,
     ProjectRow,
     init_models,
     make_engine,
     make_session_factory,
+    new_id,
 )
 from director_os.core.models import ProjectStatus
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -426,3 +430,262 @@ def publish_draft(project_id: str, body: PublishDraftRequest) -> PublishDraftRes
         privacy_status=result.privacy_status,
         caption_attached=result.caption_attached,
     )
+
+
+# ------------------------------------------------------------------ studio media (M3 close-out)
+class AssetOut(BaseModel):
+    id: str
+    role: str
+    duration_s: float
+    width: int
+    height: int
+    has_proxy: bool
+
+
+def _primary_asset(s: Session, project_id: str) -> MediaAssetRow:
+    if s.get(ProjectRow, project_id) is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    row = s.execute(
+        select(MediaAssetRow)
+        .where(MediaAssetRow.project_id == project_id)
+        .order_by(MediaAssetRow.id)
+        .limit(1)
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="project has no ingested asset yet")
+    return row
+
+
+def _proxy_file(key: str | None, name: str, sibling: str | None = None) -> Path:
+    """Resolve a stored proxy/audio key to a local path (local backend serves direct)."""
+    if not key:
+        raise HTTPException(status_code=404, detail=f"no {name} for this asset — run the pipeline")
+    p = Path(key)
+    if sibling is not None:
+        p = p.with_name(sibling)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail=f"{name} missing on disk: {p.name}")
+    return p
+
+
+@app.get("/projects/{project_id}/assets", response_model=list[AssetOut])
+def list_assets(project_id: str) -> list[AssetOut]:
+    s = session()
+    if s.get(ProjectRow, project_id) is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    rows = s.execute(
+        select(MediaAssetRow)
+        .where(MediaAssetRow.project_id == project_id)
+        .order_by(MediaAssetRow.id)
+    ).scalars()
+    return [
+        AssetOut(
+            id=r.id,
+            role=r.role,
+            duration_s=r.duration_s,
+            width=r.width,
+            height=r.height,
+            has_proxy=bool(r.r2_proxy_key and Path(r.r2_proxy_key).exists()),
+        )
+        for r in rows
+    ]
+
+
+@app.get("/assets/{asset_id}/proxy")
+def asset_proxy(asset_id: str) -> FileResponse:
+    """480p web proxy — the scrub target for the Director Studio player."""
+    s = session()
+    row = s.get(MediaAssetRow, asset_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="asset not found")
+    s.close()
+    return FileResponse(_proxy_file(row.r2_proxy_key, "proxy"), media_type="video/mp4")
+
+
+@app.get("/assets/{asset_id}/scrubsheet")
+def asset_scrubsheet(asset_id: str) -> FileResponse:
+    """Thumbnail sprite strip rendered beside proxy.mp4 (deterministic sibling)."""
+    s = session()
+    row = s.get(MediaAssetRow, asset_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="asset not found")
+    s.close()
+    return FileResponse(
+        _proxy_file(row.r2_proxy_key, "scrubsheet", sibling="scrubsheet.jpg"),
+        media_type="image/jpeg",
+    )
+
+
+# ------------------------------------------------------------------ subtitle grid (M3 close-out)
+class CueOut(BaseModel):
+    index: int
+    text: str
+    start_ms: int
+    end_ms: int
+    speaker: str
+
+
+class CueEditRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
+    speaker: str | None = Field(default=None, min_length=1, max_length=80)
+
+
+def _subtitle_dir(project_id: str) -> Path:
+    settings = get_settings()
+    return settings.output_dir / "pipeline" / project_id
+
+
+@app.get("/projects/{project_id}/subtitles", response_model=list[CueOut])
+def get_subtitles(project_id: str) -> list[CueOut]:
+    """Structured cue list for the studio subtitle grid."""
+    from director_os.subtitles.store import SubtitleStoreError, load_cues
+
+    s = session()
+    if s.get(ProjectRow, project_id) is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    s.close()
+    try:
+        cues = load_cues(_subtitle_dir(project_id))
+    except SubtitleStoreError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return [
+        CueOut(index=i, text=c.text, start_ms=c.start_ms, end_ms=c.end_ms, speaker=c.speaker)
+        for i, c in enumerate(cues)
+    ]
+
+
+@app.patch("/projects/{project_id}/subtitles/{cue_index}", response_model=CueOut)
+def edit_subtitle(project_id: str, cue_index: int, body: CueEditRequest) -> CueOut:
+    """Proofread one cue — difflib word re-alignment (guardrail 5), artifacts rebuilt."""
+    from director_os.subtitles.store import SubtitleStoreError, edit_cue
+
+    s = session()
+    if s.get(ProjectRow, project_id) is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    s.close()
+    try:
+        beat = edit_cue(_subtitle_dir(project_id), cue_index, body.text, speaker=body.speaker)
+    except SubtitleStoreError as e:
+        detail = str(e)
+        raise HTTPException(
+            status_code=404 if "out of range" in detail else 422, detail=detail
+        ) from e
+    return CueOut(
+        index=cue_index,
+        text=beat.text,
+        start_ms=beat.start_ms,
+        end_ms=beat.end_ms,
+        speaker=beat.speaker,
+    )
+
+
+@app.get("/projects/{project_id}/subtitles/srt")
+def subtitles_srt(project_id: str) -> FileResponse:
+    s = session()
+    if s.get(ProjectRow, project_id) is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    s.close()
+    srt = _subtitle_dir(project_id) / "subtitles.srt"
+    if not srt.exists():
+        raise HTTPException(status_code=404, detail="no subtitles yet — run the pipeline")
+    return FileResponse(srt, media_type="application/x-subrip", filename="subtitles.srt")
+
+
+# ------------------------------------------------------------------ blur canvas (M3 close-out)
+class RedactionIn(BaseModel):
+    """One studio-drawn blur box, in RAW-FOOTAGE pixel coordinates."""
+
+    x: int = Field(ge=0)
+    y: int = Field(ge=0)
+    w: int = Field(gt=0)
+    h: int = Field(gt=0)
+    sigma: int = Field(default=24, ge=1, le=200)
+    label: str = Field(default="", max_length=120)
+
+
+class RedactionOut(RedactionIn):
+    id: str
+    created_by: str
+    created_at: str
+
+
+def _redaction_regions(s: Session, asset_id: str) -> list[dict[str, Any]]:
+    row = s.get(PerceptionIndexRow, asset_id)
+    if row is None:
+        s.add(PerceptionIndexRow(asset_id=asset_id, redaction_tracks_json={"regions": []}))
+        s.commit()
+        return []
+    return list((row.redaction_tracks_json or {}).get("regions", []))
+
+
+def _save_redaction_regions(s: Session, asset_id: str, regions: list[dict[str, Any]]) -> None:
+    row = s.get(PerceptionIndexRow, asset_id)
+    assert row is not None  # created by _redaction_regions above
+    row.redaction_tracks_json = {"regions": regions}
+    s.commit()
+
+
+@app.get("/projects/{project_id}/redactions", response_model=list[RedactionOut])
+def list_redactions(project_id: str) -> list[RedactionOut]:
+    s = session()
+    try:
+        asset = _primary_asset(s, project_id)
+        regions = _redaction_regions(s, asset.id)
+    finally:
+        s.close()
+    return [RedactionOut(**r) for r in regions]
+
+
+@app.post("/projects/{project_id}/redactions", response_model=RedactionOut, status_code=201)
+def add_redaction(project_id: str, body: RedactionIn) -> RedactionOut:
+    """Draw a blur box. Pixel coords are clamped/validated against the raw dims."""
+    from director_os.core.models import BBox, BlurRegion
+    from director_os.vision_fx.redact import validate_regions
+
+    s = session()
+    try:
+        asset = _primary_asset(s, project_id)
+        frame_w = asset.width or 0
+        frame_h = asset.height or 0
+        if frame_w <= 0 or frame_h <= 0:
+            raise HTTPException(status_code=409, detail="asset dimensions unknown — re-ingest")
+        probe_region = BlurRegion(
+            scope="global", bbox=BBox(x=body.x, y=body.y, w=body.w, h=body.h), sigma=body.sigma
+        )
+        if validate_regions([probe_region], frame_w, frame_h) == 0:
+            raise HTTPException(
+                status_code=422,
+                detail=f"box fully outside frame ({frame_w}x{frame_h}) — check coordinates",
+            )
+        regions = _redaction_regions(s, asset.id)
+        region = {
+            "id": new_id(),
+            "x": body.x,
+            "y": body.y,
+            "w": body.w,
+            "h": body.h,
+            "sigma": body.sigma,
+            "label": body.label,
+            "created_by": "human_edit",
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        regions.append(region)
+        _save_redaction_regions(s, asset.id, regions)
+    finally:
+        s.close()
+    return RedactionOut.model_validate(region)
+
+
+@app.delete("/projects/{project_id}/redactions/{region_id}", status_code=204)
+def delete_redaction(project_id: str, region_id: str) -> Response:
+    s = session()
+    try:
+        asset = _primary_asset(s, project_id)
+        regions = _redaction_regions(s, asset.id)
+        kept = [r for r in regions if r.get("id") != region_id]
+        if len(kept) == len(regions):
+            raise HTTPException(status_code=404, detail="redaction region not found")
+        _save_redaction_regions(s, asset.id, kept)
+    finally:
+        s.close()
+    return Response(status_code=204)

@@ -1,7 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, DispatchResult, Job, Project, TimelineState, sseUrl } from "@/lib/api";
+import ProxyPlayer from "@/components/ProxyPlayer";
+import SubtitleGrid from "@/components/SubtitleGrid";
+import { api, Asset, DispatchResult, Job, Project, TimelineState, sseUrl } from "@/lib/api";
 
 const TOOLS = [
   {
@@ -36,6 +38,7 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
   const [project, setProject] = useState<Project | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [timeline, setTimeline] = useState<TimelineState | null>(null);
+  const [assets, setAssets] = useState<Asset[]>([]);
   const [progress, setProgress] = useState<{ stage: string; pct: number; error: string | null } | null>(null);
   const [dispatchLog, setDispatchLog] = useState<DispatchResult[]>([]);
   const [publish, setPublish] = useState<{ video_path: string; title: string; base_description: string }>({
@@ -57,6 +60,7 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
       setProject(await api.getProject(id));
       setJobs(await api.listJobs(id));
       setTimeline(await api.timelineState(id));
+      setAssets(await api.listAssets(id));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -111,6 +115,7 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
 
   const latest = jobs[jobs.length - 1];
   const pct = progress?.pct ?? latest?.progress_pct ?? 0;
+  const playable = assets.find((a) => a.has_proxy);
 
   return (
     <div className="space-y-6">
@@ -149,6 +154,26 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
             </code>
           </p>
         )}
+      </section>
+
+      <section className="card">
+        <h2 className="font-semibold">Proxy scrub + blur canvas</h2>
+        {playable ? (
+          <div className="mt-3">
+            <ProxyPlayer projectId={id} asset={playable} onChanged={refresh} />
+          </div>
+        ) : (
+          <p className="mt-2 text-sm text-slate-500">
+            no 480p proxy yet — ingest builds one automatically (480p + scrubsheet + 64k audio)
+          </p>
+        )}
+      </section>
+
+      <section className="card">
+        <h2 className="font-semibold">Subtitle grid</h2>
+        <div className="mt-3">
+          <SubtitleGrid projectId={id} />
+        </div>
       </section>
 
       <section className="card">

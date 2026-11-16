@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from director_os.core.ffmpeg_args import loudnorm_chain
+from director_os.core.models import BlurRegion
 from director_os.otio_engine.contract import (
     CardMeta,
     NarratorClipMeta,
@@ -88,6 +89,7 @@ def compile_timeline(
     audio: AudioRenderSpec | None = None,
     out_dir: str | Path = "./output/render",
     audio_target_lufs: float = -16.0,
+    global_blur_regions: list[BlurRegion] | None = None,
 ) -> RenderDAG:
     video = video or VideoRenderSpec()
     audio = audio or AudioRenderSpec()
@@ -96,6 +98,8 @@ def compile_timeline(
 
     master = master_track(timeline)
     overlay = track_by_name(timeline, OVERLAY_TRACK)
+    # project-level redactions (Director Studio blur canvas) ride on every raw segment
+    global_blur = list(global_blur_regions or [])
 
     segments: list[SegmentRender] = []
     t_master = 0.0
@@ -125,7 +129,7 @@ def compile_timeline(
                 video=video,
                 audio=audio,
                 audio_filters=audio_filters,
-                blur_regions=list(meta.blur_regions),
+                blur_regions=[*global_blur, *meta.blur_regions],
                 zoom_factor=zoom,
                 codec_profile=f"{video.codec}-{video.pix_fmt}-{video.fps}fps-{audio.sample_rate}hz",
             )

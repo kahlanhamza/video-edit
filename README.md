@@ -64,16 +64,19 @@ Every R&D bug is a CI test — see `tests/unit/test_g1..g8`:
 | --- | --- | --- |
 | M1 | Modular core engine + OTIO + segment caching | **closed** — 1080p demo (42s, 48kHz stereo), parallel segment fleet, ffprobe-validated cache (zero-change re-render: 4/4 hits, 0.1s) |
 | M2 | Native agentic tool runtime + durable orchestration | **core landed** — 8 typed director tools, checkpoint/rollback store, planner-executor with auto-rollback, durable 5-stage pipeline (crash resume, ASR never re-run), Gladia ASR, shot boundaries + audio events, edge-tts `generate_tts`, SKILL.md prompt injection, SSE job progress, YouTube Private-Draft publisher + Human Review Gate |
-| M3 | Director Studio Next.js UI | **landed** — cases, live SSE pipeline progress, timeline version history, checkpoint-first tool dispatch with visible rollback, Human Review Gate publish (Next.js 15, `apps/web`) |
-| M4 | Multimodal vision + Modal serverless GPU | **local surface landed** — `map_route` card (Playwright HTML→PNG + deterministic Pillow fallback), vision LLM adapter port (provider pending key), Modal GPU app scaffold |
+| M3 | Director Studio Next.js UI | **closed** — cases, live SSE pipeline progress, timeline versions, checkpoint-first dispatch with rollback, **proxy scrub player (480p) + mouse-drawn blur canvas + editable subtitle grid**, Human Review Gate publish (Next.js 15, `apps/web`) |
+| M4 | Multimodal vision + Modal serverless GPU | **local surface landed** — `map_route` card, **Gemini vision client live behind the port (`VISION_API_KEY`)**, Modal GPU app scaffold (tokens configured) |
 | M5 | Cloud deployment + multi-channel hardening | **scaffolding landed** — compose healthchecks/restart policies, cost dashboard endpoint (durations + tokens), multi-channel publish fan-out with honest `not_configured` states, `.env.example` |
 
-Remaining across milestones (all external-credential-gated):
-Pydantic AI LLM wiring (needs `LLM_API_KEY` — the tool registry, checkpointing,
-dispatch endpoint, loop and SKILL.md injection are live), real Gladia key for
-cloud ASR (stub path already green), YouTube OAuth for real drafts (in-memory
-publisher green), Modal tokens for GPU renders, and real TikTok/Shorts/Reels
-API apps for multi-channel.
+Live credentials (verified 2026-11-17): **Gladia cloud ASR is end-to-end green**
+(real transcription + diarization through the v2 API, incl. the
+`language_behaviour` removal and utterance-word flattening drift fixes). The
+**LLM backends are live behind the existing `LLMBackend` port**: native Gemini
+(`LLM_API_KEY`, REST function-calling) and any OpenAI-compatible gateway
+(`LLM_BASE_URL`) — the sandbox IP is region-blocked by Google, so point
+`LLM_BASE_URL` at a reachable gateway when running there; the key itself
+validated. Remaining: YouTube refresh token (`YOUTUBE_REFRESH_TOKEN`) for real
+draft uploads, Modal GPU renders, and TikTok/Shorts/Reels API apps.
 
 Legacy note: the previous v0.2 bodycam-autopilot prototype is archived on the
 `legacy/v0.2-autopilot` branch. Do not build on it; PLAN.md supersedes it.
