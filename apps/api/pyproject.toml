@@ -5,6 +5,8 @@ description = "DirectorOS FastAPI gateway (health, projects; full gateway in M2)
 requires-python = ">=3.12"
 dependencies = [
     "director-os-core",
+    "director-os-agent-runtime",
+    "director-os-otio-engine",
     "fastapi>=0.115",
     "uvicorn>=0.30",
 ]

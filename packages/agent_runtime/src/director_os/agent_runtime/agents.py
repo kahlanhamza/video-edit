@@ -156,8 +156,26 @@ class PlannerExecutor:
         return run
 
     def run(self, backend: LLMBackend, timeline) -> AgentRun:
-        """Full loop: propose from current state, execute, return the run report."""
+        """Full loop: propose from current state, execute, return the run report.
+
+        If the backend exposes `last_usage` ({tokens_in, tokens_out}), the
+        proposal itself is logged as a `llm.propose` row — the M5 cost
+        dashboard reads token spend from `agent_tool_logs`.
+        """
+        started = time.monotonic()
         steps = backend.propose(self._state_summary(timeline), self.role)
+        usage = getattr(backend, "last_usage", None)
+        self.store.log_tool(
+            self.agent,
+            "llm.propose",
+            {"role": self.role},
+            result_summary=f"{len(steps)} step(s) proposed",
+            duration_ms=int((time.monotonic() - started) * 1000),
+            project_id=self.project_id,
+            ok=True,
+            tokens_in=usage.get("tokens_in") if isinstance(usage, dict) else None,
+            tokens_out=usage.get("tokens_out") if isinstance(usage, dict) else None,
+        )
         return self.execute_plan(steps, timeline)
 
     def _state_summary(self, timeline) -> str:

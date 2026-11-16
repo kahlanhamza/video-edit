@@ -486,14 +486,18 @@ name = "director-os-api"
 version = "0.1.0"
 source = { editable = "apps/api" }
 dependencies = [
+    { name = "director-os-agent-runtime" },
     { name = "director-os-core" },
+    { name = "director-os-otio-engine" },
     { name = "fastapi" },
     { name = "uvicorn" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "director-os-agent-runtime", editable = "packages/agent_runtime" },
     { name = "director-os-core", editable = "packages/core" },
+    { name = "director-os-otio-engine", editable = "packages/otio_engine" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "uvicorn", specifier = ">=0.30" },
 ]
@@ -538,6 +542,7 @@ dependencies = [
     { name = "alembic" },
     { name = "httpx" },
     { name = "pydantic" },
+    { name = "pysubs2" },
     { name = "sqlalchemy" },
 ]
 
@@ -546,6 +551,7 @@ requires-dist = [
     { name = "alembic", specifier = ">=1.13" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "pydantic", specifier = ">=2.7" },
+    { name = "pysubs2", specifier = ">=1.7" },
     { name = "sqlalchemy", specifier = ">=2.0" },
 ]
 

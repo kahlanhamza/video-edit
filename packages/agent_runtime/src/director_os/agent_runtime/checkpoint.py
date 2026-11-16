@@ -110,6 +110,8 @@ class CheckpointStore:
         project_id: str | None = None,
         ok: bool = True,
         error: str | None = None,
+        tokens_in: int | None = None,
+        tokens_out: int | None = None,
     ) -> None:
         summary = result_summary if ok else f"ERROR: {error}"
         with self._sessions() as s:
@@ -121,6 +123,8 @@ class CheckpointStore:
                     args_json=args,
                     result_summary=summary[:1000],
                     duration_ms=duration_ms,
+                    tokens_in=tokens_in,
+                    tokens_out=tokens_out,
                 )
             )
             s.commit()
@@ -140,6 +144,8 @@ class CheckpointStore:
                     "args": r.args_json,
                     "summary": r.result_summary,
                     "duration_ms": r.duration_ms,
+                    "tokens_in": r.tokens_in,
+                    "tokens_out": r.tokens_out,
                 }
                 for r in rows
             ]

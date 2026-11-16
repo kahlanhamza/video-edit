@@ -33,6 +33,7 @@ from director_os.core.db import (
     make_engine,
     make_session_factory,
 )
+from director_os.core.http import download
 from director_os.core.models import JobStage, ProjectStatus
 from director_os.core.qa_probe import AuditReport, audit_technical, probe
 from director_os.otio_engine.compiler import compile_timeline
@@ -255,6 +256,66 @@ def _timeline_from_json(otio_json: dict):
     return ot_adapters.read_from_string(json.dumps(otio_json), "otio_json")
 
 
+def stage_subtitles(timeline, transcript: dict, project_id: str, deps: PipelineDeps) -> Path:
+    """Build the karaoke .ass sidecar from the transcript (deterministic, free).
+
+    No paid API and a pure function of (timeline rate, transcript), so crash-
+    resume is satisfied by recomputation — the stage never blocks recovery.
+    Output lands next to the timeline: output/pipeline/<project>/subtitles.ass.
+    """
+    from director_os.subtitles.ass_builder import CaptionBeat, WordTiming, build_ass
+
+    words = [w for w in transcript.get("words", []) if w.get("text")]
+    if not words:
+        deps.log("  [subtitles] transcript empty — skipping ass build")
+        out = deps.settings.output_dir / "pipeline" / project_id / "subtitles.ass"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("", encoding="utf-8")
+        return out
+
+    beats: list[CaptionBeat] = []
+    MAX_WORDS, MAX_S = 6, 3.5
+    run: list[dict] = []
+
+    def _flush() -> None:
+        if not run:
+            return
+        beats.append(
+            CaptionBeat(
+                text=" ".join(w["text"] for w in run),
+                start_ms=int(run[0]["start_s"] * 1000),
+                end_ms=int(run[-1]["end_s"] * 1000),
+                speaker=run[0].get("speaker") or "Unknown",
+                words=[
+                    WordTiming(
+                        word=w["text"],
+                        start_ms=int(w["start_s"] * 1000),
+                        end_ms=int(w["end_s"] * 1000),
+                    )
+                    for w in run
+                ],
+            )
+        )
+        run.clear()
+
+    for w in words:
+        if run:
+            same_speaker = (run[0].get("speaker") or "Unknown") == (w.get("speaker") or "Unknown")
+            too_long = w["end_s"] * 1000 - run[0]["start_s"] * 1000 > MAX_S * 1000
+            too_many = len(run) >= MAX_WORDS
+            boundary = w["start_s"] - run[-1]["end_s"] > 1.0  # >1s hole: new cue
+            if too_many or too_long or boundary or not same_speaker:
+                _flush()
+        run.append(w)
+    _flush()
+
+    out = deps.settings.output_dir / "pipeline" / project_id / "subtitles.ass"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(build_ass(beats), encoding="utf-8")
+    deps.log(f"  [subtitles] {len(beats)} cue(s) -> {out.name}")
+    return out
+
+
 def stage_render(
     timeline,
     project_id: str,
@@ -297,12 +358,22 @@ def stage_qa(
 
 # --------------------------------------------------------------------- runner
 def run_pipeline(
-    source: Path,
+    source: Path | str,
     project_id: str,
     deps: PipelineDeps,
     job_id: str | None = None,
 ) -> PipelineResult:
-    """Full autonomous run; safe to re-invoke after a crash at any stage."""
+    """Full autonomous run; safe to re-invoke after a crash at any stage.
+
+    `source` may be a local path or an http(s) URL — URLs are downloaded first
+    through the guardrail UA layer (`core.http.download`), and the pipeline
+    proceeds against the local copy exactly as with a file.
+    """
+    if isinstance(source, str) and source.startswith(("http://", "https://")):
+        name = Path(source.split("?")[0]).name or "ingest.bin"
+        dest = deps.settings.ingest_dir / name
+        deps.log(f"[pipeline] downloading source with UA guardrail -> {dest.name}")
+        source = download(source, dest)
     source = Path(source).resolve()
     if not source.exists():
         raise PipelineError(f"source missing: {source}")
@@ -332,6 +403,9 @@ def run_pipeline(
 
         _update_job(deps.sessions(), job_id, JobStage.render, 60.0)
         report, otio_path = stage_render(timeline, project_id, source, asset_id, deps)
+
+        _update_job(deps.sessions(), job_id, JobStage.subtitles, 85.0)
+        stage_subtitles(timeline, transcript, project_id, deps)
 
         _update_job(deps.sessions(), job_id, JobStage.qa, 90.0)
         audit = stage_qa(report.final_path, dag_total_dur(timeline), job_id, project_id, deps)

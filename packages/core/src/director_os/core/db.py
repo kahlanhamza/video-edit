@@ -109,6 +109,8 @@ class AgentToolLogRow(Base):
     args_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     result_summary: Mapped[str] = mapped_column(String(1000), default="")
     token_cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    tokens_in: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tokens_out: Mapped[int | None] = mapped_column(Integer, nullable=True)
     duration_ms: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 

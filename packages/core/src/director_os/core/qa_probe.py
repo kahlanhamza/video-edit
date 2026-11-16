@@ -7,8 +7,10 @@ Also owns the *probe side* of the audio law (ADR-0005): a rendered file that is 
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -213,3 +215,120 @@ def audit_technical(
         )
 
     return AuditReport(path=str(path), ok=all(c.ok for c in checks), checks=checks)
+
+
+def audit_layout_and_policy(
+    ass_path: str | Path | None = None,
+    cards: list[dict[str, Any]] | None = None,
+    blurs: list[dict[str, Any]] | None = None,
+    frame: tuple[int, int] = (1920, 1080),
+    lane_margins: tuple[int, int] = (46, 96),
+) -> AuditReport:
+    """Deterministic layout/policy audit (PLAN §3.3G `qa.audit_layout_and_policy`).
+
+    Gates (each becomes a named check):
+    - subtitle_lanes: the two-lane margin law holds (MarginV 46/96), type is
+      upright bold, and cues within one lane never overlap in time
+    - card_policy: every card carries a non-empty title
+    - blur_policy: every privacy blur box stays inside the canvas, sigma sane
+
+    The subtitle gate re-reads the *rendered* .ass file with pysubs2 — defense
+    in depth against the builder: what ships is what gets audited.
+    """
+    checks: list[AuditCheck] = []
+    any_input = ass_path is not None or cards or blurs
+
+    if ass_path is not None:
+        checks.append(_audit_subtitle_lanes(Path(ass_path), lane_margins))
+
+    for card in cards or []:
+        fields = card.get("fields") or {}
+        title = str(fields.get("title") or "").strip()
+        checks.append(
+            AuditCheck(
+                name="card_policy",
+                ok=bool(title),
+                detail=(
+                    f"card '{card.get('template')}' title ok" if title else "card has empty title"
+                ),
+            )
+        )
+
+    for i, blur in enumerate(blurs or []):
+        bbox = blur.get("bbox") or {}
+        try:
+            x, y, w, h = (int(bbox[k]) for k in ("x", "y", "w", "h"))
+        except (KeyError, TypeError, ValueError):
+            checks.append(
+                AuditCheck(name="blur_policy", ok=False, detail=f"blur {i}: malformed bbox {bbox}")
+            )
+            continue
+        inside = x >= 0 and y >= 0 and x + w <= frame[0] and y + h <= frame[1]
+        sigma = blur.get("sigma", 0)
+        sigma_ok = isinstance(sigma, (int, float)) and 1 <= sigma <= 200
+        ok = inside and sigma_ok
+        detail = (
+            f"blur {i} bbox {bbox} sigma {sigma}: "
+            + ("inside frame" if inside else f"EXCEEDS frame {frame[0]}x{frame[1]}")
+            + ("" if sigma_ok else ", sigma out of 1..200")
+        )
+        checks.append(AuditCheck(name="blur_policy", ok=ok, detail=detail))
+
+    if not any_input:
+        checks.append(AuditCheck(name="inputs", ok=False, detail="no ass/cards/blurs provided"))
+
+    return AuditReport(path=str(ass_path or ""), ok=all(c.ok for c in checks), checks=checks)
+
+
+def _audit_subtitle_lanes(ass_path: Path, lane_margins: tuple[int, int]) -> AuditCheck:
+    """Margin law (46/96), upright bold faces, and per-lane no-overlap."""
+    import pysubs2
+
+    try:
+        subs = pysubs2.SSAFile.from_string(ass_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return AuditCheck(name="subtitle_lanes", ok=False, detail=f"ass unreadable: {e}")
+
+    problems: list[str] = []
+    lane_styles: dict[int, list[str]] = {1: [], 2: []}
+    for style_name, style in subs.styles.items():
+        m = re.match(r"Lane([12])_", style_name)
+        if not m:
+            continue
+        lane = int(m.group(1))
+        lane_styles[lane].append(style_name)
+        expected = lane_margins[lane - 1]
+        if style.marginv != expected:
+            problems.append(f"{style_name}: MarginV {style.marginv} != law {expected}")
+        if not style.bold:
+            problems.append(f"{style_name}: not bold (law: upright bold)")
+        if style.italic:
+            problems.append(f"{style_name}: italic (law: upright)")
+
+    events_by_lane: dict[int, list[pysubs2.SSAEvent]] = {}
+    for event in subs.events:
+        m = re.match(r"Lane([12])_", event.style or "")
+        if not m:
+            continue
+        events_by_lane.setdefault(int(m.group(1)), []).append(event)
+
+    for lane, events in events_by_lane.items():
+        ordered = sorted(events, key=lambda e: e.start)
+        for a, b in zip(ordered, ordered[1:], strict=False):
+            if b.start < a.end:
+                problems.append(
+                    f"lane {lane} overlap at {a.end / 1000:.2f}s "
+                    f"({b.start / 1000:.2f}s starts before previous cue ends)"
+                )
+                break
+
+    if problems:
+        return AuditCheck(name="subtitle_lanes", ok=False, detail="; ".join(problems[:4]))
+    lanes_used = sorted(events_by_lane)
+    return AuditCheck(
+        name="subtitle_lanes",
+        ok=True,
+        detail=(
+            f"margin law {lane_margins[0]}/{lane_margins[1]} ok; lanes used: {lanes_used or 'none'}"
+        ),
+    )

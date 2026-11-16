@@ -8,7 +8,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
+from director_os.agent_runtime.agents import PlannerExecutor, ToolStep
+from director_os.agent_runtime.checkpoint import CheckpointStore
+from director_os.agent_runtime.editing_tools import DirectorToolbox, build_director_registry
 from director_os.api.events import DEFAULT_MAX_S, DEFAULT_POLL_S, job_progress_stream, require_job
 from director_os.api.youtube import (
     Chapter,
@@ -19,6 +23,7 @@ from director_os.api.youtube import (
 from director_os.core.db import ProjectRow, init_models, make_engine, make_session_factory
 from director_os.core.models import ProjectStatus
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -28,6 +33,15 @@ app = FastAPI(
     title="DirectorOS API",
     version="0.2.0",
     description="Autonomous multimodal video editing platform — gateway",
+)
+
+# Director Studio (M3) talks to this gateway from the browser in dev
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 _engine = None
@@ -116,6 +130,82 @@ def job_events(
         gen(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ------------------------------------------------------------------ agent dispatch
+class AgentDispatchRequest(BaseModel):
+    """One agent tool call, executed checkpoint-first against the active timeline."""
+
+    tool: str
+    args: dict[str, Any] = Field(default_factory=dict)
+    checkpoint_note: str = ""
+
+
+class AgentDispatchResponse(BaseModel):
+    ok: bool
+    agent: str
+    tool: str
+    version_before: int | None = None
+    version: int | None = None
+    rolled_back_to: int | None = None
+    detail: str = ""
+
+
+@app.post("/projects/{project_id}/agent/dispatch", response_model=AgentDispatchResponse)
+def agent_dispatch(project_id: str, body: AgentDispatchRequest) -> AgentDispatchResponse:
+    """Checkpoint-before-execute dispatch of one director tool (PLAN §3.3).
+
+    Loads the project's active timeline version, binds the DirectorToolbox,
+    runs the step through the typed registry inside a PlannerExecutor, and
+    advances the active-version pointer to whatever state survives (the
+    post-step state, or the rolled-back state on failure).
+    """
+    s = session()
+    try:
+        project = s.get(ProjectRow, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        active = project.active_otio_version_id
+    finally:
+        s.close()
+    if active is None:
+        raise HTTPException(
+            status_code=422, detail="project has no timeline yet — run the pipeline first"
+        )
+
+    factory = _session_factory
+    if factory is None:  # session() above always initializes it; belt and braces
+        raise HTTPException(status_code=500, detail="session factory not initialized")
+
+    store = CheckpointStore(factory)
+    timeline = store.load_version(project_id, active)
+    toolbox = DirectorToolbox(timeline, project_id)
+    registry = build_director_registry(toolbox)
+    executor = PlannerExecutor(registry, store, project_id, agent="director_agent", role="director")
+    run = executor.execute_plan(
+        [ToolStep(tool=body.tool, args=body.args, checkpoint_note=body.checkpoint_note)],
+        timeline,
+    )
+
+    step = run.steps[-1] if run.steps else None
+    detail = step.detail if step else "no steps executed"
+
+    # advance the pointer to the surviving state (post-step OR rolled-back)
+    if run.final_version is not None:
+        with factory() as s2:
+            p = s2.get(ProjectRow, project_id)
+            p.active_otio_version_id = run.final_version
+            s2.commit()
+
+    return AgentDispatchResponse(
+        ok=run.ok,
+        agent=run.agent,
+        tool=body.tool,
+        version_before=step.version_before if step else None,
+        version=run.final_version,
+        rolled_back_to=run.rolled_back_to,
+        detail=detail,
     )
 
 
