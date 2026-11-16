@@ -1,7 +1,8 @@
 """Glass graphic cards — deterministic Pillow renderer + collision-free placement.
 
 Templates (PLAN §3.3F `graphics.render_card`): `location_intro`, `case_outcome`,
-`evidence_quote`. `map_route` (animated street maps) is M4 (Playwright-based).
+`evidence_quote`, and `map_route` (M4 — Playwright HTML/CSS pipeline with a
+deterministic Pillow fallback, see `vision_fx.map_route`).
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ GLASS_BG = (16, 20, 28, 205)
 TITLE_COLOR = (240, 240, 240, 255)
 BODY_COLOR = (170, 176, 188, 255)
 
-TEMPLATES = ("location_intro", "case_outcome", "evidence_quote")
+TEMPLATES = ("location_intro", "case_outcome", "evidence_quote", "map_route")
 
 
 class CardError(RuntimeError):
@@ -61,7 +62,9 @@ def render_card(
 ) -> Path:
     """Render an anti-aliased RGBA glass card; returns the PNG path."""
     if template == "map_route":
-        raise CardError("map_route template arrives in M4 (Playwright HTML/CSS pipeline)")
+        from director_os.vision_fx.map_route import render_map_route
+
+        return render_map_route(fields, out_png, size=size)
     if template not in TEMPLATES:
         raise CardError(f"unknown card template: {template} (known: {TEMPLATES})")
 
