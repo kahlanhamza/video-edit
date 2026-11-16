@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
+from director_os.api.events import DEFAULT_MAX_S, DEFAULT_POLL_S, job_progress_stream, require_job
 from director_os.api.youtube import (
     Chapter,
     DraftMetadata,
@@ -18,7 +19,7 @@ from director_os.api.youtube import (
 from director_os.core.db import ProjectRow, init_models, make_engine, make_session_factory
 from director_os.core.models import ProjectStatus
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -92,6 +93,30 @@ def get_project(project_id: str) -> ProjectOut:
     if row is None:
         raise HTTPException(status_code=404, detail="project not found")
     return ProjectOut(id=row.id, title=row.title, niche_skill=row.niche_skill, status=row.status)
+
+
+# ------------------------------------------------------------------ SSE progress
+@app.get("/projects/{project_id}/jobs/{job_id}/events")
+def job_events(
+    project_id: str,
+    job_id: str,
+    poll_s: float = DEFAULT_POLL_S,
+    max_seconds: float = DEFAULT_MAX_S,
+) -> StreamingResponse:
+    """Server-Sent Events stream of pipeline job progress (M2)."""
+    require_job(session(), project_id, job_id)  # 404 before the stream opens
+
+    async def gen():
+        async for frame in job_progress_stream(
+            job_id, _session_factory, poll_s=poll_s, max_seconds=max_seconds
+        ):
+            yield frame
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ------------------------------------------------------------------ publish gate
