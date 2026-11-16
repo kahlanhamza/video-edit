@@ -63,15 +63,16 @@ Every R&D bug is a CI test — see `tests/unit/test_g1..g8`:
 | Milestone | Scope | State |
 | --- | --- | --- |
 | M1 | Modular core engine + OTIO + segment caching | **closed** — 1080p demo (42s, 48kHz stereo), parallel segment fleet, ffprobe-validated cache (zero-change re-render: 4/4 hits, 0.1s) |
-| M2 | Native agentic tool runtime + durable orchestration | **core landed** — 8 typed director tools, checkpoint/rollback store, planner-executor with auto-rollback, durable 5-stage pipeline (crash resume, ASR never re-run), Gladia adapter, YouTube Private-Draft publisher |
+| M2 | Native agentic tool runtime + durable orchestration | **core landed** — 8 typed director tools, checkpoint/rollback store, planner-executor with auto-rollback, durable 5-stage pipeline (crash resume, ASR never re-run), Gladia ASR, shot boundaries + audio events, edge-tts `generate_tts`, SKILL.md prompt injection, SSE job progress, YouTube Private-Draft publisher + Human Review Gate |
 | M3 | Director Studio Next.js UI | pending |
 | M4 | Multimodal vision + Modal serverless GPU | pending |
 | M5 | Cloud deployment + multi-channel hardening | pending |
 
 M2 close-out items remaining: Perceiver/Director/Critic LLM wiring (the
 tool registry, checkpointing and loop are live — the LLMBackend port
-accepts a Pydantic AI backend once API keys exist), TTS narration audio,
-subtitle stage wiring into the pipeline, and the pgvector migration.
+accepts a Pydantic AI backend once API keys exist), the agent tool-dispatch
+endpoint, subtitle stage wiring into the pipeline, `qa.audit_layout_and_policy`,
+and the pgvector migration.
 
 Legacy note: the previous v0.2 bodycam-autopilot prototype is archived on the
 `legacy/v0.2-autopilot` branch. Do not build on it; PLAN.md supersedes it.
