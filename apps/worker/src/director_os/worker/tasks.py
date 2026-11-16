@@ -38,6 +38,19 @@ def run_ffmpeg(cmd: list[str]) -> dict:
     return {"rc": 0, "stderr_tail": r.stderr[-500:]}
 
 
+@celery_app.task(name="directoros.advance_job")
+def advance_job_task(job_id: str, project_id: str, source: str, database_url: str) -> dict:
+    """Resume/advance one durable pipeline job (stages persist their products).
+
+    Safe to retry after a worker crash: completed stages are skipped via the
+    domain tables (media_assets / perception_index / timeline_versions /
+    segment_cache). See `worker.pipeline` for the stage contract.
+    """
+    from director_os.worker.pipeline import advance_job
+
+    return advance_job(job_id, project_id, source, database_url)
+
+
 # ---------------------------------------------------------------------------
 # segment-parallel render fleet (M1 close-out: issue #9 parallel rendering)
 # ---------------------------------------------------------------------------

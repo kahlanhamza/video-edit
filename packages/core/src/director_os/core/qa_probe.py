@@ -132,3 +132,84 @@ class QASummary(BaseModel):
     probe: ProbeResult
     black_seconds: float = Field(default=0.0)
     audio_law_ok: bool = False
+
+
+class AuditCheck(BaseModel):
+    """One named QA gate result (PLAN §3.3G `qa.audit_technical`)."""
+
+    name: str
+    ok: bool
+    detail: str = ""
+
+
+class AuditReport(BaseModel):
+    path: str
+    ok: bool
+    checks: list[AuditCheck] = Field(default_factory=list)
+
+    @property
+    def failures(self) -> list[AuditCheck]:
+        return [c for c in self.checks if not c.ok]
+
+
+def audit_technical(
+    path: str | Path,
+    expected_dur_s: float | None = None,
+    max_black_seconds: float = 3.0,
+    duration_tolerance: float = 1.0,
+) -> AuditReport:
+    """Deterministic technical QA of a rendered master (the `qa` pipeline stage).
+
+    Gates: playable streams present, the 48 kHz stereo audio law, black-frame
+    budget, and (when a target is given) duration drift vs. the compiled DAG.
+    """
+    path = Path(path)
+    checks: list[AuditCheck] = []
+
+    try:
+        info = probe(path)
+        checks.append(
+            AuditCheck(
+                name="streams_present",
+                ok=info.has_video and info.has_audio,
+                detail=f"video={info.has_video} audio={info.has_audio}",
+            )
+        )
+    except Exception as e:  # unplayable file: everything else is moot
+        return AuditReport(
+            path=str(path),
+            ok=False,
+            checks=[AuditCheck(name="streams_present", ok=False, detail=str(e))],
+        )
+
+    law_ok = True
+    law_detail = ""
+    try:
+        assert_audio_law(info)
+        law_detail = f"{info.sample_rate}Hz/{info.channels}ch"
+    except AudioLawError as e:
+        law_ok = False
+        law_detail = str(e)
+    checks.append(AuditCheck(name="audio_law_48k_stereo", ok=law_ok, detail=law_detail))
+
+    black = blackdetect_seconds(path)
+    checks.append(
+        AuditCheck(
+            name="black_frame_budget",
+            ok=black <= max_black_seconds,
+            detail=f"{black:.2f}s black (max {max_black_seconds:.1f}s)",
+        )
+    )
+
+    if expected_dur_s is not None:
+        drift = abs(info.duration_s - expected_dur_s)
+        checks.append(
+            AuditCheck(
+                name="duration_drift",
+                ok=drift <= duration_tolerance,
+                detail=f"final={info.duration_s:.2f}s expected={expected_dur_s:.2f}s "
+                f"(drift {drift:.2f}s, tol {duration_tolerance:.2f}s)",
+            )
+        )
+
+    return AuditReport(path=str(path), ok=all(c.ok for c in checks), checks=checks)

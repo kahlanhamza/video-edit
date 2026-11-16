@@ -10,6 +10,7 @@ dependencies = [
     "director-os-subtitles",
     "director-os-vision-fx",
     "director-os-agent-runtime",
+    "director-os-perception",
     "director-os-api",
     "director-os-worker",
     "director-os-cli",
@@ -36,6 +37,7 @@ director-os-audio-engine = { workspace = true }
 director-os-subtitles = { workspace = true }
 director-os-vision-fx = { workspace = true }
 director-os-agent-runtime = { workspace = true }
+director-os-perception = { workspace = true }
 director-os-api = { workspace = true }
 director-os-worker = { workspace = true }
 director-os-cli = { workspace = true }

@@ -253,6 +253,7 @@ dependencies = [
     { name = "director-os-cli" },
     { name = "director-os-core" },
     { name = "director-os-otio-engine" },
+    { name = "director-os-perception" },
     { name = "director-os-subtitles" },
     { name = "director-os-vision-fx" },
     { name = "director-os-worker" },
@@ -273,6 +274,7 @@ requires-dist = [
     { name = "director-os-cli", editable = "apps/cli" },
     { name = "director-os-core", editable = "packages/core" },
     { name = "director-os-otio-engine", editable = "packages/otio_engine" },
+    { name = "director-os-perception", editable = "packages/perception" },
     { name = "director-os-subtitles", editable = "packages/subtitles" },
     { name = "director-os-vision-fx", editable = "packages/vision_fx" },
     { name = "director-os-worker", editable = "apps/worker" },
@@ -437,6 +439,7 @@ dependencies = [
     { name = "celery", extra = ["redis"] },
     { name = "director-os-core" },
     { name = "director-os-otio-engine" },
+    { name = "director-os-perception" },
 ]
 
 [package.metadata]
@@ -444,6 +447,7 @@ requires-dist = [
     { name = "celery", extras = ["redis"], specifier = ">=5.4" },
     { name = "director-os-core", editable = "packages/core" },
     { name = "director-os-otio-engine", editable = "packages/otio_engine" },
+    { name = "director-os-perception", editable = "packages/perception" },
 ]
 
 [[package]]
