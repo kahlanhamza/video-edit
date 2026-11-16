@@ -3,7 +3,7 @@ name = "director-os-audio-engine"
 version = "0.1.0"
 description = "DirectorOS audio engine: FFmpeg chains (48kHz lock, slicing, ducking, speech-aware trims)"
 requires-python = ">=3.12"
-dependencies = ["director-os-core"]
+dependencies = ["director-os-core", "edge-tts>=6.1"]
 
 [build-system]
 requires = ["hatchling"]
