@@ -1,9 +1,13 @@
 [project]
 name = "director-os-agent-runtime"
-version = "0.1.0"
-description = "DirectorOS agent runtime: typed tool registry for native function-calling"
+version = "0.2.0"
+description = "DirectorOS agent runtime: typed tool registry, director editing tools, checkpoint/rollback"
 requires-python = ">=3.12"
-dependencies = ["pydantic>=2.7"]
+dependencies = [
+    "pydantic>=2.7",
+    "director-os-core",
+    "director-os-otio-engine",
+]
 
 [build-system]
 requires = ["hatchling"]

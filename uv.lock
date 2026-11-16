@@ -287,14 +287,20 @@ dev = [
 
 [[package]]
 name = "director-os-agent-runtime"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "packages/agent_runtime" }
 dependencies = [
+    { name = "director-os-core" },
+    { name = "director-os-otio-engine" },
     { name = "pydantic" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "pydantic", specifier = ">=2.7" }]
+requires-dist = [
+    { name = "director-os-core", editable = "packages/core" },
+    { name = "director-os-otio-engine", editable = "packages/otio_engine" },
+    { name = "pydantic", specifier = ">=2.7" },
+]
 
 [[package]]
 name = "director-os-api"
