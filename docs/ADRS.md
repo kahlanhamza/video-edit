@@ -38,3 +38,39 @@ from the PLAN folder listing; everything else follows §6 verbatim.
 **ADR-0008 — pgvector arrives with M2, JSON stands in for M1.** `scene_embeddings` is a
 JSON column in M1 (sqlite-runnable, CI-friendly); the pgvector column type lands with the
 Postgres migration work in M2. Schema column is named for the swap.
+
+## ADR-0009 — Pipeline idempotency via domain-table persistence (2026-11-16)
+
+**Status:** Accepted (M2)
+
+**Context:** PLAN §8 M2 done-when: a worker crash mid-render must not re-run
+ASR/TTS. Celery retries and operator re-runs are facts of life.
+
+**Decision:** Every pipeline stage persists its product in a *domain* table
+(`media_assets`, `perception_index`, `timeline_versions`, `segment_cache`)
+BEFORE the job row advances. Resume = re-run the pipeline; each stage checks
+its domain table and skips completed work. Soft failures also record
+stage + error on `jobs`; hard kills (SIGKILL) persist nothing and still
+resume correctly because no stage ever holds its only copy of finished work
+in memory.
+
+**Alternatives rejected:** workflow-engine state snapshots (Temporal adopts
+this naturally later; Celery-only for now per ADR-0004); idempotency keys on
+job rows (duplicates state that domain tables already hold).
+
+**Consequences:** stage logic is naturally restartable and testable without
+a broker; adding a stage means picking its domain table first.
+
+## ADR-0010 — Publish gate is a Private Draft, never auto-public (2026-11-16)
+
+**Status:** Accepted (M2)
+
+**Decision:** The Human Review Gate outcome is a YouTube upload with
+`privacyStatus=private`, `notifySubscribers=False`. A human presses Publish.
+Chapter metadata is validated against YouTube's real rules (0:00 first, >=3
+chapters, >=10s apart) at the API boundary so the Data API never rejects a
+payload. `GoogleYouTubePublisher` lazy-imports googleapiclient; tests and
+dry runs use `InMemoryYouTubePublisher` behind the same protocol.
+
+**Consequences:** no token-scope surprises in CI; publishing is auditable
+(`projects.youtube_draft_id`) and reversible before the human step.
