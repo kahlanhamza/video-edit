@@ -26,6 +26,7 @@ from director_os.core.db import (
     make_engine,
     make_session_factory,
 )
+from director_os.otio_engine.contract import NarratorClipMeta, RawClipMeta
 from director_os.otio_engine.timeline import (
     MASTER_TRACK,
     OVERLAY_TRACK,
@@ -55,19 +56,19 @@ def timeline():
                             name="raw_1",
                             source_start_s=0.0,
                             dur_s=10.0,
-                            meta={"kind": "raw", "asset_id": "a1"},
+                            meta=RawClipMeta(asset_id="a1"),
                         ),
                         ClipSpec(
                             name="raw_2",
                             source_start_s=10.0,
                             dur_s=8.0,
-                            meta={"kind": "raw", "asset_id": "a1"},
+                            meta=RawClipMeta(asset_id="a1"),
                         ),
                         ClipSpec(
                             name="narr",
                             source_start_s=0.0,
                             dur_s=5.0,
-                            meta={"kind": "narration", "script_text": "Original narration line."},
+                            meta=NarratorClipMeta(script_text="Original narration line."),
                         ),
                     ],
                 ),

@@ -24,11 +24,17 @@ AgentRole = Literal["perceiver", "director", "assembler", "critic"]
 
 
 class ToolStep(BaseModel):
-    """One proposed tool call in an agent plan."""
+    """One proposed tool call in an agent plan.
+
+    `provider_meta` carries provider-opaque fields (e.g. Gemini 3.x
+    `thoughtSignature` / functionCall `id`) that cannot survive normalization
+    on the generic fields but may be required to replay the conversation.
+    """
 
     tool: str
     args: dict[str, Any] = Field(default_factory=dict)
     checkpoint_note: str = ""
+    provider_meta: dict[str, Any] | None = None
 
 
 class LLMBackend(Protocol):
@@ -176,7 +182,14 @@ class PlannerExecutor:
             tokens_in=usage.get("tokens_in") if isinstance(usage, dict) else None,
             tokens_out=usage.get("tokens_out") if isinstance(usage, dict) else None,
         )
-        return self.execute_plan(steps, timeline)
+        run = self.execute_plan(steps, timeline)
+        # Multi-turn providers replay tool results into the next proposal
+        # (Gemini 3.x pairs functionResponse with the replayed functionCall
+        # turn + its thoughtSignature). Duck-typed: ScriptedBackend needs none.
+        record = getattr(backend, "record_results", None)
+        if callable(record):
+            record(steps, [sr.detail for sr in run.steps])
+        return run
 
     def _state_summary(self, timeline) -> str:
         from director_os.otio_engine.compiler import master_track

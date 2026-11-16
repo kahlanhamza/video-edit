@@ -5,8 +5,25 @@ PlannerExecutor loop, checkpoint-first dispatch and token accounting are
 provider-agnostic:
 
 - `GeminiRestBackend`  — native Google AI Studio (Generative Language REST,
-  `x-goog-api-key`). Function-calling via `functionDeclarations`; the registry's
-  OpenAI schemas map 1:1.
+  `x-goog-api-key`). Function-calling via `functionDeclarations` sending the
+  registry's Pydantic schemas through `parametersJsonSchema` (full JSON Schema
+  support), assistant turns replayed verbatim across follow-up calls.
+
+  Gemini 3.x REST traps handled here (each pinned by a unit test):
+  1. `thoughtSignature` — the model attaches this opaque field to the first
+     `functionCall` part. It is NOT representable on the normalized `ToolStep`,
+     so it rides along in `ToolStep.provider_meta` while the raw assistant turn
+     is replayed untouched in `contents` on turn 2+. Dropping it => HTTP 400
+     `missing thought_signature`.
+  2. `parametersJsonSchema` instead of `parameters` — the legacy field parses
+     into an OpenAPI 3.0 protobuf subset and rejects `additionalProperties`,
+     `$defs`/`$ref`, `anyOf` with HTTP 400. `parametersJsonSchema` accepts the
+     full JSON Schema, so Pydantic v2 output is passed through unmodified.
+  3. AQ. key 401s — if `x-goog-api-key` returns 401
+     `ACCESS_TOKEN_TYPE_UNSUPPORTED` (AI Studio key quirk), the request is
+     retried once with `?key=` as a query parameter. Also note for ops: if you
+     restrict the key in Cloud Console, pick the **Generative Language API**
+     (not "Gemini API", a known GCP dropdown trap).
 - `OpenAICompatBackend` — any OpenAI-compatible `/chat/completions` endpoint
   (vLLM, OpenRouter, GLM, a Gemini-to-OpenAI gateway) via `LLM_BASE_URL`.
 
@@ -34,37 +51,37 @@ class LLMBackendError(RuntimeError):
     pass
 
 
-def _clean_schema(parameters: dict[str, Any]) -> dict[str, Any]:
-    """Strip JSON-Schema keys Gemini rejects ($defs, additionalProperties...)."""
-    drop = {"additionalProperties", "$defs", "$schema", "title"}
-    out: dict[str, Any] = {}
-    for k, v in parameters.items():
-        if k in drop:
-            continue
-        if isinstance(v, dict):
-            out[k] = _clean_schema(v)
-        elif isinstance(v, list):
-            out[k] = [_clean_schema(i) if isinstance(i, dict) else i for i in v]
-        else:
-            out[k] = v
-    return out
-
-
 def _declarations(registry: ToolRegistry) -> list[dict[str, Any]]:
+    """functionDeclarations for Gemini 3.x REST (trap #2).
+
+    The legacy `parameters` field parses into an OpenAPI 3.0 protobuf subset
+    and 400s on Pydantic v2 output (`additionalProperties`, `$defs`/`$ref`,
+    `anyOf`). `parametersJsonSchema` supports the full JSON Schema, so the
+    registry schema passes through untouched — no lossy stripping.
+    """
     return [
         {
             "name": f["function"]["name"],
             "description": f["function"]["description"],
-            "parameters": _clean_schema(f["function"]["parameters"]),
+            "parametersJsonSchema": f["function"]["parameters"],
         }
         for f in registry.openai_schemas()
     ]
 
 
 class GeminiRestBackend:
-    """Native Google AI Studio function-calling backend (LLM_API_KEY)."""
+    """Native Google AI Studio function-calling backend (LLM_API_KEY).
+
+    Multi-turn capable: every `propose()` call on the same instance replays the
+    conversation so far (`self._history`). Assistant turns go back in verbatim
+    so Gemini 3.x `thoughtSignature` fields survive byte-for-byte (trap #1);
+    tool results are fed back via `record_results()` as functionResponse parts.
+    """
 
     provider = "gemini"
+
+    # bound on replayed conversation turns (user + model entries)
+    HISTORY_MAX_ENTRIES = 24
 
     def __init__(
         self,
@@ -85,6 +102,54 @@ class GeminiRestBackend:
         self.base_url = base_url.rstrip("/")
         self.last_usage: dict[str, int] | None = None
         self.last_system_prompt = ""
+        self._history: list[dict[str, Any]] = []
+
+    def _post(self, client: httpx.Client, url: str, payload: dict[str, Any]) -> httpx.Response:
+        """POST with x-goog-api-key, plus the trap #3 fallback.
+
+        Some AI Studio AQ. keys reject the `x-goog-api-key` header with 401
+        ACCESS_TOKEN_TYPE_UNSUPPORTED; the `?key=` query-param form resolves
+        it. Retried once with the query param (header dropped).
+        """
+        try:
+            r = client.post(url, headers={"x-goog-api-key": self.api_key}, json=payload)
+        except httpx.HTTPError as e:
+            raise LLMBackendError(f"gemini request failed: {e}") from e
+        if r.status_code == 401 and "ACCESS_TOKEN_TYPE_UNSUPPORTED" in r.text:
+            try:
+                r = client.post(url, params={"key": self.api_key}, json=payload)
+            except httpx.HTTPError as e:
+                raise LLMBackendError(f"gemini request failed: {e}") from e
+        return r
+
+    def _remember(self, entry: dict[str, Any]) -> None:
+        self._history.append(entry)
+        if len(self._history) > self.HISTORY_MAX_ENTRIES:
+            del self._history[: len(self._history) - self.HISTORY_MAX_ENTRIES]
+
+    def reset_history(self) -> None:
+        """Drop replayed turns (new conversation on the next propose)."""
+        self._history.clear()
+
+    def record_results(self, steps: list[ToolStep], results: list[str]) -> None:
+        """Append tool results as functionResponse parts (Gemini shape).
+
+        Pairs with the replayed assistant `functionCall` turn so the next
+        `propose()` is a valid multi-step tool conversation. Optional port
+        extension — callers duck-type (`hasattr(backend, "record_results")`),
+        so PlannerExecutor stays provider-agnostic.
+        """
+        parts = [
+            {
+                "functionResponse": {
+                    "name": step.tool,
+                    "response": {"result": str(res)[:4000]},
+                }
+            }
+            for step, res in zip(steps, results, strict=False)
+        ]
+        if parts:
+            self._remember({"role": "user", "parts": parts})
 
     def propose(self, state_summary: str, role: AgentRole) -> list[ToolStep]:
         self.last_system_prompt = compose_agent_prompt(
@@ -94,29 +159,28 @@ class GeminiRestBackend:
             state_summary=state_summary,
             registry=self.registry,
         )
-        payload: dict[str, Any] = {
-            "systemInstruction": {"parts": [{"text": self.last_system_prompt}]},
-            "contents": [
+        user_turn = {
+            "role": "user",
+            "parts": [
                 {
-                    "role": "user",
-                    "parts": [
-                        {
-                            "text": "Timeline state:\n"
-                            + state_summary
-                            + "\n\nPropose the next tool calls. Respond ONLY with "
-                            "function calls against the provided tools — at most "
-                            f"{MAX_STEPS_PER_PROPOSAL}, in execution order."
-                        }
-                    ],
+                    "text": "Timeline state:\n"
+                    + state_summary
+                    + "\n\nPropose the next tool calls. Respond ONLY with "
+                    "function calls against the provided tools — at most "
+                    f"{MAX_STEPS_PER_PROPOSAL}, in execution order."
                 }
             ],
+        }
+        payload: dict[str, Any] = {
+            "systemInstruction": {"parts": [{"text": self.last_system_prompt}]},
+            "contents": [*self._history, user_turn],
             "tools": [{"functionDeclarations": _declarations(self.registry)}],
             "generationConfig": {"temperature": 0.4, "maxOutputTokens": 2048},
         }
         url = f"{self.base_url}/v1beta/models/{self.model}:generateContent"
         try:
             with httpx.Client(transport=self._transport, timeout=PROPOSE_TIMEOUT_S) as client:
-                r = client.post(url, headers={"x-goog-api-key": self.api_key}, json=payload)
+                r = self._post(client, url, payload)
         except httpx.HTTPError as e:
             raise LLMBackendError(f"gemini request failed: {e}") from e
         if r.status_code != 200:
@@ -127,18 +191,31 @@ class GeminiRestBackend:
             "tokens_in": int(usage.get("promptTokenCount", 0)),
             "tokens_out": int(usage.get("candidatesTokenCount", 0)),
         }
+        parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+        # Trap #1: replay the assistant turn VERBATIM — thoughtSignature rides
+        # on the first functionCall part and must not be re-serialized through
+        # the normalized ToolStep. Normalized copies live on ToolStep.provider_meta
+        # for callers that need them.
+        if parts:
+            self._remember({"role": "model", "parts": parts})
         steps: list[ToolStep] = []
-        for part in data.get("candidates", [{}])[0].get("content", {}).get("parts", []):
+        for part in parts:
             call = part.get("functionCall")
             if not call:
                 continue
             name = call.get("name", "")
             if name in self.registry.names():
+                meta: dict[str, Any] = {}
+                if part.get("thoughtSignature"):
+                    meta["thoughtSignature"] = part["thoughtSignature"]
+                if call.get("id"):
+                    meta["call_id"] = call["id"]
                 steps.append(
                     ToolStep(
                         tool=name,
                         args=call.get("args") or {},
                         checkpoint_note=f"{self.provider}:{self.model} proposal",
+                        provider_meta=meta or None,
                     )
                 )
             if len(steps) >= MAX_STEPS_PER_PROPOSAL:

@@ -59,7 +59,9 @@ def project_with_timeline(api_client, tmp_path):
     )
     store = CheckpointStore(api_main._session_factory)
     version = store.checkpoint(timeline, pid, note="dispatch test seed", created_by="test")
-    with api_main._session_factory() as s:
+    factory = api_main._session_factory
+    assert factory is not None
+    with factory() as s:
         p = s.get(ProjectRow, pid)
         p.active_otio_version_id = version
         s.commit()
@@ -102,7 +104,9 @@ def test_dispatch_trim_advances_pointer(api_client, project_with_timeline):
     from director_os.agent_runtime.checkpoint import CheckpointStore
     from director_os.core.db import ProjectRow
 
-    with api_main._session_factory() as s:
+    factory = api_main._session_factory
+    assert factory is not None
+    with factory() as s:
         assert s.get(ProjectRow, pid).active_otio_version_id == body2["version"]
     store = CheckpointStore(api_main._session_factory)
     notes = [v["checkpoint_note"] for v in store.list_versions(pid)]
@@ -128,7 +132,9 @@ def test_dispatch_semantic_failure_rolls_back(api_client, project_with_timeline)
     import director_os.api.main as api_main
     from director_os.core.db import ProjectRow
 
-    with api_main._session_factory() as s:
+    factory = api_main._session_factory
+    assert factory is not None
+    with factory() as s:
         assert s.get(ProjectRow, pid).active_otio_version_id == body["rolled_back_to"]
 
 

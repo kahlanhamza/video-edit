@@ -134,7 +134,9 @@ def project_with_asset(api_client, fixture_video):
 def api_main_session():
     import director_os.api.main as api_main
 
-    return api_main._session_factory()
+    factory = api_main._session_factory
+    assert factory is not None
+    return factory()
 
 
 def test_assets_list_and_proxy_stream(project_with_asset):

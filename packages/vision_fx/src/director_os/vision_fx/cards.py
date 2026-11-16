@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from typing import Any
 
 from director_os.core.fonts import pick_font
 from PIL import Image, ImageDraw
@@ -56,7 +57,7 @@ def _font(path: Path, size: int):
 
 def render_card(
     template: str,
-    fields: dict[str, str],
+    fields: dict[str, Any],
     out_png: str | Path,
     size: tuple[int, int] = (CANVAS_W, CANVAS_H),
 ) -> Path:

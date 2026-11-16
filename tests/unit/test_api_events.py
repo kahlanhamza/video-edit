@@ -125,7 +125,9 @@ def test_list_projects_and_jobs(api_client, tmp_path):
     import director_os.api.main as api_main
     from director_os.core.db import JobRow
 
-    with api_main._session_factory() as s:
+    factory = api_main._session_factory
+    assert factory is not None
+    with factory() as s:
         s.add(JobRow(project_id=pid, current_stage="qa", progress_pct=90.0))
         s.commit()
     r = api_client.get(f"/projects/{pid}/jobs")
@@ -142,7 +144,9 @@ def test_timeline_state_endpoint(api_client, tmp_path):
     import director_os.api.main as api_main
     from director_os.core.db import ProjectRow
 
-    with api_main._session_factory() as s:
+    factory = api_main._session_factory
+    assert factory is not None
+    with factory() as s:
         s.get(ProjectRow, pid).active_otio_version_id = v
         s.commit()
 

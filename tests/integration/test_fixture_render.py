@@ -152,3 +152,48 @@ def test_exported_otio_reloads_for_nle_roundtrip(fixture_video: Path, tmp_path):
     assert sum(
         (i.source_range.duration.to_seconds() if i.source_range else 0) for i in master
     ) == pytest.approx(12.0)
+
+
+def test_global_blur_regions_merge_into_raw_segments(fixture_video: Path, tmp_path):
+    """M3 redaction canvas: project-level blur boxes ride on EVERY raw segment,
+    merged ahead of the clip's own meta regions, and change segment hashes."""
+    tl = build_timeline(build_spec(sigma=12))
+    cache = SegmentCache(tmp_path / "segments_canvas")
+    global_blur = [
+        BlurRegion(
+            bbox=BBox(x=500, y=20, w=120, h=60),
+            sigma=9,
+            track_id="canvas_1",
+            scope="global",
+        )
+    ]
+    dag = compile_timeline(
+        tl,
+        assets={"a1": str(fixture_video)},
+        cache=cache,
+        video=VideoRenderSpec(w=640, h=360, fps=30),
+        audio=AudioRenderSpec(),
+        out_dir=tmp_path / "render_canvas",
+        global_blur_regions=global_blur,
+    )
+    raw = [s for s in dag.segments if s.spec.kind == "raw"]
+    assert len(raw) == 2
+    # seg1 = canvas region + clip-meta region; seg2 = canvas region only
+    assert [len(s.spec.blur_regions) for s in raw] == [2, 1]
+    for s in raw:
+        canvas = [r for r in s.spec.blur_regions if r.track_id == "canvas_1"]
+        assert len(canvas) == 1 and canvas[0].bbox == BBox(x=500, y=20, w=120, h=60)
+    # canvas precedes clip meta in the merge order
+    assert raw[0].spec.blur_regions[0].track_id == "canvas_1"
+
+    # a compile WITHOUT the canvas must yield different segment keys
+    cache_plain = SegmentCache(tmp_path / "segments_plain")
+    dag_plain = compile_timeline(
+        build_timeline(build_spec(sigma=12)),
+        assets={"a1": str(fixture_video)},
+        cache=cache_plain,
+        video=VideoRenderSpec(w=640, h=360, fps=30),
+        audio=AudioRenderSpec(),
+        out_dir=tmp_path / "render_plain",
+    )
+    assert [s.key for s in dag_plain.segments] != [s.key for s in dag.segments]

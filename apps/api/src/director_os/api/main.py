@@ -10,9 +10,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from director_os.agent_runtime.agents import PlannerExecutor, ToolStep
+from director_os.agent_runtime.agents import AgentRole, PlannerExecutor, ToolStep
 from director_os.agent_runtime.checkpoint import CheckpointStore
 from director_os.agent_runtime.editing_tools import DirectorToolbox, build_director_registry
+from director_os.agent_runtime.llm import LLMBackendError, build_backend
 from director_os.api.channels import ChannelPublisher, MultiChannelPublisher
 from director_os.api.events import DEFAULT_MAX_S, DEFAULT_POLL_S, job_progress_stream, require_job
 from director_os.api.youtube import (
@@ -278,6 +279,107 @@ def agent_dispatch(project_id: str, body: AgentDispatchRequest) -> AgentDispatch
         version=run.final_version,
         rolled_back_to=run.rolled_back_to,
         detail=detail,
+    )
+
+
+# ------------------------------------------------------------------ LLM plan loop
+class AgentPlanRequest(BaseModel):
+    """Full LLM loop trigger: propose steps via the configured provider, execute."""
+
+    role: AgentRole = "director"
+    niche: str = "bodycam_documentary"
+
+
+class AgentPlanStepOut(BaseModel):
+    tool: str
+    ok: bool
+    detail: str = ""
+    version_before: int | None = None
+
+
+class AgentPlanResponse(BaseModel):
+    ok: bool
+    agent: str
+    provider: str
+    model: str
+    steps: list[AgentPlanStepOut] = Field(default_factory=list)
+    steps_ok: int = 0
+    final_version: int | None = None
+    rolled_back_to: int | None = None
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    detail: str = ""
+
+
+@app.post("/projects/{project_id}/agent/plan", response_model=AgentPlanResponse)
+def agent_plan(project_id: str, body: AgentPlanRequest | None = None) -> AgentPlanResponse:
+    """Real provider loop (PLAN §3.1): propose -> checkpoint-first execute.
+
+    `build_backend()` picks the provider from env: native Google AI Studio
+    (GeminiRestBackend) when LLM_BASE_URL is blank, an OpenAI-compatible
+    gateway when set, always against the DirectorToolbox registry. Tool results
+    are replayed into the conversation when the backend supports multi-turn
+    (`record_results` — Gemini 3.x thoughtSignature turns). 503 when no
+    provider is configured; tests inject ScriptedBackend at the port instead.
+    """
+    body = body or AgentPlanRequest()
+    s = session()
+    try:
+        project = s.get(ProjectRow, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        active = project.active_otio_version_id
+    finally:
+        s.close()
+    if active is None:
+        raise HTTPException(
+            status_code=422, detail="project has no timeline yet — run the pipeline first"
+        )
+    factory = _session_factory
+    if factory is None:
+        raise HTTPException(status_code=500, detail="session factory not initialized")
+
+    store = CheckpointStore(factory)
+    timeline = store.load_version(project_id, active)
+    toolbox = DirectorToolbox(timeline, project_id)
+    registry = build_director_registry(toolbox)
+    try:
+        backend = build_backend(registry, body.niche)
+    except LLMBackendError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    executor = PlannerExecutor(
+        registry, store, project_id, agent=f"{body.role}_agent", role=body.role
+    )
+    run = executor.run(backend, timeline)
+
+    if run.final_version is not None:
+        with factory() as s2:
+            p = s2.get(ProjectRow, project_id)
+            p.active_otio_version_id = run.final_version
+            s2.commit()
+
+    usage = getattr(backend, "last_usage", None)
+    usage = usage if isinstance(usage, dict) else {}
+    return AgentPlanResponse(
+        ok=run.ok,
+        agent=run.agent,
+        provider=str(getattr(backend, "provider", "scripted")),
+        model=str(getattr(backend, "model", "")),
+        steps=[
+            AgentPlanStepOut(
+                tool=st.tool, ok=st.ok, detail=st.detail, version_before=st.version_before
+            )
+            for st in run.steps
+        ],
+        steps_ok=run.steps_ok,
+        final_version=run.final_version,
+        rolled_back_to=run.rolled_back_to,
+        tokens_in=usage.get("tokens_in"),
+        tokens_out=usage.get("tokens_out"),
+        detail="plan executed"
+        if run.ok
+        else f"rolled back to version {run.rolled_back_to}",
     )
 
 
