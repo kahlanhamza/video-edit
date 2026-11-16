@@ -34,6 +34,8 @@ class Settings:
     r2_access_key_id: str
     r2_secret_access_key: str
     r2_bucket: str
+    # --- external services (M2)
+    gladia_api_key: str
 
 
 def _load() -> Settings:
@@ -56,6 +58,7 @@ def _load() -> Settings:
         r2_access_key_id=os.getenv("R2_ACCESS_KEY_ID", ""),
         r2_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY", ""),
         r2_bucket=os.getenv("R2_BUCKET", "directoros"),
+        gladia_api_key=os.getenv("GLADIA_API_KEY", ""),
     )
 
 

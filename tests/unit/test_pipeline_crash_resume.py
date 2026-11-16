@@ -48,7 +48,9 @@ def fake_transcriber_factory(call_log: list[str], fixture: Path):
         speaker_cycle = ["OFFICER_1", "CIVILIAN"]
         for i in range(int(info_dur / 0.5)):
             speaker = speaker_cycle[i % 2]
-            w = WordTiming(text=f"w{i}", start_s=round(t, 2), end_s=round(t + 0.4, 2), speaker=speaker)
+            w = WordTiming(
+                text=f"w{i}", start_s=round(t, 2), end_s=round(t + 0.4, 2), speaker=speaker
+            )
             words.append(w)
             t += 0.5
         for speaker in speaker_cycle:
