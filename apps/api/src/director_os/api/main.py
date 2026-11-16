@@ -20,7 +20,7 @@ from director_os.api.youtube import (
     InMemoryYouTubePublisher,
     YouTubePublisher,
 )
-from director_os.core.db import ProjectRow, init_models, make_engine, make_session_factory
+from director_os.core.db import JobRow, ProjectRow, init_models, make_engine, make_session_factory
 from director_os.core.models import ProjectStatus
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -100,6 +100,16 @@ def create_project(body: ProjectCreate) -> ProjectOut:
     return ProjectOut(id=row.id, title=row.title, niche_skill=row.niche_skill, status=row.status)
 
 
+@app.get("/projects", response_model=list[ProjectOut])
+def list_projects() -> list[ProjectOut]:
+    """All projects, newest first (Director Studio project list)."""
+    s = session()
+    rows = s.execute(select(ProjectRow).order_by(ProjectRow.created_at.desc()).limit(200)).scalars()
+    return [
+        ProjectOut(id=r.id, title=r.title, niche_skill=r.niche_skill, status=r.status) for r in rows
+    ]
+
+
 @app.get("/projects/{project_id}", response_model=ProjectOut)
 def get_project(project_id: str) -> ProjectOut:
     s = session()
@@ -107,6 +117,56 @@ def get_project(project_id: str) -> ProjectOut:
     if row is None:
         raise HTTPException(status_code=404, detail="project not found")
     return ProjectOut(id=row.id, title=row.title, niche_skill=row.niche_skill, status=row.status)
+
+
+# ------------------------------------------------------------------ read models for the studio
+class JobOut(BaseModel):
+    id: str
+    stage: str
+    progress_pct: float
+    error: str | None = None
+
+
+class TimelineVersionOut(BaseModel):
+    version_num: int
+    created_by: str
+    checkpoint_note: str = ""
+    created_at: str | None = None
+
+
+class TimelineStateOut(BaseModel):
+    active_version: int | None
+    versions: list[TimelineVersionOut]
+
+
+@app.get("/projects/{project_id}/jobs", response_model=list[JobOut])
+def list_jobs(project_id: str) -> list[JobOut]:
+    s = session()
+    if s.get(ProjectRow, project_id) is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    rows = s.execute(
+        select(JobRow).where(JobRow.project_id == project_id).order_by(JobRow.created_at)
+    ).scalars()
+    return [
+        JobOut(id=r.id, stage=r.current_stage, progress_pct=r.progress_pct, error=r.error_message)
+        for r in rows
+    ]
+
+
+@app.get("/projects/{project_id}/timeline", response_model=TimelineStateOut)
+def timeline_state(project_id: str) -> TimelineStateOut:
+    """Version history + active pointer (Director Studio timeline panel)."""
+    s = session()
+    row = s.get(ProjectRow, project_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    active = row.active_otio_version_id
+    s.close()
+    store = CheckpointStore(_session_factory)  # type: ignore[arg-type]
+    versions = store.list_versions(project_id)
+    return TimelineStateOut(
+        active_version=active, versions=[TimelineVersionOut(**v) for v in versions]
+    )
 
 
 # ------------------------------------------------------------------ SSE progress

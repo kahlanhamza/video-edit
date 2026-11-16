@@ -82,3 +82,74 @@ def test_sse_job_of_other_project_404(api_client, tmp_path):
     pid_b = api_client.post("/projects", json={"title": "Other"}).json()["id"]
     r = api_client.get(f"/projects/{pid_b}/jobs/{jid}/events")
     assert r.status_code == 404
+
+
+def _seed_timeline(api_client, pid: str) -> int:
+    import director_os.api.main as api_main
+    from director_os.agent_runtime.checkpoint import CheckpointStore
+    from director_os.otio_engine.contract import RawClipMeta
+    from director_os.otio_engine.timeline import ClipSpec, TimelineSpec, TrackSpec, build_timeline
+
+    timeline = build_timeline(
+        TimelineSpec(
+            name="studio_case",
+            fps=30,
+            width=1920,
+            height=1080,
+            tracks=[
+                TrackSpec(
+                    name="V1_master",
+                    items=[
+                        ClipSpec(
+                            name="raw_1",
+                            source_start_s=0.0,
+                            dur_s=4.0,
+                            meta=RawClipMeta(asset_id="a"),
+                        )
+                    ],
+                )
+            ],
+        )
+    )
+    store = CheckpointStore(api_main._session_factory)
+    return store.checkpoint(timeline, pid, note="studio seed", created_by="test")
+
+
+def test_list_projects_and_jobs(api_client, tmp_path):
+    ids = [api_client.post("/projects", json={"title": f"P{i}"}).json()["id"] for i in range(2)]
+    r = api_client.get("/projects")
+    assert r.status_code == 200
+    assert {p["id"] for p in r.json()} == set(ids)
+
+    pid = ids[0]
+    import director_os.api.main as api_main
+    from director_os.core.db import JobRow
+
+    with api_main._session_factory() as s:
+        s.add(JobRow(project_id=pid, current_stage="qa", progress_pct=90.0))
+        s.commit()
+    r = api_client.get(f"/projects/{pid}/jobs")
+    assert r.status_code == 200
+    jobs = r.json()
+    assert len(jobs) == 1 and jobs[0]["stage"] == "qa" and jobs[0]["progress_pct"] == 90.0
+    assert api_client.get("/projects/nope/jobs").status_code == 404
+
+
+def test_timeline_state_endpoint(api_client, tmp_path):
+    pid = api_client.post("/projects", json={"title": "Timeline case"}).json()["id"]
+    v = _seed_timeline(api_client, pid)
+
+    import director_os.api.main as api_main
+    from director_os.core.db import ProjectRow
+
+    with api_main._session_factory() as s:
+        s.get(ProjectRow, pid).active_otio_version_id = v
+        s.commit()
+
+    r = api_client.get(f"/projects/{pid}/timeline")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["active_version"] == v
+    assert len(body["versions"]) == 1
+    assert body["versions"][0]["checkpoint_note"] == "studio seed"
+    assert api_client.get("/projects/nope/timeline").status_code == 404
