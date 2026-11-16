@@ -158,10 +158,8 @@ def test_worker_crash_mid_render_never_reruns_asr(fixture_video: Path, tmp_path,
         pipeline_mod.render_dag = original
 
     assert calls == ["asr"], "ASR ran exactly once before the crash"
-    job_state = None
     with deps.sessions() as s:
         job = s.execute(select(JobRow)).scalars().one()
-        job_state = job.current_stage
         assert job.current_stage == JobStage.render.value
         assert "worker killed" in (job.error_message or "")
 
@@ -231,4 +229,9 @@ def test_audit_technical_passes_on_good_master(fixture_video: Path):
     audit = audit_technical(fixture_video, expected_dur_s=12.0, duration_tolerance=1.0)
     assert audit.ok, [c.detail for c in audit.failures]
     names = [c.name for c in audit.checks]
-    assert {"streams_present", "audio_law_48k_stereo", "black_frame_budget", "duration_drift"} == set(names)
+    assert set(names) == {
+        "streams_present",
+        "audio_law_48k_stereo",
+        "black_frame_budget",
+        "duration_drift",
+    }
