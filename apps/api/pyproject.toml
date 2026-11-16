@@ -1,0 +1,17 @@
+[project]
+name = "director-os-api"
+version = "0.1.0"
+description = "DirectorOS FastAPI gateway (health, projects; full gateway in M2)"
+requires-python = ">=3.12"
+dependencies = [
+    "director-os-core",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/director_os"]
