@@ -36,6 +36,11 @@ services:
       - "9001:9001"
     volumes:
       - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   api:
     build:
@@ -51,10 +56,18 @@ services:
       R2_BUCKET: directoros
     ports:
       - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     depends_on:
       db:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      minio:
         condition: service_healthy
 
   worker:
@@ -63,6 +76,7 @@ services:
       dockerfile: apps/worker/Dockerfile
     command:
       ["celery", "-A", "director_os.worker.celery_app.celery_app", "worker", "-l", "info"]
+    restart: unless-stopped
     environment:
       DATABASE_URL: postgresql+psycopg://directoros:directoros@db:5432/directoros
       REDIS_URL: redis://redis:6379/0
@@ -71,13 +85,20 @@ services:
       R2_ACCESS_KEY_ID: directoros
       R2_SECRET_ACCESS_KEY: directoros-secret
       R2_BUCKET: directoros
+    healthcheck:
+      test: ["CMD", "celery", "-A", "director_os.worker.celery_app.celery_app", "inspect", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
+      minio:
+        condition: service_healthy
 
-  # Director Studio web UI — Milestone 3 (PLAN §8). Uncomment when apps/web lands.
+  # Director Studio web UI — Milestone 3 (PLAN §8). Built; needs a web Dockerfile to run in compose.
   # web:
   #   build:
   #     context: .

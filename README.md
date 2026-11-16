@@ -64,15 +64,16 @@ Every R&D bug is a CI test — see `tests/unit/test_g1..g8`:
 | --- | --- | --- |
 | M1 | Modular core engine + OTIO + segment caching | **closed** — 1080p demo (42s, 48kHz stereo), parallel segment fleet, ffprobe-validated cache (zero-change re-render: 4/4 hits, 0.1s) |
 | M2 | Native agentic tool runtime + durable orchestration | **core landed** — 8 typed director tools, checkpoint/rollback store, planner-executor with auto-rollback, durable 5-stage pipeline (crash resume, ASR never re-run), Gladia ASR, shot boundaries + audio events, edge-tts `generate_tts`, SKILL.md prompt injection, SSE job progress, YouTube Private-Draft publisher + Human Review Gate |
-| M3 | Director Studio Next.js UI | pending |
-| M4 | Multimodal vision + Modal serverless GPU | pending |
-| M5 | Cloud deployment + multi-channel hardening | pending |
+| M3 | Director Studio Next.js UI | **landed** — cases, live SSE pipeline progress, timeline version history, checkpoint-first tool dispatch with visible rollback, Human Review Gate publish (Next.js 15, `apps/web`) |
+| M4 | Multimodal vision + Modal serverless GPU | **local surface landed** — `map_route` card (Playwright HTML→PNG + deterministic Pillow fallback), vision LLM adapter port (provider pending key), Modal GPU app scaffold |
+| M5 | Cloud deployment + multi-channel hardening | **scaffolding landed** — compose healthchecks/restart policies, cost dashboard endpoint (durations + tokens), multi-channel publish fan-out with honest `not_configured` states, `.env.example` |
 
-M2 close-out items remaining: Perceiver/Director/Critic LLM wiring (the
-tool registry, checkpointing and loop are live — the LLMBackend port
-accepts a Pydantic AI backend once API keys exist), the agent tool-dispatch
-endpoint, subtitle stage wiring into the pipeline, `qa.audit_layout_and_policy`,
-and the pgvector migration.
+Remaining across milestones (all external-credential-gated):
+Pydantic AI LLM wiring (needs `LLM_API_KEY` — the tool registry, checkpointing,
+dispatch endpoint, loop and SKILL.md injection are live), real Gladia key for
+cloud ASR (stub path already green), YouTube OAuth for real drafts (in-memory
+publisher green), Modal tokens for GPU renders, and real TikTok/Shorts/Reels
+API apps for multi-channel.
 
 Legacy note: the previous v0.2 bodycam-autopilot prototype is archived on the
 `legacy/v0.2-autopilot` branch. Do not build on it; PLAN.md supersedes it.

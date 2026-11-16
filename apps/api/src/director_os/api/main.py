@@ -13,6 +13,7 @@ from typing import Any
 from director_os.agent_runtime.agents import PlannerExecutor, ToolStep
 from director_os.agent_runtime.checkpoint import CheckpointStore
 from director_os.agent_runtime.editing_tools import DirectorToolbox, build_director_registry
+from director_os.api.channels import ChannelPublisher, MultiChannelPublisher
 from director_os.api.events import DEFAULT_MAX_S, DEFAULT_POLL_S, job_progress_stream, require_job
 from director_os.api.youtube import (
     Chapter,
@@ -20,13 +21,20 @@ from director_os.api.youtube import (
     InMemoryYouTubePublisher,
     YouTubePublisher,
 )
-from director_os.core.db import JobRow, ProjectRow, init_models, make_engine, make_session_factory
+from director_os.core.db import (
+    AgentToolLogRow,
+    JobRow,
+    ProjectRow,
+    init_models,
+    make_engine,
+    make_session_factory,
+)
 from director_os.core.models import ProjectStatus
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 app = FastAPI(
@@ -266,6 +274,93 @@ def agent_dispatch(project_id: str, body: AgentDispatchRequest) -> AgentDispatch
         version=run.final_version,
         rolled_back_to=run.rolled_back_to,
         detail=detail,
+    )
+
+
+# ------------------------------------------------------------------ cost dashboard
+class CostReport(BaseModel):
+    project_id: str
+    tool_calls: int
+    total_duration_ms: int
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    token_cost_usd: float = 0.0
+    recent: list[dict[str, Any]] = Field(default_factory=list)
+
+
+@app.get("/projects/{project_id}/costs", response_model=CostReport)
+def project_costs(project_id: str, limit: int = 20) -> CostReport:
+    """M5 cost dashboard feed: durations + token spend from `agent_tool_logs`."""
+    s = session()
+    if s.get(ProjectRow, project_id) is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    row = s.execute(
+        select(
+            func.count(AgentToolLogRow.id),
+            func.coalesce(func.sum(AgentToolLogRow.duration_ms), 0),
+            func.coalesce(func.sum(AgentToolLogRow.tokens_in), 0),
+            func.coalesce(func.sum(AgentToolLogRow.tokens_out), 0),
+            func.coalesce(func.sum(AgentToolLogRow.token_cost_usd), 0.0),
+        ).where(AgentToolLogRow.project_id == project_id)
+    ).one()
+    s.close()
+    store = CheckpointStore(_session_factory)  # type: ignore[arg-type]
+    return CostReport(
+        project_id=project_id,
+        tool_calls=row[0],
+        total_duration_ms=int(row[1] or 0),
+        tokens_in=int(row[2] or 0) or None,
+        tokens_out=int(row[3] or 0) or None,
+        token_cost_usd=float(row[4] or 0.0),
+        recent=store.recent_logs(project_id, limit=limit),
+    )
+
+
+# ------------------------------------------------------------------ multi-channel publish
+class ChannelPublishRequest(BaseModel):
+    """Fan the approved master out to additional platforms (M5)."""
+
+    video_path: str
+    title: str = Field(min_length=1, max_length=100)
+    description: str = ""
+
+
+class ChannelPublishResponse(BaseModel):
+    project_id: str
+    channels: list[dict[str, Any]]
+
+
+_multichannel = MultiChannelPublisher()
+
+
+def set_channel_publisher(publisher: ChannelPublisher) -> None:
+    """Register/replace one platform adapter (tests + production wiring)."""
+    _multichannel.register(publisher)
+
+
+@app.post("/projects/{project_id}/publish-channels", response_model=ChannelPublishResponse)
+def publish_channels(project_id: str, body: ChannelPublishRequest) -> ChannelPublishResponse:
+    """Report per-channel publish status — unconfigured channels never fake it."""
+    s = session()
+    try:
+        if s.get(ProjectRow, project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+    finally:
+        s.close()
+    if not Path(body.video_path).exists():
+        raise HTTPException(status_code=422, detail=f"video not found: {body.video_path}")
+    results = _multichannel.publish(Path(body.video_path), body.title, body.description)
+    return ChannelPublishResponse(
+        project_id=project_id,
+        channels=[
+            {
+                "channel": r.channel.value,
+                "status": r.status,
+                "external_id": r.external_id,
+                "detail": r.detail,
+            }
+            for r in results
+        ],
     )
 
 
