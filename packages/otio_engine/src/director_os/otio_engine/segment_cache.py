@@ -1,9 +1,10 @@
 """Segment cache — content-hashed render units (ADR-0003, PLAN §5.1 `segment_cache`).
 
 The cache key is a stable SHA-256 over the FULL render specification: source range,
-filter chains, blur regions, card *content* digests, codec + audio-law settings.
-Changing one narrator word, one blur sigma or one card pixel changes exactly one key —
-which is what makes "fix one word, re-render in seconds" true by construction.
+filter chains, blur regions, zoom keyframes, freeze callouts, card *content* digests,
+codec + audio-law settings. Changing one narrator word, one blur sigma, one zoom
+keyframe or one card pixel changes exactly one key — which is what makes "fix one
+word, re-render in seconds" true by construction.
 
 Acceptance on `put()` is ffprobe-based, not byte-count-based: an all-black narration
 segment is legitimately tiny (a few dozen KB), while a half-written encode from a
@@ -19,7 +20,8 @@ import shutil
 from pathlib import Path
 from typing import Literal
 
-from director_os.core.models import AudioContract, BlurRegion
+from director_os.core.models import AudioContract, BlurRegion, ZoomKeyframe
+from director_os.otio_engine.contract import FreezeCallout
 from pydantic import BaseModel, Field
 
 MIN_SEGMENT_BYTES = 2_048
@@ -59,7 +61,7 @@ class VideoRenderSpec(BaseModel):
 
 
 class SegmentRenderSpec(BaseModel):
-    schema_version: int = 1
+    schema_version: int = 2  # v2: blur-before-zoom ordering + keyframed zoompan + freeze
     kind: Literal["raw", "narration"] = "raw"
     asset_id: str = ""
     source_start_s: float = Field(default=0.0, ge=0.0)
@@ -70,18 +72,27 @@ class SegmentRenderSpec(BaseModel):
     video_filters: list[str] = Field(default_factory=list)
     blur_regions: list[BlurRegion] = Field(default_factory=list)
     zoom_factor: float = Field(default=1.0, ge=1.0, le=3.0)
+    zoom_keyframes: list[ZoomKeyframe] = Field(default_factory=list)
+    freeze_callout: FreezeCallout | None = None
+    spotlight_png_path: str | None = None
     cards: list[CardOverlaySpec] = Field(default_factory=list)
     narration_text: str = ""
     codec_profile: str = ""
 
 
 def segment_hash(spec: SegmentRenderSpec) -> str:
-    payload = spec.model_dump(mode="json", exclude={"cards": {"__all__": {"png_path"}}})
+    payload = spec.model_dump(
+        mode="json",
+        exclude={"cards": {"__all__": {"png_path"}}, "spotlight_png_path": True},
+    )
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     h = hashlib.sha256(("dos-seg-v1|" + canonical).encode()).hexdigest()
-    # card file CONTENT invalidates the key (pixel-level card edits re-render)
+    # card/overlay file CONTENT invalidates the key (pixel-level edits re-render)
     for card in sorted(spec.cards, key=lambda c: c.png_path):
         digest = _file_digest(card.png_path)
+        h = hashlib.sha256((h + "|" + digest).encode()).hexdigest()
+    if spec.spotlight_png_path:
+        digest = _file_digest(spec.spotlight_png_path)
         h = hashlib.sha256((h + "|" + digest).encode()).hexdigest()
     return h[:40]
 

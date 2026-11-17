@@ -3,7 +3,9 @@
 Every `otio.schema.Clip` carries structured `metadata["director_os"]`:
 
 - raw_bwc clips:  {"kind": "raw", "audio_mode": "loudnorm_48k", "trim_silence": true,
-                   "zoom_keyframes": [...], "blur_regions": [...], "angle_id": "bwc_1"}
+                   "zoom_keyframes": [...], "blur_regions": [...], "angle_id": "bwc_1",
+                   "freeze_callout": {"freeze_at_s": ..., "hold_s": ..., "dim_alpha": ...,
+                                      "spotlight_bbox": {...} | null} | null}
 - narrator clips: {"kind": "narration", "tts_provider": "edge", "voice_id": "...",
                    "script_text": "...", "broll_asset_id": ..., "broll_range": [s, e],
                    "broll_audio_volume": 0.0, "jl_cut": {"j_s": 0.4}}
@@ -18,7 +20,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from director_os.core.models import BlurRegion, ZoomKeyframe
+from director_os.core.models import BBox, BlurRegion, ZoomKeyframe
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 METADATA_KEY = "director_os"
@@ -32,6 +34,22 @@ class JLCut(BaseModel):
     l_s: float = Field(default=0.0, ge=0.0, le=10.0)
 
 
+class FreezeCallout(BaseModel):
+    """Freeze-frame evidence highlight (PLAN §3.3E `vision_fx.freeze_callout`).
+
+    At `freeze_at_s` (segment-local seconds) the picture freezes for `hold_s`
+    while audio keeps running — narration rides the freeze. `dim_alpha` darkens
+    the background; `spotlight_bbox` (RAW-FOOTAGE pixels, same canvas as the
+    blur regions) is punched out at full brightness with an accent ring. A
+    `None` bbox dims the whole frame (e.g. under a full-screen document).
+    """
+
+    freeze_at_s: float = Field(ge=0.0)
+    hold_s: float = Field(default=3.0, gt=0.0, le=15.0)
+    dim_alpha: float = Field(default=0.45, ge=0.0, le=0.9)
+    spotlight_bbox: BBox | None = None
+
+
 class RawClipMeta(BaseModel):
     kind: Literal["raw"] = "raw"
     asset_id: str
@@ -39,6 +57,7 @@ class RawClipMeta(BaseModel):
     trim_silence: bool = True
     zoom_keyframes: list[ZoomKeyframe] = Field(default_factory=list)
     blur_regions: list[BlurRegion] = Field(default_factory=list)
+    freeze_callout: FreezeCallout | None = None
     angle_id: str | None = None
 
 

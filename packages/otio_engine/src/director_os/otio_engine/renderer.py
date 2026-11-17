@@ -49,8 +49,7 @@ def build_segment_cmd(
     dur = spec.source_dur_s
     cmd: list[str] = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
 
-    graph, uses_complex = compose_filter_complex(spec)
-    n_card_inputs = len(spec.cards)
+    graph, uses_complex, n_overlay_inputs = compose_filter_complex(spec)
 
     if spec.kind == "narration" and src_path is None:
         # narration on black (TTS audio lands in M2; broll visuals per contract)
@@ -65,9 +64,11 @@ def build_segment_cmd(
         cmd += exact_slice_args(spec.source_start_s, spec.source_start_s + dur)
         cmd += ["-i", str(src_path)]
 
-    n_inputs = 1 + n_card_inputs
+    n_inputs = 1 + n_overlay_inputs
     for card in spec.cards:
         cmd += ["-loop", "1", "-i", card.png_path]
+    if spec.spotlight_png_path:
+        cmd += ["-loop", "1", "-i", spec.spotlight_png_path]
 
     # ---- audio routing: raw clips carry their own audio; everything else rides a
     #      silent 48 kHz stereo bed so the stream map never goes missing.

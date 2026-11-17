@@ -13,9 +13,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from director_os.core.ffmpeg_args import loudnorm_chain
-from director_os.core.models import BlurRegion
+from director_os.core.models import BlurRegion, ZoomKeyframe
 from director_os.otio_engine.contract import (
     CardMeta,
+    FreezeCallout,
     NarratorClipMeta,
     RawClipMeta,
     parse_clip_meta,
@@ -36,7 +37,8 @@ from director_os.otio_engine.timeline import (
     track_by_name,
 )
 from director_os.vision_fx.cards import pick_corner, render_card
-from director_os.vision_fx.redact import scale_region
+from director_os.vision_fx.redact import scale_bbox, scale_region
+from director_os.vision_fx.spotlight import render_spotlight_overlay
 
 
 class TimelineCompileError(RuntimeError):
@@ -82,6 +84,28 @@ def validate_uniformity(dag: RenderDAG) -> None:
             )
 
 
+def _resolve_freeze(
+    fc: FreezeCallout,
+    dur_s: float,
+    raw_geo: tuple[int, int] | None,
+    render_w: int,
+    render_h: int,
+) -> FreezeCallout | None:
+    """Validate + adapt an authored freeze callout for one segment.
+
+    Clamps the hold to the segment tail (dropping callouts that start beyond
+    it) and maps the spotlight bbox from RAW-FOOTAGE pixels into render space
+    with the same letterbox-aware geometry the blur regions use.
+    """
+    if fc.freeze_at_s >= dur_s - 0.1:
+        return None
+    hold = min(fc.hold_s, dur_s - fc.freeze_at_s)
+    box = fc.spotlight_bbox
+    if box is not None and raw_geo is not None and tuple(raw_geo) != (render_w, render_h):
+        box = scale_bbox(box, raw_geo[0], raw_geo[1], render_w, render_h)
+    return fc.model_copy(update={"hold_s": hold, "spotlight_bbox": box})
+
+
 def compile_timeline(
     timeline,
     assets: Mapping[str, str | Path],
@@ -119,7 +143,8 @@ def compile_timeline(
             src = assets.get(meta.asset_id)
             if src is None:
                 raise TimelineCompileError(f"unknown asset_id '{meta.asset_id}' in master track")
-            zoom = max((k.zoom_factor for k in meta.zoom_keyframes), default=1.0)
+            zoom_keyframes: list[ZoomKeyframe] = list(meta.zoom_keyframes)
+            zoom = max((k.zoom_factor for k in zoom_keyframes), default=1.0)
             audio_filters = (
                 [loudnorm_chain(audio.target_lufs)] if meta.audio_mode == "loudnorm_48k" else []
             )
@@ -130,6 +155,15 @@ def compile_timeline(
                 # detector sweep) — the renderer blurs AFTER scale+pad, so map
                 # them into render space or they land in the wrong place
                 blur = [scale_region(r, raw_geo[0], raw_geo[1], video.w, video.h) for r in blur]
+            freeze = None
+            spotlight_png = None
+            if meta.freeze_callout is not None:
+                freeze = _resolve_freeze(meta.freeze_callout, dur, raw_geo, video.w, video.h)
+                if freeze is not None:
+                    spotlight_png = cards_dir / f"spotlight_{int(t_master * 1000)}.png"
+                    render_spotlight_overlay(
+                        video.w, video.h, freeze.spotlight_bbox, freeze.dim_alpha, spotlight_png
+                    )
             spec = SegmentRenderSpec(
                 kind="raw",
                 asset_id=meta.asset_id,
@@ -140,6 +174,9 @@ def compile_timeline(
                 audio_filters=audio_filters,
                 blur_regions=blur,
                 zoom_factor=zoom,
+                zoom_keyframes=zoom_keyframes,
+                freeze_callout=freeze,
+                spotlight_png_path=str(spotlight_png) if spotlight_png else None,
                 codec_profile=f"{video.codec}-{video.pix_fmt}-{video.fps}fps-{audio.sample_rate}hz",
             )
         elif isinstance(meta, NarratorClipMeta):

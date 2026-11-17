@@ -27,32 +27,41 @@ def _clamp_region(
     return x, y, w, h
 
 
-def scale_region(region: BlurRegion, from_w: int, from_h: int, to_w: int, to_h: int) -> BlurRegion:
-    """Map a region from source pixel space to render pixel space (letterbox-aware).
+def scale_bbox(bbox: BBox, from_w: int, from_h: int, to_w: int, to_h: int) -> BBox:
+    """Map one box from source pixel space to render pixel space (letterbox-aware).
 
     Studio canvas boxes and detector sweeps are stored in RAW-FOOTAGE pixels,
-    but `build_blur_chain` runs AFTER `scale+pad` — i.e. in render space.
-    Rendering a 1920x1080 source at 1280x720 without this mapping would place
-    every raw-space box wrongly (or clamp it away entirely). Mapping matches
-    the geometry chain exactly: `scale=force_original_aspect_ratio=decrease`
-    then centered `pad`, so s = min(tw/fw, th/fh) and the remainder is
-    letterbox. A no-op when the spaces already match.
+    but every renderer effect (blur chains, spotlight overlays) runs AFTER
+    `scale+pad` — i.e. in render space. Mapping matches the geometry chain
+    exactly: `scale=force_original_aspect_ratio=decrease` then centered `pad`,
+    so s = min(tw/fw, th/fh) and the remainder is letterbox. A no-op when the
+    spaces already match.
     """
     if (from_w, from_h) == (to_w, to_h) or from_w <= 0 or from_h <= 0:
-        return region
+        return bbox
     s = min(to_w / from_w, to_h / from_h)
     pad_x = (to_w - from_w * s) / 2.0
     pad_y = (to_h - from_h * s) / 2.0
-    x = max(0, int(round(region.bbox.x * s + pad_x)))
-    y = max(0, int(round(region.bbox.y * s + pad_y)))
-    w = max(4, int(round(region.bbox.w * s)))
-    h = max(4, int(round(region.bbox.h * s)))
+    x = max(0, int(round(bbox.x * s + pad_x)))
+    y = max(0, int(round(bbox.y * s + pad_y)))
+    w = max(4, int(round(bbox.w * s)))
+    h = max(4, int(round(bbox.h * s)))
     w = min(w, to_w - x)
     h = min(h, to_h - y)
     if w < 4 or h < 4:
         # degenerate after scale — keep a minimal visible box so redaction intent survives
         w, h = 4, 4
-    return region.model_copy(update={"bbox": BBox(x=x, y=y, w=w, h=h)})
+    return BBox(x=x, y=y, w=w, h=h)
+
+
+def scale_region(region: BlurRegion, from_w: int, from_h: int, to_w: int, to_h: int) -> BlurRegion:
+    """Map a blur region from source pixel space to render pixel space.
+
+    A no-op that returns the ORIGINAL object when the spaces already match.
+    """
+    if (from_w, from_h) == (to_w, to_h) or from_w <= 0 or from_h <= 0:
+        return region
+    return region.model_copy(update={"bbox": scale_bbox(region.bbox, from_w, from_h, to_w, to_h)})
 
 
 def _safe_sigmas(sigma: int, box_w: int, box_h: int) -> tuple[int, int]:
