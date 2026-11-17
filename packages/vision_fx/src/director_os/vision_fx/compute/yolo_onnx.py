@@ -47,6 +47,24 @@ def resolve_yolo_model_path(model_path: str | Path | None = None) -> Path | None
     return None
 
 
+def resolve_input_size(declared_shape: list, requested: int) -> tuple[int, str]:
+    """Reconcile the caller's requested sweep size with the ONNX model's input.
+
+    Returns (effective_size, note). Fixed exports (lindevs releases pin 640x640)
+    MUST win: feeding 960 into a 640-fixed model raises INVALID_ARGUMENT — the
+    exact silent failure that emptied the Eustis tracked plan (issue #14
+    follow-up). Dynamic exports (str/symbolic dims) honor the requested size.
+    """
+    dims = declared_shape[1:] if len(declared_shape) >= 4 else []
+    ints = [d for d in dims if isinstance(d, int)]
+    if len(ints) >= 2 and len(ints) == len(dims):
+        eff = ints[-1]
+        if eff != requested:
+            return eff, f"model input fixed at {eff}; requested {requested} honored-as-{eff}"
+        return eff, f"model input fixed at {eff}"
+    return requested, "dynamic model input; requested size used"
+
+
 class YoloOnnxFaceDetector:
     """onnxruntime wrapper: (name + raw-pixel boxes), same shape as YuNet's."""
 
@@ -79,6 +97,9 @@ class YoloOnnxFaceDetector:
             str(resolved), sess_options=opts, providers=["CPUExecutionProvider"]
         )
         self._input_name = self._session.get_inputs()[0].name
+        self._input_size, self._input_note = resolve_input_size(
+            list(self._session.get_inputs()[0].shape), input_size
+        )
 
     # ------------------------------------------------------------- preprocess
     def _letterbox(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, float, int, int]:

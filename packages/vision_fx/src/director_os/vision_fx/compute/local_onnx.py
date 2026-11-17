@@ -42,6 +42,19 @@ DEFAULT_SWEEP_CONF = 0.22
 DEFAULT_TRACK_BUFFER = 60  # BoT-SORT buffer, sampled frames
 
 
+def median_flow_shift(disp: np.ndarray) -> tuple[float, float]:
+    """Median (dx, dy) of a stack of per-point displacements.
+
+    cv2 point arrays arrive shaped (N, 1, 2); `np.median(..., axis=0)` on that
+    yields (1, 2) whose elements are arrays — numpy 2.x refuses `float()` on
+    them and the whole sweep crashes. Flattening to (N, 2) first makes the
+    median a proper (2,) vector. Regression-tested (test_local_onnx_flow.py).
+    """
+    flat = np.asarray(disp).reshape(-1, 2)
+    med = np.median(flat, axis=0)
+    return float(med[0]), float(med[1])
+
+
 class _FrameDetector(Protocol):
     """Structural type any face detector must satisfy (name + raw-pixel boxes)."""
 
@@ -140,7 +153,7 @@ class LocalOnnxCpuBackend:
         motions: list[tuple[float, float]] = []
         prev_gray: np.ndarray | None = None
         prev_pts: np.ndarray | None = None
-        idx, decoded, failed = 0, 0, 0
+        idx, decoded = 0, 0
         while decoded < max_samples:
             ok, frame = cap.read()
             if not ok:
@@ -155,8 +168,7 @@ class LocalOnnxCpuBackend:
                     )
                     good = st.ravel() == 1
                     if good.sum() >= 8:
-                        med = np.median(next_pts[good] - prev_pts[good], axis=0)
-                        motions.append((float(med[0]), float(med[1])))
+                        motions.append(median_flow_shift(next_pts[good] - prev_pts[good]))
                     else:
                         motions.append((0.0, 0.0))
                 else:
@@ -167,12 +179,12 @@ class LocalOnnxCpuBackend:
                         gray, maxCorners=200, qualityLevel=0.01, minDistance=8, blockSize=7
                     ),
                 )
-                try:
-                    hits = det.detect(frame)
-                except Exception:
-                    failed += 1
-                    idx += 1
-                    continue
+                # Fail LOUD: a detector exception is a code/shape bug, not a
+                # soft capability gap. Swallowing it here produced an EMPTY
+                # tracked plan on real footage (Eustis) — the render baked
+                # zero redaction while the audit passed vacuously. Capability
+                # absence raises at construction (`_make_detector`), never here.
+                hits = det.detect(frame)
                 decoded += 1
                 detections_per_frame.append(
                     [(int(x), int(y), int(w), int(h), float(s)) for x, y, w, h, s in hits]
@@ -185,7 +197,7 @@ class LocalOnnxCpuBackend:
 
         # the tracker consumes the detector's name for stats via capabilities
         self._last_detector_name = getattr(det, "name", "unknown")
-        self._last_failed_frames = failed
+        self._last_failed_frames = 0  # detector errors raise — nothing is swallowed
         tracks = track_and_interpolate(
             detections_per_frame,
             t_per_frame,

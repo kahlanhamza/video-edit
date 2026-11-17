@@ -164,9 +164,9 @@ def sparse_motion_vectors(video_path: str | Path, sample_stride: int) -> list[tu
                 )
                 good = st.ravel() == 1
                 if good.sum() >= 8:
-                    disp = next_pts[good] - prev_pts[good]
-                    med = np.median(disp, axis=0)
-                    motions.append((float(med[0]), float(med[1])))
+                    from director_os.vision_fx.compute.local_onnx import median_flow_shift
+
+                    motions.append(median_flow_shift(next_pts[good] - prev_pts[good]))
                 else:
                     motions.append((0.0, 0.0))
             else:

@@ -314,6 +314,15 @@ def _tracked_redaction_payload(
         raise RuntimeError("CFR source frame count unknown — refusing to plan blind")
 
     tracks = backend.detect_faces(cfr_path)  # imgsz 960, conf 0.22, GMC + buffer 60
+    if not tracks:
+        # A sweep that sees NOTHING is a broken sweep, not an empty scene:
+        # shipping it bakes zero redaction while the audit passes vacuously
+        # (0 detections = 0 leaks). Fail the stage loud — privacy is not soft.
+        raise RuntimeError(
+            "tracked redaction sweep found ZERO faces — refusing to persist an "
+            "empty plan (broken detector/model or genuinely face-less source; "
+            "verify with scripts/fetch_yolov8n_face.py + a debug-overlay sweep)"
+        )
     plan = repair_trajectories(tracks, fps=30, frame_w=frame_w, frame_h=frame_h, n_frames=n_frames)
     from director_os.vision_fx.redact_track import assert_zero_leaks
 
