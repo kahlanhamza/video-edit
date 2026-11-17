@@ -412,9 +412,7 @@ def phase_push() -> None:
     script = SE48K_KERNEL_TEMPLATE.replace("@@RAW_URL@@", raw_url).replace("@@VAD_URL@@", vad_url)
     client = _client()
     push_slug = _kernel_slug()
-    pushed = client.push_kernel(
-        push_slug, "DirectorOS MossFormer2 SE (Eustis evidence)", script
-    )
+    pushed = client.push_kernel(push_slug, "DirectorOS MossFormer2 SE (Eustis evidence)", script)
     ref = str(pushed.get("ref", "")).removeprefix("/code/") or SLUG
     REF_FILE.parent.mkdir(parents=True, exist_ok=True)
     REF_FILE.write_text(ref)

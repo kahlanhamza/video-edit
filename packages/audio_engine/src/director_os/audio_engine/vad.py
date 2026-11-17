@@ -83,9 +83,7 @@ class SileroVad:
         x = pcm_16k.astype(np.float32)
         total = (x.size // CHUNK_SAMPLES) * CHUNK_SAMPLES
         for i in range(0, total, CHUNK_SAMPLES):
-            window = np.concatenate(
-                [context, x[i : i + CHUNK_SAMPLES].reshape(1, -1)], axis=1
-            )
+            window = np.concatenate([context, x[i : i + CHUNK_SAMPLES].reshape(1, -1)], axis=1)
             prob, state = self.session.run(
                 None,
                 {"input": window, "state": state, "sr": np.array(VAD_SR, dtype=np.int64)},
