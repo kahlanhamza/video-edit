@@ -93,6 +93,23 @@ is not evidence; the test is.
 - **Audio law (ADR-0005):** 48 kHz stereo AAC stems; loudnorm; speech-gated level audit
   targets −12 dB … −6 dB RMS on spoken-word intervals only (never whole-program — sirens
   and door slams skew loudnorm); hard limiter ceiling −1.5 dBTP.
+- **2-Bus Speech Isolation law (raw bodycam renders, `audio_mode=isolate_2bus`):**
+  `afftdn` alone is NOT noise reduction — highway traffic, wind gusts and cruiser
+  engines survive it audibly. The only acceptable Bus-1 chain is a NEURAL speech
+  extractor (deep-filter `--atten-lim-db 28` default; ClearerVoice
+  `MossFormer2_SE_48K` when installed) on top of the 90 Hz rumble pre-clean, then
+  intelligibility EQ + compression + speech-gated −14 dB duck (Silero VAD + ASR
+  words, 150 ms ramps), mixed over a tamed ambience bed (−24 dB, 150 Hz–4 kHz) and
+  limited at −1.5 dBTP. **No silent fallbacks:** a missing neural denoiser is a
+  hard fail (`auto` never degrades to afftdn); an afftdn run outside hermetic
+  tests FAILS the `enhancer_engine_used` QA check. The shipped master is PROVEN,
+  not trusted: `snr_verification` (clean SNR ≥ 14 dB and noise floor fell ≥ 8 dB
+  or SNR improved ≥ 6 dB, on ASR word intervals), `zero_clipping` (≤ −1.0 dBTP on
+  the decoded final — the segment encode carries its own headroom limiter), and a
+  15 s raw-vs-clean A/B pair exported next to the render. Measurement law: never
+  decode through ffmpeg's auto mono downmix (1/√2 law reads +3 dB hot) —
+  `decode_pcm_channels` + explicit averaging; `alimiter` MUST run with
+  `level=disabled` (auto-level re-boosts everything to 0 dBFS).
 - **Coordinates law:** detector sweeps and Studio canvases live in RAW-footage pixels;
   render effects live in letterboxed render space. Mapping goes through
   `redact.scale_bbox` (`s = min(tw/fw, th/fh)` + centered pad) — never eyeball it.
