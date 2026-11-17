@@ -189,6 +189,103 @@ class DirectorToolbox:
             "detail": f"removed blur {region_index} from clip {item_index}: {removed}",
         }
 
+    # ------------------------------------------------------------ multi-cam
+    def switch_camera(
+        self,
+        item_index: int,
+        at_local_s: float,
+        dur_s: float,
+        angle_asset_id: str,
+        angle_offset_s: float = 0.0,
+        angle_drift_ppm: float = 0.0,
+        current_offset_s: float = 0.0,
+    ) -> dict[str, Any]:
+        """Show another synced angle for `dur_s` starting at a clip-local time.
+
+        Three-way splits the raw clip (like two `split_clip` calls) and rewires
+        the middle piece to the angle's asset, mapping the switch point from
+        reference wall time into the angle's source clock via the
+        `perception.sync_multicam` offsets: angle_src = wall - offset - drift
+        ppm compensation. The angle piece starts CLEAN — blur boxes, zoom
+        keyframes and freeze callouts are raw-geometry artifacts of the OLD
+        angle and would land wrong on different footage; redact the new angle
+        with its own boxes (or a face sweep) after switching.
+        """
+        clip = _master_clip(self.timeline, item_index)
+        meta = _plain(clip.metadata.get("director_os"))
+        if not meta or meta.get("kind") != "raw":
+            raise ToolOperationError(f"clip {item_index} is not a raw clip")
+        if not angle_asset_id.strip():
+            raise ToolOperationError("angle_asset_id must not be empty")
+        if angle_asset_id == meta.get("asset_id"):
+            raise ToolOperationError(
+                f"angle_asset_id '{angle_asset_id}' is the clip's current asset"
+            )
+        dur = item_duration_s(clip)
+        if not 0.0 <= at_local_s < dur:
+            raise ToolOperationError(f"at_local_s {at_local_s:.2f}s outside clip 0..{dur:.2f}s")
+        end = at_local_s + dur_s
+        if end > dur + 1e-9:
+            raise ToolOperationError(
+                f"switch range {at_local_s:.2f}..{end:.2f}s exceeds clip ({dur:.2f}s)"
+            )
+
+        sr = clip.source_range
+        rate = sr.start_time.rate
+        src0 = sr.start_time.to_seconds()
+        ref_wall = src0 + at_local_s + current_offset_s
+        angle_src = ref_wall - angle_offset_s - angle_drift_ppm * ref_wall / 1e6
+        if angle_src < 0:
+            raise ToolOperationError(
+                f"switch maps before the angle's first frame ({angle_src:.2f}s)"
+            )
+
+        left_dur = at_local_s
+        right_dur = dur - end
+        name = clip.name or "clip"
+
+        def _piece(name_suffix: str, start_s: float, piece_dur: float) -> ot_schema.Clip:
+            piece = ot_schema.Clip(name=f"{name}.{name_suffix}")
+            piece.source_range = ot_time.TimeRange(
+                start_time=ot_time.RationalTime(start_s * rate, rate),
+                duration=ot_time.RationalTime(piece_dur * rate, rate),
+            )
+            piece.metadata.update(copy.deepcopy(clip.metadata))
+            return piece
+
+        angle_meta = dict(meta)
+        angle_meta["asset_id"] = angle_asset_id
+        angle_meta["angle_id"] = angle_asset_id
+        angle_meta["trim_silence"] = False  # mid-event switch: never re-trim
+        angle_meta["blur_regions"] = []
+        angle_meta["zoom_keyframes"] = []
+        angle_meta["freeze_callout"] = None
+
+        mid = _piece(f"cam_{angle_asset_id}", angle_src, dur_s)
+        mid.metadata.update({"director_os": angle_meta})
+
+        track = _master(self.timeline)
+        idx = list(track).index(clip)
+        inserts: list[ot_schema.Clip] = []
+        if left_dur > 1e-9:
+            track[idx] = _piece("a", src0, left_dur)
+            inserts.append(mid)
+        else:
+            track[idx] = mid
+        if right_dur > 1e-9:
+            inserts.append(_piece("b", src0 + end, right_dur))
+        for offset, piece in enumerate(inserts, start=1):
+            track.insert(idx + offset, piece)
+        n_after = len(inserts) + (1 if left_dur > 1e-9 else 0)
+        return {
+            "ok": True,
+            "detail": (
+                f"switched clip {item_index} to '{angle_asset_id}' at wall "
+                f"{ref_wall:.2f}s -> angle_src {angle_src:.2f}s for {dur_s:.2f}s "
+                f"({n_after} piece(s) from {left_dur:.2f}/{dur_s:.2f}/{right_dur:.2f}s)"
+            ),
+        }
+
     # ------------------------------------------------------------ overlay cards
     def add_card(
         self,
@@ -327,6 +424,13 @@ def build_director_registry(toolbox: DirectorToolbox) -> ToolRegistry:
         lambda **kw: toolbox.move_clip(**kw),
     )
     reg.register(
+        "timeline.switch_camera",
+        "Switch the visible camera to another synced angle for a time range "
+        "(offsets/drift from perception.sync_multicam).",
+        _SwitchCameraInput,
+        lambda **kw: toolbox.switch_camera(**kw),
+    )
+    reg.register(
         "narration.set_text",
         "Rewrite a narration clip's script text (re-renders only that segment).",
         _NarrationInput,
@@ -396,3 +500,13 @@ class _CardInput(BaseModel):
     dur_s: float = Field(ge=0.5, le=60.0)
     subtitle: str = Field(default="", max_length=200)
     fade_s: float = Field(default=0.5, ge=0.0, le=5.0)
+
+
+class _SwitchCameraInput(BaseModel):
+    item_index: int = Field(ge=0)
+    at_local_s: float = Field(ge=0.0)
+    dur_s: float = Field(gt=0.0)
+    angle_asset_id: str = Field(min_length=1, max_length=120)
+    angle_offset_s: float = 0.0
+    angle_drift_ppm: float = 0.0
+    current_offset_s: float = 0.0

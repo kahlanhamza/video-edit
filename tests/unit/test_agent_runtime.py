@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import opentimelineio.schema as ot_schema
 import pytest
 from director_os.agent_runtime import (
     CheckpointStore,
@@ -21,6 +22,7 @@ from director_os.agent_runtime import (
     ToolStep,
     build_director_registry,
 )
+from director_os.agent_runtime.editing_tools import _plain
 from director_os.core.db import (
     init_models,
     make_engine,
@@ -176,6 +178,113 @@ def test_card_outside_gap_rejected(timeline):
         box.add_card("location_intro", "B", start_s=20.0, dur_s=5.0)
 
 
+# ------------------------------------------------------------------ multi-cam
+def test_switch_camera_splices_angle_piece(timeline):
+    box = DirectorToolbox(timeline, PROJECT)
+    box.add_blur_region(0, [100, 100, 200, 80], sigma=24)
+    out = box.switch_camera(
+        0,
+        at_local_s=3.0,
+        dur_s=4.0,
+        angle_asset_id="b1",
+        angle_offset_s=-5.0,  # angle b started 5 s BEFORE the reference
+    )
+    assert out["ok"]
+    items = list(timeline.tracks[0])
+    assert len(items) == 5  # a(3s) + b1(4s) + a(3s) + narr(5s) + raw_2(8s)
+    left, mid, right = items[0], items[1], items[2]
+    assert left.name.endswith(".a") and right.name.endswith(".b")
+    assert mid.name.endswith(".cam_b1")
+    # wall at switch = 0 + 3 + 0 = 3s; angle started 5s early -> src = 3 + 5 = 8
+    assert mid.source_range.start_time.to_seconds() == pytest.approx(8.0)
+    assert mid.source_range.duration.to_seconds() == pytest.approx(4.0)
+    assert right.source_range.start_time.to_seconds() == pytest.approx(7.0)
+    m = _plain(mid.metadata["director_os"])
+    assert m["asset_id"] == "b1" and m["angle_id"] == "b1"
+    assert m["blur_regions"] == [] and m["zoom_keyframes"] == []
+    assert m["freeze_callout"] is None and m["trim_silence"] is False
+    # the old-angle pieces keep their redaction (deep-copied, not aliased)
+    for piece in (left, right):
+        pm = _plain(piece.metadata["director_os"])
+        assert pm["asset_id"] == "a1"
+        assert len(pm["blur_regions"]) == 1
+    # track duration unchanged
+    assert sum(
+        i.source_range.duration.to_seconds() for i in items if not isinstance(i, ot_schema.Gap)
+    ) == pytest.approx(3.0 + 4.0 + 3.0 + 5.0 + 8.0)
+
+
+def test_switch_camera_drift_compensation_and_offsets(timeline):
+    box = DirectorToolbox(timeline, PROJECT)
+    # clip 1: source starts at 10.0; current asset a1 is the reference (+0)
+    # wall at local 2.0 = 12.0; angle b: offset +2.5 (started later), drift 60ppm
+    # angle_src = 12.0 - 2.5 - 60e-6*12.0 = 9.49928
+    out = box.switch_camera(
+        1,
+        at_local_s=2.0,
+        dur_s=3.0,
+        angle_asset_id="b1",
+        angle_offset_s=2.5,
+        angle_drift_ppm=60.0,
+    )
+    assert out["ok"]
+    mid = list(timeline.tracks[0])[2]
+    assert mid.source_range.start_time.to_seconds() == pytest.approx(12.0 - 2.5 - 60e-6 * 12.0)
+
+
+def test_switch_camera_edge_pieces_skipped(timeline):
+    box = DirectorToolbox(timeline, PROJECT)
+    # full-clip switch: no left/right pieces survive
+    out = box.switch_camera(0, at_local_s=0.0, dur_s=10.0, angle_asset_id="b1")
+    assert out["ok"]
+    items = list(timeline.tracks[0])
+    assert len(items) == 3  # was 3 clips, clip 0 replaced whole by the angle piece
+    assert items[0].metadata["director_os"]["asset_id"] == "b1"
+    # end-of-clip switch: no right piece
+    out2 = box.switch_camera(1, at_local_s=5.0, dur_s=3.0, angle_asset_id="c1")
+    assert out2["ok"]
+    items2 = list(timeline.tracks[0])
+    assert len(items2) == 4
+    assert items2[2].name.endswith(".cam_c1")
+
+
+def test_switch_camera_rejections(timeline):
+    box = DirectorToolbox(timeline, PROJECT)
+    with pytest.raises(ToolOperationError, match="not a raw clip"):
+        box.switch_camera(2, at_local_s=1.0, dur_s=1.0, angle_asset_id="b1")
+    with pytest.raises(ToolOperationError, match="current asset"):
+        box.switch_camera(0, at_local_s=1.0, dur_s=1.0, angle_asset_id="a1")
+    with pytest.raises(ToolOperationError, match="exceeds clip"):
+        box.switch_camera(0, at_local_s=8.0, dur_s=3.0, angle_asset_id="b1")
+    with pytest.raises(ToolOperationError, match="outside clip"):
+        box.switch_camera(0, at_local_s=11.0, dur_s=1.0, angle_asset_id="b1")
+    # angle started so much later that the switch maps before its first frame
+    with pytest.raises(ToolOperationError, match="before the angle"):
+        box.switch_camera(0, at_local_s=1.0, dur_s=1.0, angle_asset_id="b1", angle_offset_s=20.0)
+
+
+def test_registry_dispatches_switch_camera(timeline):
+    reg = build_director_registry(DirectorToolbox(timeline, PROJECT))
+    out = reg.dispatch(
+        "timeline.switch_camera",
+        {
+            "item_index": 0,
+            "at_local_s": 4.0,
+            "dur_s": 2.0,
+            "angle_asset_id": "b1",
+            "angle_offset_s": -1.0,
+        },
+    )
+    assert out["ok"]
+    from director_os.agent_runtime.registry import ToolDispatchError
+
+    with pytest.raises(ToolDispatchError, match="rejected args"):
+        reg.dispatch(
+            "timeline.switch_camera",
+            {"item_index": 0, "at_local_s": 1.0, "dur_s": 0.0, "angle_asset_id": "b1"},
+        )
+
+
 # ------------------------------------------------------------------ registry wiring
 def test_registry_dispatches_and_rejects(timeline):
     reg = build_director_registry(DirectorToolbox(timeline, PROJECT))
@@ -198,9 +307,9 @@ def test_registry_dispatches_and_rejects(timeline):
 def test_openai_schemas_available(timeline):
     reg = build_director_registry(DirectorToolbox(timeline, PROJECT))
     schemas = reg.openai_schemas()
-    assert len(schemas) == 8
-    fn = next(s for s in schemas if s["function"]["name"] == "redaction.add_blur")
-    assert fn["function"]["parameters"]["properties"]["bbox"]["type"] == "array"
+    assert len(schemas) == 9
+    fn = next(s for s in schemas if s["function"]["name"] == "timeline.switch_camera")
+    assert fn["function"]["parameters"]["properties"]["angle_asset_id"]["type"] == "string"
 
 
 # ------------------------------------------------------------------ checkpoint store
