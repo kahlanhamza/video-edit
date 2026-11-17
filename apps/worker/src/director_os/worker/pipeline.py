@@ -154,9 +154,10 @@ def stage_perception(asset_id: str, source: Path, project_id: str, deps: Pipelin
     """Transcribe once; the persisted transcript makes re-runs free (crash resume)."""
     with deps.sessions() as s:
         row = s.get(PerceptionIndexRow, asset_id)
-        if row is not None and row.transcript_json.get("words"):
+        has_words = bool((row.transcript_json or {}).get("words")) if row is not None else False
+        if has_words:
             deps.log(f"  [perception] transcript for {asset_id[:8]} already persisted — skip ASR")
-            return row.transcript_json
+            return row.transcript_json  # type: ignore[union-attr]
 
     if deps.transcribe is None:
         raise PipelineError("no transcribe callable provided (Gladia not configured?)")
@@ -379,6 +380,13 @@ def stage_render(
     out_dir = deps.settings.output_dir / "pipeline" / project_id
     save_otio(timeline, out_dir / "timeline.otio")
     cache = SegmentCache(deps.settings.segments_dir)
+    with deps.sessions() as s:
+        asset = s.get(MediaAssetRow, asset_id)
+    geometry = (
+        {asset_id: (asset.width, asset.height)}
+        if asset and asset.width > 0 and asset.height > 0
+        else None
+    )
     dag = compile_timeline(
         timeline,
         assets={asset_id: str(source)},
@@ -388,6 +396,7 @@ def stage_render(
         out_dir=out_dir,
         audio_target_lufs=deps.settings.target_lufs,
         global_blur_regions=_project_redaction_regions(deps.sessions, asset_id),
+        asset_geometry=geometry,
     )
     deps.log(f"  [render] {len(dag.segments)} segment(s), {dag.total_dur_s:.1f}s master")
     report = render_dag(dag, cache, log=deps.log, max_workers=deps.max_workers)

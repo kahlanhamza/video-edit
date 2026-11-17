@@ -36,6 +36,7 @@ from director_os.otio_engine.timeline import (
     track_by_name,
 )
 from director_os.vision_fx.cards import pick_corner, render_card
+from director_os.vision_fx.redact import scale_region
 
 
 class TimelineCompileError(RuntimeError):
@@ -90,6 +91,7 @@ def compile_timeline(
     out_dir: str | Path = "./output/render",
     audio_target_lufs: float = -16.0,
     global_blur_regions: list[BlurRegion] | None = None,
+    asset_geometry: Mapping[str, tuple[int, int]] | None = None,
 ) -> RenderDAG:
     video = video or VideoRenderSpec()
     audio = audio or AudioRenderSpec()
@@ -121,6 +123,13 @@ def compile_timeline(
             audio_filters = (
                 [loudnorm_chain(audio.target_lufs)] if meta.audio_mode == "loudnorm_48k" else []
             )
+            blur = [*global_blur, *meta.blur_regions]
+            raw_geo = (asset_geometry or {}).get(meta.asset_id)
+            if raw_geo is not None and tuple(raw_geo) != (video.w, video.h):
+                # blur boxes are authored in RAW-FOOTAGE pixels (studio canvas,
+                # detector sweep) — the renderer blurs AFTER scale+pad, so map
+                # them into render space or they land in the wrong place
+                blur = [scale_region(r, raw_geo[0], raw_geo[1], video.w, video.h) for r in blur]
             spec = SegmentRenderSpec(
                 kind="raw",
                 asset_id=meta.asset_id,
@@ -129,7 +138,7 @@ def compile_timeline(
                 video=video,
                 audio=audio,
                 audio_filters=audio_filters,
-                blur_regions=[*global_blur, *meta.blur_regions],
+                blur_regions=blur,
                 zoom_factor=zoom,
                 codec_profile=f"{video.codec}-{video.pix_fmt}-{video.fps}fps-{audio.sample_rate}hz",
             )

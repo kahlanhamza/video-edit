@@ -117,6 +117,84 @@ def test_unknown_asset_raises(tmp_path):
         )
 
 
+# --------------------------------------------- raw->render blur space mapping
+def test_scale_region_same_space_is_noop():
+    from director_os.core.models import BBox, BlurRegion
+    from director_os.vision_fx.redact import scale_region
+
+    r = BlurRegion(bbox=BBox(x=100, y=50, w=200, h=100), sigma=12)
+    assert scale_region(r, 1920, 1080, 1920, 1080) is r
+
+
+def test_scale_region_downscales_with_aspect():
+    from director_os.core.models import BBox, BlurRegion
+    from director_os.vision_fx.redact import scale_region
+
+    r = BlurRegion(bbox=BBox(x=960, y=540, w=400, h=300))
+    out = scale_region(r, 1920, 1080, 1280, 720)
+    # s = 2/3, no letterbox on matched 16:9
+    assert (out.bbox.x, out.bbox.y) == (640, 360)
+    assert (out.bbox.w, out.bbox.h) == (267, 200)
+    assert out.sigma == r.sigma and out.mode == r.mode and out.track_id == r.track_id
+
+
+def test_scale_region_letterbox_offsets_y():
+    from director_os.core.models import BBox, BlurRegion
+    from director_os.vision_fx.redact import scale_region
+
+    # 2.4:1 source into 16:9 render: s = 640/1920 = 1/3, source height 800*1/3=266.4
+    r = BlurRegion(bbox=BBox(x=0, y=0, w=1920, h=800))
+    out = scale_region(r, 1920, 800, 640, 360)
+    pad_y = (360 - 800 / 3) / 2  # 46.8 -> 47
+    assert out.bbox.y == int(round(pad_y))
+    assert out.bbox.w == 640
+    assert out.bbox.h == int(round(800 / 3))
+
+
+def test_compile_maps_global_blur_from_raw_space(tmp_path):
+    """Studio canvas boxes are raw-pixel coords; render at 720p must rescale them."""
+    from director_os.core.models import BBox, BlurRegion
+    from director_os.otio_engine.segment_cache import VideoRenderSpec
+
+    tl = build_timeline(timeline_spec())
+    cache = SegmentCache(tmp_path / "cache")
+    dag = compile_timeline(
+        tl,
+        assets={"a1": "/media/a1.mp4", "a2": "/media/a2.mp4"},
+        cache=cache,
+        out_dir=tmp_path / "r3",
+        video=VideoRenderSpec(w=1280, h=720),
+        global_blur_regions=[BlurRegion(bbox=BBox(x=1600, y=60, w=280, h=160), sigma=18)],
+        asset_geometry={"a1": (1920, 1080), "a2": (1920, 1080)},
+    )
+    raw_seg = dag.segments[0]
+    assert len(raw_seg.spec.blur_regions) == 1
+    box = raw_seg.spec.blur_regions[0].bbox
+    # 1600*2/3=1067, 60*2/3=40, 280*2/3=187, 160*2/3=107
+    assert (box.x, box.y, box.w, box.h) == (1067, 40, 187, 107)
+    # narration segment never carries blur
+    assert dag.segments[1].spec.blur_regions == []
+    # second raw asset scales too
+    box2 = dag.segments[2].spec.blur_regions[0].bbox
+    assert (box2.x, box2.y, box2.w, box2.h) == (1067, 40, 187, 107)
+
+
+def test_compile_without_geometry_keeps_coords(tmp_path):
+    """Backward compat: no asset_geometry -> regions pass through untouched."""
+    from director_os.core.models import BBox, BlurRegion
+
+    tl = build_timeline(timeline_spec())
+    cache = SegmentCache(tmp_path / "cache")
+    dag = compile_timeline(
+        tl,
+        assets={"a1": "/media/a1.mp4", "a2": "/media/a2.mp4"},
+        cache=cache,
+        out_dir=tmp_path / "r4",
+        global_blur_regions=[BlurRegion(bbox=BBox(x=1600, y=60, w=280, h=160))],
+    )
+    assert dag.segments[0].spec.blur_regions[0].bbox.x == 1600
+
+
 def test_uniformity_guard(dag: RenderDAG):
     validate_uniformity(dag)  # must not raise
     broken = RenderDAG(

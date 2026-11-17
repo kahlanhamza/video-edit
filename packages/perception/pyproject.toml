@@ -3,7 +3,10 @@ name = "director-os-perception"
 version = "0.1.0"
 description = "DirectorOS perception layer (M2/M4): shots, captions, ASR, audio events, OCR, multi-cam sync"
 requires-python = ">=3.12"
-dependencies = ["director-os-core"]
+dependencies = [
+    "director-os-core",
+    "opencv-python-headless>=5.0.0.93",
+]
 
 [build-system]
 requires = ["hatchling"]

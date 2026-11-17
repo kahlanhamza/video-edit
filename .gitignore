@@ -19,3 +19,8 @@ data/secrets/
 output/
 *.log
 .DS_Store
+
+# real-media working files (large binaries stay local)
+data/media/
+data/models/
+output/
