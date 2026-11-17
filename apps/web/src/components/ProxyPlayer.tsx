@@ -7,6 +7,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Asset, Redaction, api, assetProxyUrl } from "@/lib/api";
+import { useNLEShortcuts } from "@/hooks/useNLEShortcuts";
 
 interface Draft {
   x0: number;
@@ -30,6 +31,11 @@ export default function ProxyPlayer({
   const [showExisting, setShowExisting] = useState(true);
   const [drawMode, setDrawMode] = useState(false);
   const wrapRef = useRef<HTMLDivElement | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+
+  // Studio NLE shortcuts (issue #19): Space/J/K/L/I/O/←/→/S/Ctrl+Z.
+  // Disabled while a blur box is being drawn — the mouse owns the surface then.
+  const { state: nle } = useNLEShortcuts({ videoRef, enabled: !drawMode });
 
   const reload = useCallback(async () => {
     try {
@@ -109,7 +115,35 @@ export default function ProxyPlayer({
         onMouseMove={drawMode ? onMouseMove : undefined}
         onMouseUp={drawMode ? onMouseUp : undefined}
       >
-        <video src={assetProxyUrl(asset.id)} controls className="w-full" preload="metadata" />
+        <video
+          ref={videoRef}
+          src={assetProxyUrl(asset.id)}
+          controls
+          className="w-full"
+          preload="metadata"
+        />
+        {nle.inS !== null && (
+          <span
+            className="pointer-events-none absolute top-1 bottom-1 border-l-2 border-emerald-400"
+            title={`in ${nle.inS.toFixed(2)}s`}
+            style={{ left: `${Math.min(100, (nle.inS / asset.duration_s) * 100)}%` }}
+          />
+        )}
+        {nle.outS !== null && (
+          <span
+            className="pointer-events-none absolute top-1 bottom-1 border-r-2 border-sky-400"
+            title={`out ${nle.outS.toFixed(2)}s`}
+            style={{ left: `${Math.min(100, (nle.outS / asset.duration_s) * 100)}%` }}
+          />
+        )}
+        {nle.splits.map((t) => (
+          <span
+            key={t}
+            title={`split ${t.toFixed(2)}s`}
+            className="pointer-events-none absolute top-1 h-2 w-0.5 bg-amber-400"
+            style={{ left: `${Math.min(100, (t / asset.duration_s) * 100)}%` }}
+          />
+        ))}
         {showExisting &&
           scaleX > 0 &&
           regions.map((r) => (
@@ -161,6 +195,10 @@ export default function ProxyPlayer({
           />
           show {regions.length} blur box(es)
         </label>
+        <p className="rounded bg-slate-900/60 p-2 text-[11px] leading-4 text-slate-500">
+          <span className="text-slate-300">NLE keys</span> — space play · J/K/L shuttle ·
+          I/O in/out · ←/→ frame step · S split · Ctrl+Z undo
+        </p>
         {error && <p className="text-xs text-red-400">{error}</p>}
         <ul className="space-y-1">
           {regions.map((r) => (
