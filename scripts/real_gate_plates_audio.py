@@ -18,7 +18,7 @@ OUT.mkdir(parents=True, exist_ok=True)
 
 def main() -> int:
     from director_os.vision_fx.compute.local_onnx import LocalOnnxCpuBackend
-    from director_os.vision_fx.compute.tracker import EmptySweepError, merge_redaction_tracks
+    from director_os.vision_fx.compute.tracker import merge_redaction_tracks
     from director_os.vision_fx.redact_track import (
         assert_zero_leaks,
         normalize_cfr,
@@ -36,14 +36,20 @@ def main() -> int:
     faces = backend.detect_faces(cfr, max_samples=600)
     print(f"face tracks: {len(faces)}")
     for t in faces:
-        print(f"  {t.track_id}: {t.n_real} real hits, span {t.t_start_s:.1f}-{t.t_end_s:.1f}s, min_score {t.min_score:.2f}")
+        print(
+            f"  {t.track_id}: {t.n_real} real hits, span {t.t_start_s:.1f}-{t.t_end_s:.1f}s,"
+            f" min_score {t.min_score:.2f}"
+        )
 
     plates: list = []
     if caps.get("plates"):
         plates = backend.detect_plates(cfr, max_samples=600)
         print(f"plate tracks: {len(plates)}")
         for t in plates:
-            print(f"  {t.track_id}: {t.n_real} real hits, span {t.t_start_s:.1f}-{t.t_end_s:.1f}s, min_score {t.min_score:.2f}")
+            print(
+                f"  {t.track_id}: {t.n_real} real hits, span {t.t_start_s:.1f}-{t.t_end_s:.1f}s,"
+                f" min_score {t.min_score:.2f}"
+            )
     else:
         print("plate model absent — faces only")
 
@@ -53,16 +59,12 @@ def main() -> int:
     n_boxes = sum(len(t.boxes) for t in plan.trajectories)
     print(f"plan OK: {len(plan.trajectories)} trajectories, {n_boxes} per-frame boxes, 0 leaks")
 
-    # render one debug-overlay strip over the plate-active span for visual proof
+    # render the debug overlay over the whole window for visual proof
     if plates:
         from director_os.vision_fx.redact_track import render_tracked_redaction
 
-        strip = plan.trajectories[-1]
-        span0 = max(0, strip.frame_start - 5)
         out = OUT / "debug_plate_strip.mp4"
-        render_tracked_redaction(
-            cfr, plan, out, debug_overlay=True, n_frames_expected=n_frames
-        )
+        render_tracked_redaction(cfr, plan, out, debug_overlay=True, n_frames_expected=n_frames)
         print(f"debug overlay render: {out}")
 
     # ---- audio events on the REAL audio
