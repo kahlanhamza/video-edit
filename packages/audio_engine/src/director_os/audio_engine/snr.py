@@ -16,6 +16,13 @@ Gates (all must hold on the clean master):
 - zero clipping: sample peak stays ≤ -1.0 dBTP on the final master (the
   -1.5 dBTP limiter gives 0.5 dB headroom above this gate)
 - stream uniformity: every audio stream 48000 Hz stereo (checked in qa_probe)
+
+Timbre gate (the "deep voice" law): neural speech extractors shave the top
+end hardest — measured on the real MossFormer2 harvest, presence (2-5 kHz)
+lands -19.9 dB and air (5-12 kHz) -23.9 dB below the 500-2k mid band, which
+perceptually reads as muffled/deep voices. `speech_band_tilts` + `timbre_gate`
+quantify the shipped master's spectral balance on word intervals and FAIL
+extreme muffling (presence tilt below MIN_PRESENCE_TILT_DB).
 """
 
 from __future__ import annotations
@@ -28,6 +35,13 @@ MIN_CLEAN_SNR_DB = 14.0
 MAX_DELTA_NOISE_DB = -8.0  # noise floor must FALL by at least 8 dB ...
 MIN_SNR_IMPROVEMENT_DB = 6.0  # ... or SNR must improve by at least 6 dB
 MAX_PEAK_DBTP = -1.0  # sample-peak ceiling on the final master
+
+# spectral-tilt bands (measured deep-voice signature — see module docstring)
+TILT_LOW_HZ = (120.0, 250.0)
+TILT_MID_HZ = (500.0, 2000.0)
+TILT_PRESENCE_HZ = (2000.0, 5000.0)
+TILT_AIR_HZ = (5000.0, 12000.0)
+MIN_PRESENCE_TILT_DB = -24.0  # extreme-muffling floor (pre-fix real render: ~-20)
 
 
 def noise_floor_db(
@@ -115,6 +129,70 @@ def snr_gate(
         if ok
         else "; ".join(reasons)
     )
+    return ok, detail
+
+
+def speech_band_tilts(
+    path: str,
+    speech_intervals: list[tuple[float, float]],
+    sr: int = 48_000,
+) -> dict[str, float]:
+    """Spectral balance of the VOICE on the merged word spans (the timbre QA).
+
+    Concatenates the samples inside spoken-word spans, FFTs them, and reports
+    each band's mean energy density relative to the 500-2k mid band:
+    `tilt_lowmid_db` (120-250), `tilt_presence_db` (2-5k), `tilt_air_db`
+    (5-12k). Per-Hz normalization makes the numbers level- and duration-
+    independent. Raises when there is no speech to measure (caller decides).
+    """
+    pcm = decode_pcm_mono(path, sr)
+    slices = []
+    for s, e in merge_intervals(speech_intervals):
+        a, b = int(s * sr), min(int(e * sr), pcm.size)
+        if b > a:
+            slices.append(pcm[a:b])
+    if not slices:
+        raise ValueError("no speech samples inside the given intervals")
+    x = np.concatenate(slices).astype(np.float64)
+    spec = np.abs(np.fft.rfft(x)) ** 2
+    freqs = np.fft.rfftfreq(x.size, d=1.0 / sr)
+
+    def band_db(lo: float, hi: float) -> float:
+        mask = (freqs >= lo) & (freqs < hi)
+        n = int(mask.sum())
+        if n == 0:
+            return -120.0
+        p = float(np.mean(spec[mask]))
+        return max(-120.0, 10.0 * np.log10(p + 1e-24))
+
+    mid = band_db(*TILT_MID_HZ)
+    return {
+        "tilt_lowmid_db": band_db(*TILT_LOW_HZ) - mid,
+        "tilt_presence_db": band_db(*TILT_PRESENCE_HZ) - mid,
+        "tilt_air_db": band_db(*TILT_AIR_HZ) - mid,
+    }
+
+
+def timbre_gate(
+    tilts: dict[str, float],
+    min_presence_tilt_db: float = MIN_PRESENCE_TILT_DB,
+) -> tuple[bool, str]:
+    """The timbre law: the shipped voice must not be extremely muffled.
+
+    FAILS when the presence band (2-5 kHz) falls more than `floor` dB below
+    the mid band inside word spans — the measured "deep/muffled voice"
+    signature. Low-mid and air tilts ride in the detail for evidence; they
+    are recorded, not gated (voice f0 and mic proximity legitimately vary
+    them between officers and vehicles).
+    """
+    tilt = tilts["tilt_presence_db"]
+    ok = tilt >= min_presence_tilt_db
+    detail = (
+        f"presence {tilt:+.1f}dB air {tilts['tilt_air_db']:+.1f}dB "
+        f"lowmid {tilts['tilt_lowmid_db']:+.1f}dB vs mid (gate >= {min_presence_tilt_db:g}dB)"
+    )
+    if not ok:
+        detail += " | VOICE MUFFLED: presence band collapsed — check the Bus-1 timbre chain"
     return ok, detail
 
 

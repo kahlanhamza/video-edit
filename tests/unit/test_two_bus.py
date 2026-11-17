@@ -82,8 +82,12 @@ def test_duck_envelope_short_span_reaches_full_open_at_center():
 # --------------------------------------------------------------------- chains
 def test_bus1_chain_carries_eq_and_compressor_law():
     chain = bus1_tone_chain()
-    assert "equalizer=f=300:width_type=o:width=1.2:g=-2.5" in chain  # mud cut
-    assert "equalizer=f=2800:width_type=o:width=1.2:g=2.5" in chain  # clarity lift
+    # mud cut (deepened -3.0 after the measured tilt showed bass-heavy output)
+    assert "equalizer=f=300:width_type=o:width=1.2:g=-3" in chain
+    # clarity lift (+3) and the timbre-restoration law: presence bell + air shelf
+    assert "equalizer=f=2800:width_type=o:width=1.2:g=+3" in chain
+    assert "equalizer=f=4500:width_type=o:width=1.4:g=+2.5" in chain
+    assert "highshelf=f=6800:g=+3" in chain
     assert "acompressor=threshold=-18dB:ratio=3:attack=10:release=120" in chain
 
 

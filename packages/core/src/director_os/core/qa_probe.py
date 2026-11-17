@@ -368,6 +368,8 @@ def _audio_verification_checks(
         measure_snr,
         peak_true_dbfs,
         snr_gate,
+        speech_band_tilts,
+        timbre_gate,
     )
 
     checks: list[AuditCheck] = []
@@ -419,6 +421,24 @@ def _audio_verification_checks(
             )
         except Exception as e:  # noqa: BLE001
             checks.append(AuditCheck(name="snr_verification", ok=False, detail=str(e)))
+
+        try:
+            tilts = speech_band_tilts(str(path), speech_intervals)
+            ok, tdetail = timbre_gate(tilts)
+            checks.append(
+                AuditCheck(
+                    name="timbre_not_muffled",
+                    ok=ok,
+                    detail=(
+                        f"voice tilt on word spans: "
+                        f"presence {tilts['tilt_presence_db']:+.1f}dB "
+                        f"air {tilts['tilt_air_db']:+.1f}dB "
+                        f"lowmid {tilts['tilt_lowmid_db']:+.1f}dB (vs mid) | " + tdetail
+                    ),
+                )
+            )
+        except Exception as e:  # noqa: BLE001
+            checks.append(AuditCheck(name="timbre_not_muffled", ok=False, detail=str(e)))
 
     try:
         peak = peak_true_dbfs(str(path))

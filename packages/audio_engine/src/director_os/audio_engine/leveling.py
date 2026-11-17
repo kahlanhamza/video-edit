@@ -20,7 +20,9 @@ import numpy as np
 # speech target window (issue #15): dialogue RMS must sit inside it
 SPEECH_LO_DBFS = -12.0
 SPEECH_HI_DBFS = -6.0
-DEFAULT_TARGET_DBFS = -9.0  # center of the window
+DEFAULT_TARGET_DBFS = -9.0  # window center; measured shipped-file offset
+# (pause-trim + headroom limiter + AAC) is ~1 dB under the master WAV, so
+# dialogue ships ~-10: comfortably inside -12..-6 with margin on both sides.
 MAX_GAIN_DB = 12.0  # never boost dead-air hiss into audibility
 # -1.5 dBTP ceiling as a linear alimiter threshold: 10^(-1.5/20) = 0.8414
 LIMITER_DBTP = -1.5

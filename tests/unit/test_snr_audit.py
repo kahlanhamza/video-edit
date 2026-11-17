@@ -1,8 +1,9 @@
 """Quantitative SNR verification + the production audio QA gates.
 
 Covers: robust noise-floor math (median beats a passing siren), the SNR gate
-thresholds, and the audit_technical checks that enforce the 2-bus law —
-enhancer_engine_used (afftdn forbidden in production), snr_verification,
+thresholds, the timbre (deep-voice) tilt measurement + gate, and the
+audit_technical checks that enforce the 2-bus law — enhancer_engine_used
+(afftdn forbidden in production), snr_verification, timbre_not_muffled,
 zero_clipping, stream_uniformity.
 """
 
@@ -19,6 +20,8 @@ from director_os.audio_engine.snr import (
     noise_floor_db,
     peak_true_dbfs,
     snr_gate,
+    speech_band_tilts,
+    timbre_gate,
 )
 from director_os.core.qa_probe import AudioVerification, audit_technical
 
@@ -26,6 +29,9 @@ SR = 48_000
 
 
 def _write_wav(path: Path, pcm: np.ndarray) -> Path:
+    if pcm.ndim == 1:  # mono input -> duplicated stereo (a raw 1-D buffer
+        pcm = np.stack([pcm, pcm], axis=1)  # declared as 2ch interleaves and
+        # aliases the spectrum on decode — fatal for spectral-tilt asserts)
     data = (np.clip(pcm, -0.999, 0.999) * 32767).astype(np.int16).tobytes()
     with wave.open(str(path), "wb") as w:
         w.setnchannels(2)
@@ -45,12 +51,17 @@ def _band_noise(rng, n: int, lo_hz: float, hi_hz: float, sr: int) -> np.ndarray:
 
 
 def _make_pcm(rng, speech_spans, dur_s=6.0, speech_amp=0.3, noise_amp=0.05, siren=None):
-    """Speech = FFT band-limited noise bursts (300-3000 Hz, realistic RMS)."""
+    """Speech = FFT band-limited noise bursts (300-7000 Hz, realistic RMS).
+
+    The band reaches 7 kHz because REAL speech carries fricative/sibilant
+    energy there — a 3 kHz-deep synthetic voice would be artificially muffled
+    and trip the timbre gate for the wrong reason.
+    """
     n = int(dur_s * SR)
     speech = np.zeros(n)
     for s0, s1 in speech_spans:
         a, b = int(s0 * SR), int(s1 * SR)
-        speech[a:b] = _band_noise(rng, b - a, 300.0, 3000.0, SR) * speech_amp
+        speech[a:b] = _band_noise(rng, b - a, 300.0, 7000.0, SR) * speech_amp
     brown = np.cumsum(rng.normal(size=n))
     brown = brown / (np.sqrt(np.mean(np.square(brown))) + 1e-9)
     noise = brown * noise_amp
@@ -112,6 +123,78 @@ class TestSnrGate:
         assert ok  # improvement +10.5 >= 6.0 despite delta_noise > -8
 
 
+class TestTimbreTilt:
+    def test_full_band_voice_measures_neutral_tilt(self, tmp_path):
+        rng = np.random.default_rng(31)
+        speech, noise = _make_pcm(rng, WORDS)  # 300-7000 Hz "voice"
+        wav = _write_wav(tmp_path / "voice.wav", (speech + noise).astype(np.float32))
+        tilts = speech_band_tilts(str(wav), WORDS)
+        # flat density across mid/presence bands -> tilt near zero (±3 dB),
+        # i.e. NOT muffled; air band is above the voice band so it dips some
+        assert tilts["tilt_presence_db"] > -6.0
+        assert tilts["tilt_air_db"] > -12.0
+
+    def test_muffled_voice_fails_gate_and_audit(self, tmp_path):
+        # the deep-voice signature measured on the real harvest: everything
+        # above ~2 kHz sits ~40 dB down (shelf, not a hard cut) — extreme
+        # muffling, well past the gate floor
+        rng = np.random.default_rng(33)
+        speech, _ = _make_pcm(rng, WORDS)
+        freqs = np.fft.rfftfreq(speech.size, d=1.0 / SR)
+        x = np.fft.irfft(np.fft.rfft(speech) * np.where(freqs < 2000.0, 1.0, 0.01), n=speech.size)
+        wav = _write_wav(tmp_path / "muffled.wav", x.astype(np.float32))
+        tilts = speech_band_tilts(str(wav), WORDS)
+        ok, detail = timbre_gate(tilts)
+        assert not ok and "VOICE MUFFLED" in detail
+
+        master = tmp_path / "muffled.mp4"
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=30:duration=6",
+                "-i",
+                str(wav),
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                "34",
+                "-c:a",
+                "aac",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                "-shortest",
+                str(master),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        ver = AudioVerification(raw_audio_path=str(wav), enhancer_engine="deepfilternet3")
+        audit = audit_technical(master, speech_intervals=WORDS, audio_verification=ver)
+        check = next(c for c in audit.checks if c.name == "timbre_not_muffled")
+        assert not check.ok and not audit.ok
+
+    def test_no_speech_intervals_raise(self, tmp_path):
+        rng = np.random.default_rng(35)
+        speech, noise = _make_pcm(rng, WORDS)
+        wav = _write_wav(tmp_path / "voice.wav", (speech + noise).astype(np.float32))
+        with pytest.raises(ValueError):
+            speech_band_tilts(str(wav), [])
+
+
 class TestAuditAudioVerification:
     @pytest.fixture()
     def scene(self, tmp_path):
@@ -171,6 +254,7 @@ class TestAuditAudioVerification:
         by_name = {c.name: c for c in audit.checks}
         assert by_name["enhancer_engine_used"].ok
         assert by_name["snr_verification"].ok, by_name["snr_verification"].detail
+        assert by_name["timbre_not_muffled"].ok, by_name["timbre_not_muffled"].detail
         assert by_name["zero_clipping"].ok
         assert by_name["stream_uniformity"].ok
         assert "raw_snr" in by_name["snr_verification"].detail

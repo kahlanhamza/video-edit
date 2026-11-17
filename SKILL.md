@@ -110,6 +110,20 @@ is not evidence; the test is.
   decode through ffmpeg's auto mono downmix (1/√2 law reads +3 dB hot) —
   `decode_pcm_channels` + explicit averaging; `alimiter` MUST run with
   `level=disabled` (auto-level re-boosts everything to 0 dBFS).
+- **Timbre law (the "deep voice" fix, measured 2026-11-18):** neural speech
+  extractors shave the top end hardest — measured on the real MossFormer2 harvest,
+  presence (2–5 kHz) landed −19.9 dB and air (5–12 kHz) −23.9 dB below the mid
+  band (raw: −14.3/−14.3), which ears read as deep/muffled voices. The Bus-1 tone
+  chain therefore MUST carry timbre restoration: mud 300 Hz −3 dB, clarity 2.8 kHz
+  +3 dB, presence 4.5 kHz +2.5 dB, air high-shelf 6.8 kHz +3 dB
+  (`bus1_tone_chain()`); validated post-EQ presence −14.3 / air −18.7
+  (`scripts/validate_timbre_eq.py`). `qa.audit_technical` enforces
+  `timbre_not_muffled` (presence tilt ≥ −24 dB on word spans) and the raw/clean
+  tilts ride in the enhance receipt. **`ENHANCE_CACHE_VERSION` is bumped on EVERY
+  tone-chain change** — a stale cache key would silently re-ship the old sound
+  (currently `v2`). Segment encode headroom is −3.0 dBFS pre-codec: AAC
+  reconstruction overshoot measured up to ~1.5 dB on sibilant material, and the
+  decoded final must stay under −1.0 dBTP at any crest.
 - **Coordinates law:** detector sweeps and Studio canvases live in RAW-footage pixels;
   render effects live in letterboxed render space. Mapping goes through
   `redact.scale_bbox` (`s = min(tw/fw, th/fh)` + centered pad) — never eyeball it.

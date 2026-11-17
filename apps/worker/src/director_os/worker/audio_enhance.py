@@ -44,7 +44,7 @@ from director_os.audio_engine.leveling import (
     measure_speech_levels,
     speech_gated_gain,
 )
-from director_os.audio_engine.snr import measure_snr
+from director_os.audio_engine.snr import measure_snr, speech_band_tilts
 from director_os.audio_engine.two_bus import (
     RUMBLE_HIGHPASS_HZ,
     SAMPLE_RATE,
@@ -55,7 +55,10 @@ from director_os.audio_engine.two_bus import (
 )
 from director_os.audio_engine.vad import SileroVad, speech_gate_intervals
 
-ENHANCE_CACHE_VERSION = "v1"
+# v2: Bus-1 timbre-restoration chain (presence + air shelf). Bumping the
+# version is MANDATORY on any tone-chain change — the cache key must not let
+# a re-render silently reuse a master mixed with the old sound.
+ENHANCE_CACHE_VERSION = "v2"
 DURATION_DRIFT_TOLERANCE_S = 0.05
 
 
@@ -83,6 +86,10 @@ class EnhanceInfo:
     ducked_seconds: float
     total_seconds: float
     cache_key: str
+    # timbre receipt (the deep-voice law); defaulted for old-receipt cache hits
+    tilt_presence_raw_db: float = 0.0
+    tilt_presence_clean_db: float = 0.0
+    tilt_air_clean_db: float = 0.0
 
     def enhanced_audio_map(self) -> dict[str, Path]:
         return {self.asset_id: self.master_wav}
@@ -291,6 +298,22 @@ def stage_audio_enhance(
     # 8) quantitative SNR receipt (raw vs clean, same word intervals)
     raw_snr = measure_snr(str(raw_ref), gate)
     clean_snr = measure_snr(str(master), gate)
+    delta_noise = clean_snr["noise_floor_db"] - raw_snr["noise_floor_db"]
+
+    # 8b) timbre receipt: the deep-voice law (tilt on word spans, raw vs clean)
+    tilt_raw = {"tilt_presence_db": 0.0, "tilt_air_db": 0.0, "tilt_lowmid_db": 0.0}
+    tilt_clean = dict(tilt_raw)
+    try:
+        tilt_raw = speech_band_tilts(str(raw_ref), gate)
+        tilt_clean = speech_band_tilts(str(master), gate)
+        deps.log(
+            f"  [audio] timbre tilt (presence/air vs mid): raw {tilt_raw['tilt_presence_db']:+.1f}/"
+            f"{tilt_raw['tilt_air_db']:+.1f} dB -> clean {tilt_clean['tilt_presence_db']:+.1f}/"
+            f"{tilt_clean['tilt_air_db']:+.1f} dB"
+        )
+    except ValueError as e:  # no speech inside the gate: nothing to measure
+        deps.log(f"  [audio] timbre tilt not measurable: {e}")
+
     info = EnhanceInfo(
         asset_id=asset_id,
         master_wav=master,
@@ -303,7 +326,10 @@ def stage_audio_enhance(
         speech_intervals=gate,
         raw_snr_db=raw_snr["snr_db"],
         clean_snr_db=clean_snr["snr_db"],
-        delta_noise_db=clean_snr["noise_floor_db"] - raw_snr["noise_floor_db"],
+        delta_noise_db=delta_noise,
+        tilt_presence_raw_db=tilt_raw["tilt_presence_db"],
+        tilt_presence_clean_db=tilt_clean["tilt_presence_db"],
+        tilt_air_clean_db=tilt_clean["tilt_air_db"],
         master_gain_db=gain_db,
         ducked_seconds=_ducked_seconds(gate, clean_snr["duration_s"]),
         total_seconds=clean_snr["duration_s"],
@@ -377,7 +403,8 @@ def _persist(deps, project_id: str, asset_id: str, info: EnhanceInfo, t0: float)
                     f"enhancer_engine={info.engine} neural={info.neural} "
                     f"atten_lim_db={info.atten_lim_db} gate={info.gate_source} "
                     f"snr_raw={info.raw_snr_db:.1f} snr_clean={info.clean_snr_db:.1f} "
-                    f"delta_noise={info.delta_noise_db:+.1f}dB"
+                    f"delta_noise={info.delta_noise_db:+.1f}dB "
+                    f"tilt_presence={info.tilt_presence_clean_db:+.1f}dB"
                 ),
                 duration_ms=int((time.monotonic() - t0) * 1000),
             )

@@ -4,7 +4,8 @@ Why plain loudnorm fails on bodycam: it integrates EVERYTHING — highway
 traffic, wind gusts, cruiser engines — so the officer's voice arrives buried
 in a "normalized" wall of noise. The pro fix is a 2-bus mix:
 
-    BUS 1 (voice)      neural speech extraction -> intelligibility EQ ->
+    BUS 1 (voice)      neural speech extraction -> intelligibility EQ (mud
+                       cut + clarity/presence/air timbre restoration) ->
                        compression -> speech-gated -14 dB duck in gaps
     BUS 2 (ambience)   tamed copy of the raw audio (150 Hz-4 kHz band,
                        -24 dB under the voice) so pauses keep outdoor air
@@ -46,18 +47,29 @@ BUS2_VOLUME_LINEAR = 0.06  # -24.4 dB under the voice bus
 # alimiter's `limit` floor is 0.0625 — the bed clamp sits a hair above the
 # -24 dB volume target, so the bed can never poke above its own level
 BUS2_LIMITER_LINEAR = 0.0625
-MUD_CUT_HZ, MUD_CUT_GAIN_DB, MUD_CUT_WIDTH_O = 300, -2.5, 1.2
-CLARITY_HZ, CLARITY_GAIN_DB, CLARITY_WIDTH_O = 2800, 2.5, 1.2
+# Timbre restoration law (measured, Nov 2026 — scripts/measure_tilt.py on the
+# real MossFormer2_SE_48K Kaggle harvest): neural extractors preserve low-mid
+# most and shave the top end hardest — presence 2-5 kHz lands -19.9 dB and air
+# 5-12 kHz -23.9 dB below the 500-2k mid band (raw: -14.3/-14.3). Perceptually
+# that is exactly "the voices sound deep": consonants dull, no sparkle, bass
+# dominant. The Bus-1 chain therefore RESTORES the top end on top of the mud
+# control instead of only de-mudding.
+MUD_CUT_HZ, MUD_CUT_GAIN_DB, MUD_CUT_WIDTH_O = 300, -3.0, 1.2
+CLARITY_HZ, CLARITY_GAIN_DB, CLARITY_WIDTH_O = 2800, 3.0, 1.2
+PRESENCE_HZ, PRESENCE_GAIN_DB, PRESENCE_WIDTH_O = 4500, 2.5, 1.4
+AIR_SHELF_HZ, AIR_SHELF_GAIN_DB = 6800, 3.0
 COMP_THRESHOLD_DB = -18.0
 COMP_RATIO = 3.0
 COMP_ATTACK_MS = 10
 COMP_RELEASE_MS = 120
 MASTER_LIMITER_LINEAR = 0.8414  # -1.5 dBTP
 SEGMENT_FADE_S = 0.02  # anti-click micro-fades at cut seams
-# AAC reconstruction overshoots a hard-limited waveform by up to ~1 dB on
-# decode; the segment encoder needs its own ceiling so the SHIPPED mp4 stays
-# under the -1.0 dBTP clipping gate (master bus stays at the spec'd -1.5)
-ENCODE_HEADROOM_LIMITER_LINEAR = 0.79  # ~ -2.1 dBFS pre-codec
+# AAC reconstruction overshoots a hard-limited waveform by up to ~1.5 dB on
+# decode for sibilant/high-crest material (measured: -0.66 dBFS decoded from a
+# -2.1 dBFS pre-codec ceiling on a sibilance-heavy mix); the segment encoder
+# needs its own ceiling so the SHIPPED mp4 stays under the -1.0 dBTP clipping
+# gate at ANY crest (master bus stays at the spec'd -1.5)
+ENCODE_HEADROOM_LIMITER_LINEAR = 0.7079  # -3.0 dBFS pre-codec
 SAMPLE_RATE = 48_000
 
 # duck gain as a linear factor: 10^(-14/20)
@@ -69,15 +81,21 @@ class TwoBusMixError(RuntimeError):
 
 
 def bus1_tone_chain() -> str:
-    """Bus-1 intelligibility chain: mud cut -> clarity lift -> gentle comp.
+    """Bus-1 intelligibility chain: mud cut -> clarity -> presence -> air -> comp.
 
     Applied to the neural-clean audio BEFORE the gate, so the compressor
-    breathes with the voice, not with the gate.
+    breathes with the voice, not with the gate. The presence bell + air shelf
+    are the timbre-restoration law: they put back the 2-12 kHz band the neural
+    extractor shaved (the measured "deep voice" artifact — see the constants
+    block). Safe noise-wise: after the extractor the residual in those bands
+    sits >20 dB under the voice, so the lift cannot re-inflate the floor.
     """
     return ",".join(
         [
             f"equalizer=f={MUD_CUT_HZ}:width_type=o:width={MUD_CUT_WIDTH_O}:g={MUD_CUT_GAIN_DB}",
-            f"equalizer=f={CLARITY_HZ}:width_type=o:width={CLARITY_WIDTH_O}:g={CLARITY_GAIN_DB}",
+            f"equalizer=f={CLARITY_HZ}:width_type=o:width={CLARITY_WIDTH_O}:g={CLARITY_GAIN_DB:+g}",
+            f"equalizer=f={PRESENCE_HZ}:width_type=o:width={PRESENCE_WIDTH_O}:g={PRESENCE_GAIN_DB:+g}",
+            f"highshelf=f={AIR_SHELF_HZ}:g={AIR_SHELF_GAIN_DB:+g}",
             (
                 f"acompressor=threshold={COMP_THRESHOLD_DB:g}dB:ratio={COMP_RATIO:g}:"
                 f"attack={COMP_ATTACK_MS}:release={COMP_RELEASE_MS}"

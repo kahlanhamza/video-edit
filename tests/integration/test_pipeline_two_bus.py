@@ -41,14 +41,42 @@ NOISE_RMS = 0.16  # broadband highway/static noise (-16 dBFS)
 
 
 def _voiced_burst(n: int, sr: int, rng, rms_target: float) -> np.ndarray:
-    """Harmonic-complex 'voice' (f0=130 Hz, 1/k rolloff) — speech-like crest
-    (~4 dB) instead of Gaussian noise's ~12 dB, so limiter behavior in the
-    test matches real compressed dialogue rather than a pathological case."""
+    """Harmonic-complex 'voice' (f0=130 Hz, 1/k rolloff) + sibilance band.
+
+    Speech-like crest (~4 dB) instead of Gaussian noise's ~12 dB, so limiter
+    behavior in the test matches real compressed dialogue rather than a
+    pathological case. The 3-8 kHz band-limited noise layer stands in for
+    fricatives/sibilance — real speech carries it, and the timbre gate
+    (timbre_not_muffled) would rightly reject a voice with none.
+    """
     t = np.arange(n) / sr
     phase = rng.uniform(0, 2 * np.pi, size=12)
     wave_ = sum(np.sin(2 * np.pi * 130 * k * t + phase[k - 1]) / k for k in range(1, 13))
     wave_ *= 0.6 + 0.4 * np.sin(2 * np.pi * 3.3 * t)  # syllabic AM
-    return wave_ / (np.sqrt(np.mean(np.square(wave_))) + 1e-9) * rms_target
+    wave_ = wave_ / (np.sqrt(np.mean(np.square(wave_))) + 1e-9) * rms_target
+    hiss = _band_noise(n, sr, rng, 3000.0, 8000.0) * (rms_target * 0.22)
+    # sibilance rides WITH the syllables (same AM as the voice) — continuous
+    # independent white-noise would stack a 12 dB crest on the voice and the
+    # limiter chain would eat real loudness, which real speech never does
+    hiss *= 0.6 + 0.4 * np.sin(2 * np.pi * 3.3 * t)
+    out = wave_ + hiss
+    # soft-knee limiter: free-running harmonics + hiss show ~12 dB crest, a
+    # crest no AGC'd bodycam dialogue ever carries. The shipped loudness is a
+    # limiter equilibrium (RMS = ceiling - crest), so the fixture must bound
+    # crest or the -12..-6 window audit fails for synthetic reasons. Drive is
+    # tuned so the burst crest lands ~7 dB over RMS — compressed-dialogue-like.
+    drive = 0.35
+    out = np.tanh(drive * out / (np.sqrt(np.mean(np.square(out))) + 1e-9))
+    peak = float(np.max(np.abs(out)))
+    return out * (rms_target * 2.2 / peak)  # peak ~ 6.8 dB over RMS
+
+
+def _band_noise(n: int, sr: int, rng, lo_hz: float, hi_hz: float) -> np.ndarray:
+    x = rng.normal(size=n)
+    spec = np.fft.rfft(x)
+    freqs = np.fft.rfftfreq(n, d=1.0 / sr)
+    out = np.fft.irfft(spec * ((freqs >= lo_hz) & (freqs <= hi_hz)), n=n)
+    return out / (np.sqrt(np.mean(np.square(out))) + 1e-9)
 
 
 @pytest.fixture(scope="module")
@@ -205,7 +233,13 @@ def test_full_pipeline_two_bus_render_is_clean_and_proven(noisy_bodycam, project
     assert result.audit.ok, [c.detail for c in result.audit.failures]
     by_name = {c.name: c for c in result.audit.checks}
     # --- the acoustic law is ON the report
-    for gate in ("enhancer_engine_used", "snr_verification", "zero_clipping", "stream_uniformity"):
+    for gate in (
+        "enhancer_engine_used",
+        "snr_verification",
+        "timbre_not_muffled",
+        "zero_clipping",
+        "stream_uniformity",
+    ):
         assert gate in by_name, f"missing QA gate {gate}"
         assert by_name[gate].ok, f"{gate}: {by_name[gate].detail}"
     # --- the engine law: the fake's exact name is on record, afftdn nowhere
