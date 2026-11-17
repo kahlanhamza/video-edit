@@ -1,8 +1,10 @@
 """Glass graphic cards — deterministic Pillow renderer + collision-free placement.
 
 Templates (PLAN §3.3F `graphics.render_card`): `location_intro`, `case_outcome`,
-`evidence_quote`, and `map_route` (M4 — Playwright HTML/CSS pipeline with a
-deterministic Pillow fallback, see `vision_fx.map_route`).
+`evidence_quote`, `evidence_fact` (issue #17 — the middle-card: BAC numbers,
+policy violations, dispatch quotes as big-fact callouts), and `map_route`
+(M4 — Playwright HTML/CSS pipeline with a deterministic Pillow fallback, see
+`vision_fx.map_route`).
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ GLASS_BG = (16, 20, 28, 205)
 TITLE_COLOR = (240, 240, 240, 255)
 BODY_COLOR = (170, 176, 188, 255)
 
-TEMPLATES = ("location_intro", "case_outcome", "evidence_quote", "map_route")
+TEMPLATES = ("location_intro", "case_outcome", "evidence_quote", "evidence_fact", "map_route")
 
 
 class CardError(RuntimeError):
@@ -81,6 +83,9 @@ def render_card(
     badge = fields.get("badge", "")
     quote = fields.get("quote", "")
     attribution = fields.get("attribution", "")
+    fact_value = fields.get("fact_value", "")
+    fact_label = fields.get("fact_label", "")
+    fact_source = fields.get("source", "")
 
     if template == "location_intro":
         f_title = _fit_text(draw, title, font_path, 44, w - 110)
@@ -95,6 +100,20 @@ def render_card(
         draw.text((w - 194, 38), badge or "OUTCOME", font=f_badge, fill=TITLE_COLOR)
         draw.text((56, 34), title, font=f_title, fill=TITLE_COLOR)
         draw.text((56, 106), body, font=f_body, fill=BODY_COLOR)
+    elif template == "evidence_fact":
+        # the documentary middle-card: ONE fact, huge and citable
+        #   fact_value: "0.14% BAC" — the number is the design
+        #   fact_label: "Breath test at 22:41" — what the number means
+        #   source:     "TOX-2024-1187, p.3" — where it came from (audit trail)
+        f_value = _fit_text(draw, fact_value, font_path, 56, w - 250)
+        f_label = _fit_text(draw, fact_label or title, font_path, 24, w - 110)
+        f_badge = _font(font_path, 18)
+        f_source = _fit_text(draw, f"SOURCE: {fact_source}", font_path, 16, w - 190)
+        draw.rounded_rectangle([w - 178, 30, w - 36, 62], radius=12, fill=ACCENT)
+        draw.text((w - 172, 37), badge or "FACT", font=f_badge, fill=TITLE_COLOR)
+        draw.text((56, 26), fact_value, font=f_value, fill=TITLE_COLOR)
+        draw.text((56, h - 116), fact_label or title, font=f_label, fill=BODY_COLOR)
+        draw.text((56, h - 66), f"SOURCE: {fact_source}", font=f_source, fill=(130, 138, 152, 255))
     else:  # evidence_quote
         f_quote = _fit_text(draw, f'"{quote}"', font_path, 36, w - 110)
         f_attr = _fit_text(draw, f"— {attribution}", font_path, 22, w - 110)

@@ -103,6 +103,54 @@ def assert_audio_law(result: ProbeResult) -> None:
         )
 
 
+def _window_event_seconds(
+    path: str | Path, filter_str: str, head_s: float | None, tail_s: float | None
+) -> float:
+    """Run a detect filter on ONLY the head or tail window; return event seconds.
+
+    `-sseof` + `-t` keeps the scan cheap on long masters and makes the check
+    about the OUT-FRAMES specifically (issue #18) instead of the whole file.
+    """
+    args = ["ffmpeg", "-hide_banner", "-nostats"]
+    if head_s is not None:
+        args += ["-t", f"{head_s:g}"]
+    if tail_s is not None:
+        args += ["-sseof", f"-{tail_s:g}"]
+    args += ["-i", str(path), "-vf", filter_str, "-f", "null", "-"]
+    r = subprocess.run(args, capture_output=True, text=True)
+    total = 0.0
+    for m in re.finditer(
+        r"(?:black_start|freeze_start):\S+\s+(?:black_end|freeze_end):\S+\s+(?:black_duration|freeze_duration):([0-9.]+)",
+        r.stderr,
+    ):
+        total += float(m.group(1))
+    return total
+
+
+def clean_out_frames_check(path: str | Path, window_s: float = 1.5) -> AuditCheck:
+    """First/last frames are clean visible frames — no trailing black/frozen tail.
+
+    YouTube renders what's in the container: a trailing black span reads as a
+    broken video, a frozen last frame reads as a stall. blackdetect on the
+    head AND tail windows + freezedetect on the tail catch all three.
+    """
+    try:
+        head_black = _window_event_seconds(
+            path, "blackdetect=d=0.2:pix_th=0.10", head_s=window_s, tail_s=None
+        )
+        tail_black = _window_event_seconds(
+            path, "blackdetect=d=0.2:pix_th=0.10", head_s=None, tail_s=window_s
+        )
+        tail_freeze = _window_event_seconds(
+            path, "freezedetect=n=0.003:d=1", head_s=None, tail_s=max(window_s, 2.0)
+        )
+        ok = head_black < 0.05 and tail_black < 0.05 and tail_freeze < 0.05
+        detail = f"head_black={head_black:.2f}s tail_black={tail_black:.2f}s tail_freeze={tail_freeze:.2f}s (windows {window_s:g}s)"
+        return AuditCheck(name="clean_out_frames", ok=ok, detail=detail)
+    except Exception as e:
+        return AuditCheck(name="clean_out_frames", ok=False, detail=str(e))
+
+
 def blackdetect_seconds(path: str | Path, min_dur: float = 0.5) -> float:
     """Total seconds of black video (ffmpeg blackdetect) — used by qa gates."""
     r = subprocess.run(
@@ -201,6 +249,8 @@ def audit_technical(
         law_detail = str(e)
     checks.append(AuditCheck(name="audio_law_48k_stereo", ok=law_ok, detail=law_detail))
 
+    checks.append(clean_out_frames_check(path))
+
     black = blackdetect_seconds(path)
     checks.append(
         AuditCheck(
@@ -281,6 +331,26 @@ def audit_layout_and_policy(
                 ),
             )
         )
+        bbox = card.get("bbox") or card.get("rect")
+        if bbox:
+            try:
+                bx, by, bw, bh = (int(bbox[k]) for k in ("x", "y", "w", "h"))
+                from director_os.vision_fx.safe_zone import check_safe_zone
+
+                ok, detail = check_safe_zone((bx, by, bw, bh), frame[0], frame[1])
+                checks.append(
+                    AuditCheck(
+                        name="card_safe_zone",
+                        ok=ok,
+                        detail=f"card '{card.get('template')}': {detail}",
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                checks.append(
+                    AuditCheck(
+                        name="card_safe_zone", ok=False, detail=f"card malformed bbox {bbox}"
+                    )
+                )
 
     for i, blur in enumerate(blurs or []):
         bbox = blur.get("bbox") or {}
