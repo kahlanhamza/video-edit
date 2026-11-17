@@ -132,7 +132,10 @@ def speech_gated_chain(gain_db: float, limit_linear: float = LIMITER_LINEAR) -> 
     `alimiter` runs AFTER the gain so the boosted dialogue can never poke
     through the ceiling — the limiter is the guarantee, not an afterthought.
     """
-    return f"volume={gain_db:+g}dB,alimiter=level_in=1:level_out=1:limit={limit_linear:g}:attack=5:release=50"
+    return (
+        f"volume={gain_db:+g}dB,"
+        f"alimiter=level_in=1:level_out=1:limit={limit_linear:g}:attack=5:release=50"
+    )
 
 
 def leveled_chain_for(

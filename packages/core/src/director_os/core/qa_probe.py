@@ -145,7 +145,10 @@ def clean_out_frames_check(path: str | Path, window_s: float = 1.5) -> AuditChec
             path, "freezedetect=n=0.003:d=1", head_s=None, tail_s=max(window_s, 2.0)
         )
         ok = head_black < 0.05 and tail_black < 0.05 and tail_freeze < 0.05
-        detail = f"head_black={head_black:.2f}s tail_black={tail_black:.2f}s tail_freeze={tail_freeze:.2f}s (windows {window_s:g}s)"
+        detail = (
+            f"head_black={head_black:.2f}s tail_black={tail_black:.2f}s "
+            f"tail_freeze={tail_freeze:.2f}s (windows {window_s:g}s)"
+        )
         return AuditCheck(name="clean_out_frames", ok=ok, detail=detail)
     except Exception as e:
         return AuditCheck(name="clean_out_frames", ok=False, detail=str(e))
@@ -284,7 +287,8 @@ def audit_technical(
                     name="speech_gated_loudness",
                     ok=ok,
                     detail=(
-                        f"speech RMS {speech_db:.1f} dBFS (window {speech_lo_dbfs:g}..{speech_hi_dbfs:g}), "
+                        f"speech RMS {speech_db:.1f} dBFS "
+                        f"(window {speech_lo_dbfs:g}..{speech_hi_dbfs:g}), "
                         f"file RMS {levels['file_rms_dbfs']:.1f} — siren does not skew the meter"
                     ),
                 )
