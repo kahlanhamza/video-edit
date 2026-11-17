@@ -263,9 +263,9 @@ metrics = {
     "improvement_db": round(improvement, 2),
     "clean_peak_dbfs": round(peak_clean_dbfs, 2),
     "gates": {
-        "clean_snr_ge_14": gate_clean,
-        "noise_reduction": gate_reduction,
-        "zero_clipping": gate_clip,
+        "clean_snr_ge_14": bool(gate_clean),
+        "noise_reduction": bool(gate_reduction),
+        "zero_clipping": bool(gate_clip),
     },
     "all_gates_pass": bool(gate_clean and gate_reduction and gate_clip),
 }
@@ -413,7 +413,7 @@ def phase_push() -> None:
     client = _client()
     push_slug = _kernel_slug()
     pushed = client.push_kernel(
-        push_slug, "DirectorOS MossFormer2 SE 48K (Eustis evidence run)", script
+        push_slug, "DirectorOS MossFormer2 SE (Eustis evidence)", script
     )
     ref = str(pushed.get("ref", "")).removeprefix("/code/") or SLUG
     REF_FILE.parent.mkdir(parents=True, exist_ok=True)
