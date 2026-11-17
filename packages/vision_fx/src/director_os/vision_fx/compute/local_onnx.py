@@ -29,6 +29,8 @@ from director_os.vision_fx.compute.base import (
 from director_os.vision_fx.compute.tracker import track_and_interpolate
 from director_os.vision_fx.compute.yolo_onnx import (
     YoloOnnxFaceDetector,
+    YoloOnnxPlateDetector,
+    resolve_plate_model_path,
     resolve_yolo_model_path,
 )
 
@@ -74,13 +76,16 @@ class LocalOnnxCpuBackend:
         detector: _FrameDetector | None = None,
         stride: int = 3,
         sample_every_s: float | None = None,
+        plate_model_path: str | Path | None = None,
     ):
         self._yolo_path = yolo_model_path
+        self._plate_path = plate_model_path
         self._detector = detector
         self.stride = max(1, stride)
         # stride=3 wins when the caller didn't pin an explicit cadence
         self._sample_every_s = sample_every_s
         self._yolo_model_file = resolve_yolo_model_path(yolo_model_path)
+        self._plate_model_file = resolve_plate_model_path(plate_model_path)
 
     # --------------------------------------------------------------- detector
     def _make_detector(
@@ -116,36 +121,30 @@ class LocalOnnxCpuBackend:
         return det
 
     # ------------------------------------------------------------------- jobs
-    def detect_faces(
+    def _sweep_tracks(
         self,
         video_path: Path | str,
-        sample_every_s: float = DEFAULT_SAMPLE_EVERY_S,
-        max_samples: int = DEFAULT_MAX_SAMPLES,
-        score_threshold: float = DEFAULT_SWEEP_CONF,
-        progress: Callable[[int, int], None] | None = None,
-        imgsz: int = DEFAULT_IMGSZ,
-        conf: float = DEFAULT_SWEEP_CONF,
-        gmc: bool = True,
-    ) -> list[FaceTrack]:
-        """Pass 1 — detect + GMC-track faces -> persistent per-frame tracks.
+        det: _FrameDetector,
+        sample_every_s: float,
+        max_samples: int,
+        gmc: bool,
+        progress: Callable[[int, int], None] | None,
+    ) -> tuple[
+        list[list[tuple[int, int, int, int, float]]], list[float], list[tuple[float, float]]
+    ]:
+        """The ONE decode sweep both face and plate jobs ride (issue #12).
 
-        Detection runs at `imgsz` with `conf` floor; sparse-optical-flow camera
-        motion is measured on the SAME decode sweep and fed to the tracker so
-        whip-pans keep identities; `track_buffer=60` keeps re-association alive.
-        Caller MUST CFR-normalize first (redact_track.normalize_cfr) so the
-        frame indices returned here are the renderer's frame indices.
+        Detection + sparse-optical-flow GMC measured on the same sampled frames;
+        a detector exception propagates LOUD (swallowing it here produced the
+        empty Eustis plan — see detect_faces). Returns per-sampled-frame
+        detections, timestamps and motion vectors for the tracker.
         """
         import cv2
 
-        det: _FrameDetector = self._make_detector(imgsz=imgsz, conf=conf)
-        if self._sample_every_s is not None and sample_every_s == DEFAULT_SAMPLE_EVERY_S:
-            sample_every_s = self._sample_every_s
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             raise ComputeNotAvailable(f"cannot open video: {video_path}")
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        # stride=3 at 30 fps via the 0.1 s default cadence; a caller-pinned
-        # smaller cadence is honored, never silently coarser than requested
         frame_stride = max(1, int(round(fps * sample_every_s)))
 
         detections_per_frame: list[list[tuple[int, int, int, int, float]]] = []
@@ -194,10 +193,83 @@ class LocalOnnxCpuBackend:
                     progress(decoded, max_samples)
             idx += 1
         cap.release()
+        return detections_per_frame, t_per_frame, motions
+
+    def detect_faces(
+        self,
+        video_path: Path | str,
+        sample_every_s: float = DEFAULT_SAMPLE_EVERY_S,
+        max_samples: int = DEFAULT_MAX_SAMPLES,
+        score_threshold: float = DEFAULT_SWEEP_CONF,
+        progress: Callable[[int, int], None] | None = None,
+        imgsz: int = DEFAULT_IMGSZ,
+        conf: float = DEFAULT_SWEEP_CONF,
+        gmc: bool = True,
+    ) -> list[FaceTrack]:
+        """Pass 1 — detect + GMC-track faces -> persistent per-frame tracks.
+
+        Detection runs at `imgsz` with `conf` floor; sparse-optical-flow camera
+        motion is measured on the SAME decode sweep and fed to the tracker so
+        whip-pans keep identities; `track_buffer=60` keeps re-association alive.
+        Caller MUST CFR-normalize first (redact_track.normalize_cfr) so the
+        frame indices returned here are the renderer's frame indices.
+        """
+        det: _FrameDetector = self._make_detector(imgsz=imgsz, conf=conf)
+        if self._sample_every_s is not None and sample_every_s == DEFAULT_SAMPLE_EVERY_S:
+            sample_every_s = self._sample_every_s
+        detections_per_frame, t_per_frame, motions = self._sweep_tracks(
+            video_path, det, sample_every_s, max_samples, gmc, progress
+        )
 
         # the tracker consumes the detector's name for stats via capabilities
         self._last_detector_name = getattr(det, "name", "unknown")
         self._last_failed_frames = 0  # detector errors raise — nothing is swallowed
+        tracks = track_and_interpolate(
+            detections_per_frame,
+            t_per_frame,
+            gmc_vectors=motions if gmc else None,
+            track_buffer=DEFAULT_TRACK_BUFFER,
+        )
+        return [tr for tr in tracks if tr.min_score >= score_threshold]
+
+    def detect_plates(
+        self,
+        video_path: Path | str,
+        sample_every_s: float = DEFAULT_SAMPLE_EVERY_S,
+        max_samples: int = DEFAULT_MAX_SAMPLES,
+        score_threshold: float = DEFAULT_SWEEP_CONF,
+        progress: Callable[[int, int], None] | None = None,
+        imgsz: int = DEFAULT_IMGSZ,
+        conf: float = DEFAULT_SWEEP_CONF,
+        gmc: bool = True,
+    ) -> list[FaceTrack]:
+        """Pass 1 for LICENSE PLATES (issue #12) — same law as faces.
+
+        Same decode sweep, same GMC tracker, same track_buffer — plates ride on
+        vehicles through whip-pans just like faces do. The plate export is fixed
+        at 640 input (`resolve_input_size` honors the model's contract), and the
+        detection floor lands near the readability floor of the RAW pixels: what
+        the detector cannot see, a viewer cannot read, so nothing legally
+        requiring redaction is missed. Ids are re-prefixed `plate_N` by
+        `merge_tracks` when the two sweeps combine into one redaction plan.
+
+        Raises ComputeNotAvailable when the plate model file is absent —
+        callers check `capabilities()["plates"]` first and skip the sweep.
+        """
+        if self._plate_model_file is None:
+            raise ComputeNotAvailable(
+                "license-plate ONNX model not found — run scripts/fetch_yolov8n_plate.py "
+                "or set DIRECTOR_YOLOV8N_PLATE_PATH"
+            )
+        det: _FrameDetector = YoloOnnxPlateDetector(
+            self._plate_model_file, conf_threshold=conf, input_size=imgsz
+        )
+        if self._sample_every_s is not None and sample_every_s == DEFAULT_SAMPLE_EVERY_S:
+            sample_every_s = self._sample_every_s
+        detections_per_frame, t_per_frame, motions = self._sweep_tracks(
+            video_path, det, sample_every_s, max_samples, gmc, progress
+        )
+        self._last_plate_detector_name = getattr(det, "name", "unknown")
         tracks = track_and_interpolate(
             detections_per_frame,
             t_per_frame,
@@ -244,4 +316,10 @@ class LocalOnnxCpuBackend:
             demucs_ok = True
         except ImportError:
             demucs_ok = False
-        return {"faces": True, "stems": demucs_ok, "asr_align": False, "yolo_model": yolo}
+        return {
+            "faces": True,
+            "plates": self._plate_model_file is not None,
+            "stems": demucs_ok,
+            "asr_align": False,
+            "yolo_model": yolo,
+        }

@@ -265,6 +265,69 @@ def _median_t_step(t_per_frame: list[float]) -> float:
     return steps[len(steps) // 2]
 
 
+class EmptySweepError(RuntimeError):
+    """Both face AND plate sweeps came back empty — the plan would be vacuous.
+
+    A sweep that sees nothing is a broken sweep, not an empty scene (issue #14
+    follow-up: the Eustis bake shipped ZERO redaction while the audit passed
+    with 0 detections = 0 leaks). Privacy is not soft: refuse.
+    """
+
+
+def merge_tracks(*groups: list[FaceTrack]) -> list[FaceTrack]:
+    """Concatenate detector groups (faces, plates, ...) into one id-unique list.
+
+    Each sweep's tracker emits `person_{n}` ids independently, so a bare
+    concatenation collides (`person_1` from faces AND plates). Only colliding
+    ids are renamed (suffix `_2`, `_3`, ...); domain semantics — `plate_N` vs
+    `person_N` — come from `merge_redaction_tracks`, which pre-prefixes plate
+    ids so the two sweeps NEVER alias each other's objects. Order is preserved
+    (faces first, plates second); the redaction plan, Studio exclusion toggles
+    and the debug overlay all key on these ids.
+    """
+    merged: list[FaceTrack] = []
+    seen: set[str] = set()
+    for group in groups:
+        for tr in group:
+            tid = tr.track_id
+            if tid in seen:
+                n = 1
+                while f"{tid}_{n}" in seen:
+                    n += 1
+                tid = f"{tid}_{n}"
+            seen.add(tid)
+            merged.append(FaceTrack(track_id=tid, hits=tr.hits))
+    return merged
+
+
+def merge_redaction_tracks(
+    face_tracks: list[FaceTrack], plate_tracks: list[FaceTrack]
+) -> list[FaceTrack]:
+    """Face + plate tracks -> one redaction track list; EMPTY is an error.
+
+    Plates get readable ids (`person_N` -> `plate_N`) so the Studio UI and the
+    debug overlay distinguish a blurred face from a blurred plate. An empty
+    MERGED list raises `EmptySweepError` — a face-less source is legitimate
+    (plates may still be present), but nothing-detectable-everywhere is the
+    broken-sweep signature we refuse to bake (issue #14 follow-up law).
+    """
+    prefixed_plates: list[FaceTrack] = []
+    for tr in plate_tracks:
+        tid = tr.track_id
+        if tid.startswith("person_"):
+            tid = f"plate_{tid[len('person_') :]}"
+        prefixed_plates.append(FaceTrack(track_id=tid, hits=tr.hits))
+    merged = merge_tracks(face_tracks, prefixed_plates)
+    if not merged:
+        raise EmptySweepError(
+            "tracked redaction sweep found ZERO faces and ZERO plates — refusing to persist an "
+            "empty plan (broken detector/model or genuinely empty scene; verify with "
+            "scripts/fetch_yolov8n_face.py + scripts/fetch_yolov8n_plate.py "
+            "+ a debug-overlay sweep)"
+        )
+    return merged
+
+
 def tracks_to_regions(
     tracks: list[FaceTrack],
     *,

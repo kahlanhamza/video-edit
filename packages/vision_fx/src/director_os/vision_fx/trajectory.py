@@ -200,8 +200,8 @@ def _dense_frames(
         last_fi = -1
         for i in range(lead, 0, -1):
             fi = max(0, first["frame_idx"] - i)
-            if fi <= last_fi:
-                continue  # clamped at frame 0 — already covered by an earlier lead frame
+            if fi >= first["frame_idx"] or fi <= last_fi:
+                continue  # clamped onto the first real frame (or an earlier lead) — skip
             out.insert(0, {**first, "frame_idx": fi, "bridged": False, "lead": True})
             last_fi = fi
         last = out[-1]

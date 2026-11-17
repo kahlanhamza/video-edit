@@ -19,32 +19,49 @@ from pathlib import Path
 import numpy as np
 
 DEFAULT_MODEL_FILENAME = "yolov8n-face-lindevs.onnx"
+PLATE_MODEL_FILENAME = "yolov8n-license-plate.onnx"
 DEFAULT_CONF_THRESHOLD = 0.35
 DEFAULT_IOU_THRESHOLD = 0.45
 INPUT_SIZE = 640
 
 
-def resolve_yolo_model_path(model_path: str | Path | None = None) -> Path | None:
+def resolve_yolo_model_path(
+    model_path: str | Path | None = None,
+    *,
+    default_filename: str = DEFAULT_MODEL_FILENAME,
+    env_var: str = "DIRECTOR_YOLOV8N_FACE_PATH",
+) -> Path | None:
     """Search order: explicit arg (must exist — fail loud otherwise) -> env ->
-    repo-root data/models (dev checkout / editable install) -> package models dir."""
+    repo-root data/models (dev checkout / editable install) -> package models dir.
+
+    `default_filename`/`env_var` parameterize the same search for the second
+    detector of the family (license plates, issue #12) — one resolver, two models.
+    """
     here = Path(__file__).resolve()
     # here = <root>/packages/vision_fx/src/director_os/vision_fx/compute/yolo_onnx.py
     # parents: 0=compute 1=vision_fx 2=director_os 3=src 4=vision_fx(pkg) 5=packages 6=<repo root>
     if model_path:
         p = Path(model_path)
         if not p.exists():
-            raise FileNotFoundError(f"explicit yolov8n-face model not found: {p}")
+            raise FileNotFoundError(f"explicit yolov8n model not found: {p}")
         return p
-    env = os.getenv("DIRECTOR_YOLOV8N_FACE_PATH", "").strip()
+    env = os.getenv(env_var, "").strip()
     candidates: list[Path] = [Path(env)] if env else []
     for up in (6, 5):
-        candidates.append(here.parents[up] / "data" / "models" / DEFAULT_MODEL_FILENAME)
-    candidates.append(Path.cwd() / "data" / "models" / DEFAULT_MODEL_FILENAME)
-    candidates.append(here.parent.parent / "models" / DEFAULT_MODEL_FILENAME)
+        candidates.append(here.parents[up] / "data" / "models" / default_filename)
+    candidates.append(Path.cwd() / "data" / "models" / default_filename)
+    candidates.append(here.parent.parent / "models" / default_filename)
     for c in candidates:
         if c.exists():
             return c
     return None
+
+
+def resolve_plate_model_path(model_path: str | Path | None = None) -> Path | None:
+    """License-plate variant of the resolver (fetch via scripts/fetch_yolov8n_plate.py)."""
+    return resolve_yolo_model_path(
+        model_path, default_filename=PLATE_MODEL_FILENAME, env_var="DIRECTOR_YOLOV8N_PLATE_PATH"
+    )
 
 
 def resolve_input_size(declared_shape: list, requested: int) -> tuple[int, str]:
@@ -69,6 +86,9 @@ class YoloOnnxFaceDetector:
     """onnxruntime wrapper: (name + raw-pixel boxes), same shape as YuNet's."""
 
     name = "yolov8n-face-onnx"
+    _default_filename = DEFAULT_MODEL_FILENAME
+    _env_var = "DIRECTOR_YOLOV8N_FACE_PATH"
+    _fetch_hint = "scripts/fetch_yolov8n_face.py"
 
     def __init__(
         self,
@@ -77,11 +97,13 @@ class YoloOnnxFaceDetector:
         iou_threshold: float = DEFAULT_IOU_THRESHOLD,
         input_size: int = INPUT_SIZE,
     ):
-        resolved = resolve_yolo_model_path(model_path)
+        resolved = resolve_yolo_model_path(
+            model_path, default_filename=self._default_filename, env_var=self._env_var
+        )
         if resolved is None:
             raise FileNotFoundError(
-                "yolov8n-face ONNX model not found — run scripts/fetch_yolov8n_face.py "
-                "or set DIRECTOR_YOLOV8N_FACE_PATH"
+                f"{self._default_filename} ONNX model not found — run {self._fetch_hint} "
+                f"or set {self._env_var}"
             )
         try:
             import onnxruntime as ort
@@ -195,3 +217,20 @@ class YoloOnnxFaceDetector:
                 continue
             hits.append((x0, y0, x1 - x0, y1 - y0, round(float(score), 3)))
         return hits
+
+
+class YoloOnnxPlateDetector(YoloOnnxFaceDetector):
+    """License-plate detector — SAME decode path, second ONNX model (issue #12).
+
+    The ml-debi plate export has the identical graph contract (input fixed
+    640x640, output (1, 5, 8400) single-class), so it is literally a rename of
+    the resolver. Note the fixed 640 input means distant plates (< ~18 px after
+    letterbox) will not fire — an unreadable plate carries no PII, so the
+    detection floor aligns with the redaction requirement (blur what is
+    readable in RAW pixels, incl. under punch-in zooms).
+    """
+
+    name = "yolov8n-license-plate-onnx"
+    _default_filename = PLATE_MODEL_FILENAME
+    _env_var = "DIRECTOR_YOLOV8N_PLATE_PATH"
+    _fetch_hint = "scripts/fetch_yolov8n_plate.py"

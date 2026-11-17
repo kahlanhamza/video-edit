@@ -297,7 +297,11 @@ def _tracked_redaction_payload(
     import json as _json
 
     from director_os.vision_fx.compute.local_onnx import LocalOnnxCpuBackend
-    from director_os.vision_fx.compute.tracker import tracks_to_regions
+    from director_os.vision_fx.compute.tracker import (
+        EmptySweepError,
+        merge_redaction_tracks,
+        tracks_to_regions,
+    )
     from director_os.vision_fx.redact_track import normalize_cfr, video_n_frames
     from director_os.vision_fx.trajectory import repair_trajectories
 
@@ -314,25 +318,29 @@ def _tracked_redaction_payload(
         raise RuntimeError("CFR source frame count unknown — refusing to plan blind")
 
     tracks = backend.detect_faces(cfr_path)  # imgsz 960, conf 0.22, GMC + buffer 60
-    if not tracks:
+    plate_tracks: list = []
+    if caps.get("plates"):
+        # plates ride the same 3-pass law (issue #12): same sweep, same GMC
+        # tracker, same Pass-2 repair. Absent model -> faces-only, never a blocker.
+        plate_tracks = backend.detect_plates(cfr_path)
+    try:
+        merged = merge_redaction_tracks(tracks, plate_tracks)
+    except EmptySweepError as e:
         # A sweep that sees NOTHING is a broken sweep, not an empty scene:
         # shipping it bakes zero redaction while the audit passes vacuously
         # (0 detections = 0 leaks). Fail the stage loud — privacy is not soft.
-        raise RuntimeError(
-            "tracked redaction sweep found ZERO faces — refusing to persist an "
-            "empty plan (broken detector/model or genuinely face-less source; "
-            "verify with scripts/fetch_yolov8n_face.py + a debug-overlay sweep)"
-        )
-    plan = repair_trajectories(tracks, fps=30, frame_w=frame_w, frame_h=frame_h, n_frames=n_frames)
+        raise RuntimeError(str(e)) from e
+    plan = repair_trajectories(merged, fps=30, frame_w=frame_w, frame_h=frame_h, n_frames=n_frames)
     from director_os.vision_fx.redact_track import assert_zero_leaks
 
-    assert_zero_leaks(plan, tracks, 30.0)  # the zero-leak contract, enforced at plan time
+    assert_zero_leaks(plan, merged, 30.0)  # the zero-leak contract, enforced at plan time
 
-    regions = tracks_to_regions(tracks, frame_w=frame_w, frame_h=frame_h)[:max_regions]
+    regions = tracks_to_regions(merged, frame_w=frame_w, frame_h=frame_h)[:max_regions]
     plan_json = plan.model_dump(mode="json")
     digest = hashlib.sha256(_json.dumps(plan_json, sort_keys=True).encode()).hexdigest()[:8]
     deps.log(
-        f"  [redaction] tracked plan: {len(plan.trajectories)} track(s), "
+        f"  [redaction] tracked plan: {len(plan.trajectories)} track(s) "
+        f"({len(tracks)} face + {len(plate_tracks)} plate), "
         f"{sum(t.n_windows for t in plan.trajectories)} window(s), digest {digest}"
     )
     return {
@@ -342,8 +350,10 @@ def _tracked_redaction_payload(
         "source": "tracked_local_gmc_3pass",
         "stats": {
             "tracks": len(tracks),
+            "plate_tracks": len(plate_tracks),
             "n_frames": n_frames,
             "detector": getattr(backend, "_last_detector_name", "unknown"),
+            "plate_detector": getattr(backend, "_last_plate_detector_name", None),
         },
     }
 
@@ -398,6 +408,7 @@ def stage_vision_enrichment(asset_id: str, source: Path, deps: PipelineDeps) -> 
 
     Persists into the existing free-form JSON columns (no migration):
     - `shots_json["frame_quality"]`    — CPU blur/darkness pre-filter (always on)
+    - `shots_json["audio_events"]`     — YAMNet CPU event spans (siren/gunshot/...)
     - `shots_json["visual_timeline"]`  — lite-tier contact-sheet indexing (needs key)
     - `redaction_tracks_json["timestamp_ocr"]` — AXON overlay OCR (needs key/fleet)
     """
@@ -428,6 +439,23 @@ def stage_vision_enrichment(asset_id: str, source: Path, deps: PipelineDeps) -> 
             )
         except Exception as e:  # noqa: BLE001 — enrichment never kills the pipeline
             deps.log(f"  [vision] frame quality skipped: {e}")
+
+    if "audio_events" not in shots:
+        # YAMNet on CPU — local, $0, no key. Sirens/gunshots/shouting/glass as
+        # explicit spans (issue #12): the speech-gated meter refuses to treat
+        # them as program loudness, retention can anchor on them.
+        try:
+            from director_os.perception.audio_events import make_audio_event_backend
+
+            sweep = make_audio_event_backend().detect_events(source)
+            shots["audio_events"] = sweep.model_dump(mode="json")
+            kinds = sweep.kinds()
+            deps.log(
+                f"  [vision] audio events: {len(sweep.events)} span(s)"
+                + (f" — {', '.join(sorted(kinds))}" if kinds else " — quiet scene")
+            )
+        except Exception as e:  # noqa: BLE001
+            deps.log(f"  [vision] audio events skipped: {e}")
 
     if deps.settings.vision_api_key:
         if "visual_timeline" not in shots:
