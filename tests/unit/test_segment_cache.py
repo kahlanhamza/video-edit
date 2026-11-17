@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from director_os.core.models import BBox, BlurRegion
+from director_os.core.models import BBox, BlurRegion, ZoomKeyframe
 from director_os.otio_engine.segment_cache import (
     AudioRenderSpec,
     CardOverlaySpec,
@@ -29,6 +29,51 @@ def base_spec() -> SegmentRenderSpec:
 
 def test_stable_hash_for_identical_spec():
     assert segment_hash(base_spec()) == segment_hash(base_spec())
+
+
+def test_zoom_keyframe_change_invalidates():
+    a = base_spec()
+    b = base_spec()
+    b.zoom_keyframes = [ZoomKeyframe(t_s=2.0, zoom_factor=1.4)]
+    assert segment_hash(a) != segment_hash(b)
+
+
+def test_freeze_callout_change_invalidates():
+    from director_os.otio_engine.contract import FreezeCallout
+
+    a = base_spec()
+    b = base_spec()
+    b.freeze_callout = FreezeCallout(freeze_at_s=3.0, hold_s=2.0)
+    assert segment_hash(a) != segment_hash(b)
+
+
+def test_relative_cache_root_resolves_absolute(tmp_path, monkeypatch):
+    """ffmpeg's concat demuxer resolves `file` lines against the LIST file, not
+    the CWD — so cache paths must be absolute even when the root is relative."""
+    monkeypatch.chdir(tmp_path)
+    cache = SegmentCache("./output/segments")
+    assert cache.root.is_absolute()
+    assert cache.path_for("abc").is_absolute()
+
+
+def test_spotlight_png_content_change_invalidates(tmp_path):
+    from director_os.vision_fx.spotlight import render_spotlight_overlay
+
+    a = base_spec()
+    b = base_spec()
+    p1 = tmp_path / "s1.png"
+    p2 = tmp_path / "s2.png"
+    render_spotlight_overlay(640, 360, BBox(x=10, y=10, w=100, h=80), 0.45, p1)
+    render_spotlight_overlay(640, 360, BBox(x=150, y=10, w=100, h=80), 0.45, p2)
+    a.spotlight_png_path = str(p1)
+    b.spotlight_png_path = str(p2)
+    assert segment_hash(a) != segment_hash(b)
+    # identical content at different paths stays the same key (no path leakage)
+    p3 = tmp_path / "s3.png"
+    render_spotlight_overlay(640, 360, BBox(x=10, y=10, w=100, h=80), 0.45, p3)
+    c = base_spec()
+    c.spotlight_png_path = str(p3)
+    assert segment_hash(a) == segment_hash(c)
 
 
 def test_blur_sigma_change_invalidates():

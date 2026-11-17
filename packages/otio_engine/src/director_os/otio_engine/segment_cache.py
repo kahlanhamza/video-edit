@@ -103,7 +103,10 @@ def _file_digest(path: str | Path) -> str:
 
 class SegmentCache:
     def __init__(self, root: str | Path):
-        self.root = Path(root)
+        # Absolute by contract: concat lists and DAG paths must resolve from any
+        # CWD — ffmpeg's concat demuxer resolves `file` lines relative to the
+        # LIST file, not the process CWD, so relative roots broke final concat.
+        self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
 
     def path_for(self, key: str) -> Path:

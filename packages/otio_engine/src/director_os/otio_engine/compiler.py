@@ -119,7 +119,7 @@ def compile_timeline(
 ) -> RenderDAG:
     video = video or VideoRenderSpec()
     audio = audio or AudioRenderSpec()
-    out_dir = Path(out_dir)
+    out_dir = Path(out_dir).resolve()  # absolute: concat lists + PNG paths must resolve anywhere
     cards_dir = out_dir / "cards"
 
     master = master_track(timeline)
