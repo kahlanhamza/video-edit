@@ -17,6 +17,7 @@ in tests. Nothing here talks to the network.
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -68,7 +69,7 @@ class PipelineDeps:
     audio: AudioRenderSpec = field(default_factory=AudioRenderSpec)
     max_workers: int | None = None
     # --- M4 vision stack (all optional; None/False keeps the CPU-only pipeline)
-    redact_backend: str | None = None  # "yunet" (CPU, offline) | "modal" (GPU fleet)
+    redact_backend: str | None = None  # "tracked" (3-pass, issue #14) | "yunet" | "modal"
     vision_enrich: bool = False  # frame-quality score + VLM timeline + timestamp OCR
     log: Callable[[str], None] = lambda _msg: None
 
@@ -184,12 +185,14 @@ def stage_redaction(
 ) -> list:
     """Auto-detect redaction regions — idempotent, pluggable backend (M4).
 
-    backend "modal": YOLOv8-face + plate + ByteTrack on the serverless GPU fleet
-    (persistent Person/Plate IDs, time-binned tracked regions). backend "yunet":
-    the zero-download CPU sweep used since the first real-footage run. Both write
-    the same `redaction_tracks_json.regions` contract the studio canvas and the
-    renderer already consume, so a region the backend fails to produce is a
-    skipped stage, never a broken pipeline.
+    backend "tracked" (issue #14, the default when the YOLO model is present):
+    the deterministic 3-pass pipeline — CFR normalize, imgsz-960/conf-0.22 YOLO
+    + GMC tracking, One-Euro trajectory repair — persisted as a per-frame plan
+    PLUS the static regions the studio canvas already draws. backend "modal":
+    YOLOv8-face + plate + ByteTrack on the serverless GPU fleet (persistent
+    Person/Plate IDs, time-binned tracked regions). backend "yunet": the
+    zero-download CPU sweep used since the first real-footage run. A backend
+    that cannot run is a skipped stage, never a broken pipeline.
     """
     with deps.sessions() as s:
         row = s.get(PerceptionIndexRow, asset_id)
@@ -205,6 +208,23 @@ def stage_redaction(
         return []
 
     backend = deps.redact_backend or "yunet"
+    tracked_extra: dict[str, Any] = {}  # per_frame plan + digest (tracked backend only)
+    if backend == "tracked":
+        try:
+            tracked_payload = _tracked_redaction_payload(
+                source, project_id, deps, frame_w, frame_h, max_regions
+            )
+            regions = tracked_payload["regions"]
+            source_tag = tracked_payload["source"]
+            stats = tracked_payload["stats"]
+            tracked_extra = {
+                "per_frame": tracked_payload["per_frame"],
+                "plan_digest": tracked_payload["plan_digest"],
+            }
+        except Exception as e:  # model missing, sweep failure — degrade loudly
+            deps.log(f"  [redaction] tracked 3-pass unavailable ({e}) — falling back to YuNet")
+            backend = "yunet"
+
     if backend == "modal":
         from director_os.perception.modal_redact import (
             ModalRedactError,
@@ -241,6 +261,7 @@ def stage_redaction(
         "regions": [r.model_dump(mode="json") for r in regions],
         "source": source_tag,
         "stats": stats,
+        **tracked_extra,
     }
     with deps.sessions() as s:
         row = s.get(PerceptionIndexRow, asset_id)
@@ -255,6 +276,112 @@ def stage_redaction(
         f"({', '.join(sorted({r.track_id or 'box' for r in regions}))[:4]}...)"
     )
     return payload_json["regions"]
+
+
+def _tracked_redaction_payload(
+    source: Path,
+    project_id: str,
+    deps: PipelineDeps,
+    frame_w: int,
+    frame_h: int,
+    max_regions: int,
+) -> dict[str, Any]:
+    """Pass 1+2 of the 3-pass pipeline — the plan the render stage bakes in.
+
+    Persists BOTH contracts: the per-frame plan (`per_frame`, frame-indexed)
+    for the render bake, and static padded regions (studio canvas). The plan
+    digest rides in the payload so a re-sweep invalidates the baked source
+    naturally (content-addressed, like the segment cache).
+    """
+    import hashlib
+    import json as _json
+
+    from director_os.vision_fx.compute.local_onnx import LocalOnnxCpuBackend
+    from director_os.vision_fx.compute.tracker import tracks_to_regions
+    from director_os.vision_fx.redact_track import normalize_cfr, video_n_frames
+    from director_os.vision_fx.trajectory import repair_trajectories
+
+    backend = LocalOnnxCpuBackend()
+    caps = backend.capabilities()
+    if not caps.get("yolo_model"):
+        raise RuntimeError("yolov8n-face model not present (run scripts/fetch_yolov8n_face.py)")
+
+    out_dir = deps.settings.output_dir / "pipeline" / project_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cfr_path = normalize_cfr(source, out_dir / "source_cfr.mp4")
+    n_frames = video_n_frames(cfr_path)
+    if not n_frames:
+        raise RuntimeError("CFR source frame count unknown — refusing to plan blind")
+
+    tracks = backend.detect_faces(cfr_path)  # imgsz 960, conf 0.22, GMC + buffer 60
+    plan = repair_trajectories(tracks, fps=30, frame_w=frame_w, frame_h=frame_h, n_frames=n_frames)
+    from director_os.vision_fx.redact_track import assert_zero_leaks
+
+    assert_zero_leaks(plan, tracks, 30.0)  # the zero-leak contract, enforced at plan time
+
+    regions = tracks_to_regions(tracks, frame_w=frame_w, frame_h=frame_h)[:max_regions]
+    plan_json = plan.model_dump(mode="json")
+    digest = hashlib.sha256(_json.dumps(plan_json, sort_keys=True).encode()).hexdigest()[:8]
+    deps.log(
+        f"  [redaction] tracked plan: {len(plan.trajectories)} track(s), "
+        f"{sum(t.n_windows for t in plan.trajectories)} window(s), digest {digest}"
+    )
+    return {
+        "regions": [r.model_dump(mode="json") for r in regions],
+        "per_frame": plan_json,
+        "plan_digest": digest,
+        "source": "tracked_local_gmc_3pass",
+        "stats": {
+            "tracks": len(tracks),
+            "n_frames": n_frames,
+            "detector": getattr(backend, "_last_detector_name", "unknown"),
+        },
+    }
+
+
+def _tracked_redacted_source(
+    deps: PipelineDeps,
+    project_id: str,
+    source: Path,
+    asset_id: str,
+    out_dir: Path,
+) -> Path | None:
+    """Pass 3 — bake the per-frame plan into a redacted source (once, cached).
+
+    When the persisted plan exists (REDACT_MODE=tracked) the render DAG cuts
+    its segments from THIS file instead of the raw source, so every segment —
+    cached or fresh — inherits zero-leak redaction. Content-addressed by the
+    plan digest: a changed plan is a different file, a stale artifact never
+    gets reused.
+    """
+    with deps.sessions() as s:
+        row = s.get(PerceptionIndexRow, asset_id)
+        payload = (row.redaction_tracks_json or {}) if row else {}
+    per_frame = payload.get("per_frame")
+    if not per_frame or deps.redact_backend != "tracked":
+        return None
+    from director_os.vision_fx.redact_track import (
+        normalize_cfr,
+        render_tracked_redaction,
+    )
+    from director_os.vision_fx.trajectory import PerFrameRedaction
+
+    plan = PerFrameRedaction.model_validate(per_frame)
+    digest = payload.get("plan_digest") or "unpinned"
+    dst = out_dir / f"redacted_source_{digest}.mp4"
+    if dst.exists() and dst.stat().st_size > 0:
+        deps.log(f"  [render] baked redacted source reuse ({dst.name})")
+        return dst
+    cfr_path = normalize_cfr(source, out_dir / "source_cfr.mp4")
+    deps.log(f"  [render] baking tracked redaction source ({digest})...")
+    render_tracked_redaction(
+        cfr_path,
+        plan,
+        dst,
+        mode="gauss",
+        n_frames_expected=plan.n_frames,
+    )
+    return dst
 
 
 def stage_vision_enrichment(asset_id: str, source: Path, deps: PipelineDeps) -> None:
@@ -563,7 +690,13 @@ def stage_render(
     asset_id: str,
     deps: PipelineDeps,
 ) -> tuple[RenderReport, Path]:
-    """Compile + segment-cached render (content-addressed idempotency)."""
+    """Compile + segment-cached render (content-addressed idempotency).
+
+    REDACT_MODE=tracked + a persisted per-frame plan -> segments are cut from
+    the baked redacted source (Pass 3), so the privacy redaction is frame-
+    exact regardless of segment cache hits; the static blur regions still
+    ride the filtergraph for studio-drawn boxes.
+    """
     out_dir = deps.settings.output_dir / "pipeline" / project_id
     save_otio(timeline, out_dir / "timeline.otio")
     cache = SegmentCache(deps.settings.segments_dir)
@@ -574,9 +707,14 @@ def stage_render(
         if asset and asset.width > 0 and asset.height > 0
         else None
     )
+    baked_source: Path | None = None
+    try:
+        baked_source = _tracked_redacted_source(deps, project_id, source, asset_id, out_dir)
+    except Exception as e:  # a bake failure degrades to static regions, loudly
+        deps.log(f"  [render] tracked redaction bake failed ({e}) — using raw source")
     dag = compile_timeline(
         timeline,
-        assets={asset_id: str(source)},
+        assets={asset_id: str(baked_source or source)},
         cache=cache,
         video=deps.video,
         audio=deps.audio,
@@ -714,6 +852,9 @@ def make_deps(
     engine = make_engine(database_url)
     init_models(engine)
     resolved = settings or get_settings()
+    # REDACT_MODE env default ("tracked" | "yunet" | "modal") — explicit
+    # overrides always win; unset env keeps the hermetic CPU default
+    overrides.setdefault("redact_backend", os.getenv("REDACT_MODE", "").strip().lower() or None)
     return PipelineDeps(
         sessions=make_session_factory(engine),
         settings=resolved,
