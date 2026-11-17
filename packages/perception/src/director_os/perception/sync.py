@@ -274,9 +274,12 @@ def sync_multicam(
     if len(audio_paths) < 2:
         raise SyncError("multi-cam sync needs at least two angles")
 
-    tmp = Path(workdir) if workdir else None
-    ctx = tempfile.TemporaryDirectory() if tmp is None else None
-    work = Path(tmp) if tmp else Path(ctx.name)  # type: ignore[arg-type]
+    ctx: tempfile.TemporaryDirectory[str] | None = None
+    if workdir:
+        work = Path(workdir)
+    else:
+        ctx = tempfile.TemporaryDirectory()
+        work = Path(ctx.name)
     work.mkdir(parents=True, exist_ok=True)
     try:
         samples: dict[str, np.ndarray] = {}
