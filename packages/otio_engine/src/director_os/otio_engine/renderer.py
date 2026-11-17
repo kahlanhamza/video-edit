@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
+from director_os.audio_engine.two_bus import segment_fade_chain
 from director_os.core.ffmpeg_args import assert_audio_law, exact_slice_args
 from director_os.core.qa_probe import has_audio_stream
 from director_os.otio_engine.compiler import RenderDAG, SegmentRender
@@ -72,8 +73,17 @@ def build_segment_cmd(
 
     # ---- audio routing: raw clips carry their own audio; everything else rides a
     #      silent 48 kHz stereo bed so the stream map never goes missing.
-    silence_needed = (spec.kind == "narration") or not src_has_audio
-    if silence_needed:
+    #      2-bus mode: the audio is the pre-mixed master WAV (separate input,
+    #      sliced on the same window), not the raw source stream.
+    two_bus = bool(spec.enhanced_audio_path) and spec.kind == "raw"
+    silence_needed = (spec.kind == "narration") or (not src_has_audio and not two_bus)
+    if two_bus:
+        # video+overlay inputs, then the enhanced audio input (same window)
+        enhanced_idx = n_inputs
+        cmd += exact_slice_args(spec.source_start_s, spec.source_start_s + dur)
+        cmd += ["-i", str(spec.enhanced_audio_path)]
+        audio_input_idx = enhanced_idx
+    elif silence_needed:
         audio_input_idx = n_inputs
         cmd += [
             "-f",
@@ -95,7 +105,10 @@ def build_segment_cmd(
         cmd += ["-vf", plain_video_chain(spec)]
 
     # ---- audio path (guardrail 1: -af precedes the audio-law flags)
-    if spec.audio_filters and spec.kind == "raw":
+    if two_bus:
+        # anti-click micro-fades at the cut seams of this slice
+        cmd += ["-af", segment_fade_chain(dur)]
+    elif spec.audio_filters and spec.kind == "raw":
         cmd += ["-af", ",".join(spec.audio_filters)]
     cmd += ["-ar", str(a.sample_rate), "-ac", str(a.channels)]
     cmd += [

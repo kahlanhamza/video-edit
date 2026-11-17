@@ -5,6 +5,7 @@ description = "DirectorOS OTIO timeline engine: metadata contract, segment cache
 requires-python = ">=3.12"
 dependencies = [
     "director-os-core",
+    "director-os-audio-engine",
     "director-os-vision-fx",
     "opentimelineio>=0.16",
 ]

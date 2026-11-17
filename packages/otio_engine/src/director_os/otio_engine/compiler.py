@@ -116,7 +116,15 @@ def compile_timeline(
     audio_target_lufs: float = -16.0,
     global_blur_regions: list[BlurRegion] | None = None,
     asset_geometry: Mapping[str, tuple[int, int]] | None = None,
+    enhanced_audio: Mapping[str, str | Path] | None = None,
 ) -> RenderDAG:
+    """Compile the master track into renderable segments.
+
+    `enhanced_audio` maps asset_id -> the 2-bus master WAV produced by the
+    audio-enhance pre-pass. Raw clips authored with `audio_mode="isolate_2bus"`
+    REQUIRE their entry (fail loudly — a missing master WAV must never
+    silently downgrade a broadcast mix back to noisy raw audio).
+    """
     video = video or VideoRenderSpec()
     audio = audio or AudioRenderSpec()
     out_dir = Path(out_dir).resolve()  # absolute: concat lists + PNG paths must resolve anywhere
@@ -145,6 +153,18 @@ def compile_timeline(
                 raise TimelineCompileError(f"unknown asset_id '{meta.asset_id}' in master track")
             zoom_keyframes: list[ZoomKeyframe] = list(meta.zoom_keyframes)
             zoom = max((k.zoom_factor for k in zoom_keyframes), default=1.0)
+            enhanced_path: str | None = None
+            enhanced_digest: str | None = None
+            if meta.audio_mode == "isolate_2bus":
+                wav = (enhanced_audio or {}).get(meta.asset_id)
+                if wav is None:
+                    raise TimelineCompileError(
+                        f"asset '{meta.asset_id}' is audio_mode=isolate_2bus but no 2-bus "
+                        "master WAV was provided (run stage_audio_enhance first — refusing "
+                        "to silently render noisy raw audio)"
+                    )
+                enhanced_path = str(Path(wav).resolve())
+                enhanced_digest = _file_digest_sha256(Path(wav))[:24]
             audio_filters = (
                 [loudnorm_chain(audio.target_lufs)] if meta.audio_mode == "loudnorm_48k" else []
             )
@@ -185,6 +205,8 @@ def compile_timeline(
                 zoom_keyframes=zoom_keyframes,
                 freeze_callout=freeze,
                 spotlight_png_path=str(spotlight_png) if spotlight_png else None,
+                enhanced_audio_path=enhanced_path,
+                enhanced_audio_digest=enhanced_digest,
                 codec_profile=f"{video.codec}-{video.pix_fmt}-{video.fps}fps-{audio.sample_rate}hz",
             )
         elif isinstance(meta, NarratorClipMeta):
@@ -293,6 +315,16 @@ def _seg_t0(segments: list[SegmentRender], target: SegmentRender) -> float:
             return t
         t += s.dur_s
     return t
+
+
+def _file_digest_sha256(path: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _png_size(path: Path) -> tuple[int, int]:

@@ -206,6 +206,25 @@ class AuditReport(BaseModel):
         return [c for c in self.checks if not c.ok]
 
 
+class AudioVerification(BaseModel):
+    """Inputs for the 2-bus acoustic SNR verification (audio.isolate_2bus).
+
+    Carried by the enhance receipt: the raw 48 kHz reference (Bus-2 source),
+    the exact enhancer engine used, and the SNR/clipping gate thresholds.
+    """
+
+    raw_audio_path: str
+    enhancer_engine: str
+    enhancer_neural: bool = True
+    atten_lim_db: float | None = None
+    # None -> hermetic-env check (afftdn allowed only inside tests)
+    allow_afftdn: bool | None = None
+    min_clean_snr_db: float = 14.0
+    max_delta_noise_db: float = -8.0
+    min_snr_improvement_db: float = 6.0
+    max_peak_dbtp: float = -1.0
+
+
 def audit_technical(
     path: str | Path,
     expected_dur_s: float | None = None,
@@ -214,14 +233,16 @@ def audit_technical(
     speech_intervals: list[tuple[float, float]] | None = None,
     speech_lo_dbfs: float = -12.0,
     speech_hi_dbfs: float = -6.0,
+    audio_verification: AudioVerification | None = None,
 ) -> AuditReport:
     """Deterministic technical QA of a rendered master (the `qa` pipeline stage).
 
     Gates: playable streams present, the 48 kHz stereo audio law, black-frame
-    budget, (when a target is given) duration drift vs. the compiled DAG, and
+    budget, (when a target is given) duration drift vs. the compiled DAG,
     (when ASR speech intervals are given) speech-gated loudness — dialogue RMS
     measured ONLY on spoken spans must sit inside the -12..-6 dBFS window so
-    sirens and slams cannot skew the meter (issue #15).
+    sirens and slams cannot skew the meter (issue #15) — and (when the 2-bus
+    verification is given) quantitative SNR proof + clipping + engine law.
     """
     path = Path(path)
     checks: list[AuditCheck] = []
@@ -251,6 +272,8 @@ def audit_technical(
         law_ok = False
         law_detail = str(e)
     checks.append(AuditCheck(name="audio_law_48k_stereo", ok=law_ok, detail=law_detail))
+
+    checks.append(_stream_uniformity_check(path))
 
     checks.append(clean_out_frames_check(path))
 
@@ -296,7 +319,122 @@ def audit_technical(
         except Exception as e:
             checks.append(AuditCheck(name="speech_gated_loudness", ok=False, detail=str(e)))
 
+    if audio_verification is not None:
+        checks.extend(_audio_verification_checks(path, audio_verification, speech_intervals))
+
     return AuditReport(path=str(path), ok=all(c.ok for c in checks), checks=checks)
+
+
+def _audio_stream_infos(path: Path) -> list[dict]:
+    data = _ffprobe(path, "-show_streams")
+    return [s for s in data.get("streams", []) if s.get("codec_type") == "audio"]
+
+
+def _stream_uniformity_check(path: Path) -> AuditCheck:
+    """EVERY audio stream in the master is 48000 Hz stereo — no stragglers."""
+    try:
+        streams = _audio_stream_infos(path)
+        if not streams:
+            return AuditCheck(name="stream_uniformity", ok=False, detail="no audio streams")
+        bad = [
+            f"stream {i}: {s.get('sample_rate')}Hz/{s.get('channels')}ch"
+            for i, s in enumerate(streams)
+            if int(s.get("sample_rate") or 0) != SUPPORTED_SAMPLE_RATE
+            or int(s.get("channels") or 0) != SUPPORTED_CHANNELS
+        ]
+        ok = not bad
+        detail = (
+            f"{len(streams)} audio stream(s) all {SUPPORTED_SAMPLE_RATE} Hz stereo"
+            if ok
+            else "; ".join(bad)
+        )
+        return AuditCheck(name="stream_uniformity", ok=ok, detail=detail)
+    except Exception as e:  # noqa: BLE001
+        return AuditCheck(name="stream_uniformity", ok=False, detail=str(e))
+
+
+def _audio_verification_checks(
+    path: Path,
+    verification: AudioVerification,
+    speech_intervals: list[tuple[float, float]] | None,
+) -> list[AuditCheck]:
+    """The acoustic law for 2-bus renders: engine, SNR, clipping.
+
+    Soft-imports audio_engine exactly like the speech-gated loudness check —
+    core stays standalone-installable without the audio extras.
+    """
+    from director_os.audio_engine.enhance import engine_is_production_legal
+    from director_os.audio_engine.snr import (
+        measure_snr,
+        peak_true_dbfs,
+        snr_gate,
+    )
+
+    checks: list[AuditCheck] = []
+    engine = verification.enhancer_engine
+    legal = engine_is_production_legal(
+        engine, verification.allow_afftdn, neural=verification.enhancer_neural
+    )
+    checks.append(
+        AuditCheck(
+            name="enhancer_engine_used",
+            ok=legal,
+            detail=(
+                f"enhancer_engine={engine} neural={verification.enhancer_neural} "
+                f"atten_lim_db={verification.atten_lim_db}"
+                + (
+                    ""
+                    if legal
+                    else " — afftdn fallback is FORBIDDEN in production renders "
+                    "(install deep-filter / clearvoice, or run inside hermetic tests)"
+                )
+            ),
+        )
+    )
+
+    if speech_intervals:
+        try:
+            raw = measure_snr(verification.raw_audio_path, speech_intervals)
+            clean = measure_snr(str(path), speech_intervals)
+            delta_noise = clean["noise_floor_db"] - raw["noise_floor_db"]
+            ok, gate_detail = snr_gate(
+                raw["snr_db"],
+                clean["snr_db"],
+                delta_noise,
+                verification.min_clean_snr_db,
+                verification.max_delta_noise_db,
+                verification.min_snr_improvement_db,
+            )
+            checks.append(
+                AuditCheck(
+                    name="snr_verification",
+                    ok=ok,
+                    detail=(
+                        f"raw_snr={raw['snr_db']:.1f}dB clean_snr={clean['snr_db']:.1f}dB "
+                        f"noise_floor {raw['noise_floor_db']:.1f} -> "
+                        f"{clean['noise_floor_db']:.1f}dB (delta {delta_noise:+.1f}) | "
+                        + gate_detail
+                    ),
+                )
+            )
+        except Exception as e:  # noqa: BLE001
+            checks.append(AuditCheck(name="snr_verification", ok=False, detail=str(e)))
+
+    try:
+        peak = peak_true_dbfs(str(path))
+        checks.append(
+            AuditCheck(
+                name="zero_clipping",
+                ok=peak <= verification.max_peak_dbtp,
+                detail=(
+                    f"sample peak {peak:.2f} dBFS (gate <= {verification.max_peak_dbtp:g} dBTP, "
+                    f"limiter ceiling -1.5 dBTP)"
+                ),
+            )
+        )
+    except Exception as e:  # noqa: BLE001
+        checks.append(AuditCheck(name="zero_clipping", ok=False, detail=str(e)))
+    return checks
 
 
 def audit_layout_and_policy(

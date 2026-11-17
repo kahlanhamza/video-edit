@@ -68,6 +68,10 @@ class PipelineDeps:
     video: VideoRenderSpec = field(default_factory=VideoRenderSpec)
     audio: AudioRenderSpec = field(default_factory=AudioRenderSpec)
     max_workers: int | None = None
+    # --- audio law: "loudnorm_48k" (legacy) | "isolate_2bus" (broadcast mix)
+    audio_mode: str = "loudnorm_48k"
+    speech_enhancer: Any | None = None  # SpeechEnhancer override (tests/fakes)
+    vocals_stem_resolver: Callable[[str], Path | None] | None = None  # Demucs pre-split hook
     # --- M4 vision stack (all optional; None/False keeps the CPU-only pipeline)
     redact_backend: str | None = None  # "tracked" (3-pass, issue #14) | "yunet" | "modal"
     vision_enrich: bool = False  # frame-quality score + VLM timeline + timestamp OCR
@@ -557,12 +561,21 @@ def stage_planning(
             device = ocr.get("device") or "BODYCAM"
             card_fields["subtitle"] = f"{device} — {ocr['iso']}"
 
+    _AUDIO_MODE_BY_ENV: dict[str, Any] = {
+        "loudnorm_48k": "loudnorm_48k",
+        "isolate_2bus": "isolate_2bus",
+        "silence": "silence",
+    }
     master_items: list[ClipSpec | GapSpec] = [
         ClipSpec(
             name=f"raw_{i + 1}",
             source_start_s=i * seg_len,
             dur_s=seg_len,
-            meta=RawClipMeta(asset_id=asset_id, audio_mode="loudnorm_48k"),
+            meta=RawClipMeta(
+                asset_id=asset_id,
+                # unknown env values fall back to the legacy loudnorm law
+                audio_mode=_AUDIO_MODE_BY_ENV.get(deps.audio_mode, "loudnorm_48k"),
+            ),
         )
         for i in range(n_segments)
     ]
@@ -726,13 +739,15 @@ def stage_render(
     source: Path,
     asset_id: str,
     deps: PipelineDeps,
+    enhanced_audio: dict[str, Path] | None = None,
 ) -> tuple[RenderReport, Path]:
     """Compile + segment-cached render (content-addressed idempotency).
 
     REDACT_MODE=tracked + a persisted per-frame plan -> segments are cut from
     the baked redacted source (Pass 3), so the privacy redaction is frame-
     exact regardless of segment cache hits; the static blur regions still
-    ride the filtergraph for studio-drawn boxes.
+    ride the filtergraph for studio-drawn boxes. `enhanced_audio` feeds the
+    2-bus speech-isolation masters (audio_mode=isolate_2bus).
     """
     out_dir = deps.settings.output_dir / "pipeline" / project_id
     save_otio(timeline, out_dir / "timeline.otio")
@@ -759,6 +774,7 @@ def stage_render(
         audio_target_lufs=deps.settings.target_lufs,
         global_blur_regions=_project_redaction_regions(deps.sessions, asset_id),
         asset_geometry=geometry,
+        enhanced_audio=enhanced_audio or None,
     )
     deps.log(f"  [render] {len(dag.segments)} segment(s), {dag.total_dur_s:.1f}s master")
     report = render_dag(dag, cache, log=deps.log, max_workers=deps.max_workers)
@@ -766,9 +782,41 @@ def stage_render(
 
 
 def stage_qa(
-    final_path: Path, expected_dur_s: float, job_id: str, project_id: str, deps
+    final_path: Path,
+    expected_dur_s: float,
+    job_id: str,
+    project_id: str,
+    deps,
+    transcript: dict | None = None,
+    enhance_info: Any | None = None,
+    raw_source: Path | None = None,
 ) -> AuditReport:
-    audit = audit_technical(final_path, expected_dur_s=expected_dur_s)
+    """Deterministic QA + the 2-bus acoustic verification (SNR/clipping/engine)."""
+    audio_verification = None
+    speech_intervals = None
+    if enhance_info is not None:
+        from director_os.core.qa_probe import AudioVerification
+
+        # the -12..-6 speech window + SNR/clipping gates are the 2-BUS law —
+        # legacy loudnorm_48k renders keep their integrated-loudness law
+        speech_intervals = list(enhance_info.speech_intervals)
+        audio_verification = AudioVerification(
+            raw_audio_path=str(enhance_info.raw_reference_wav),
+            enhancer_engine=enhance_info.engine,
+            enhancer_neural=bool(enhance_info.neural),
+            atten_lim_db=enhance_info.atten_lim_db,
+        )
+    audit = audit_technical(
+        final_path,
+        expected_dur_s=expected_dur_s,
+        speech_intervals=speech_intervals,
+        audio_verification=audio_verification,
+    )
+    if enhance_info is not None:
+        # ear evidence next to the metrics: 15 s raw-vs-clean pair
+        from director_os.worker.audio_enhance import export_enhance_ab
+
+        export_enhance_ab(deps, project_id, enhance_info, video_path=raw_source)
     with deps.sessions() as s:
         if audit.ok:
             _update_job(s, job_id, JobStage.human_gate, 100.0)
@@ -829,17 +877,49 @@ def run_pipeline(
         if deps.vision_enrich:
             stage_vision_enrichment(asset_id, source, deps)
 
+        # 2-bus speech isolation runs BEFORE planning so the compiled clips
+        # (audio_mode=isolate_2bus) always find their master WAV at render time
+        enhance_info = None
+        if deps.audio_mode == "isolate_2bus":
+            _update_job(deps.sessions(), job_id, JobStage.audio_prep, 38.0)
+            from director_os.worker.audio_enhance import stage_audio_enhance
+
+            enhance_info = stage_audio_enhance(
+                asset_id,
+                source,
+                transcript,
+                project_id,
+                deps,
+                enhancer=deps.speech_enhancer,
+            )
+
         _update_job(deps.sessions(), job_id, JobStage.planning, 45.0)
         timeline, version = stage_planning(asset_id, transcript, project_id, deps)
 
         _update_job(deps.sessions(), job_id, JobStage.render, 60.0)
-        report, otio_path = stage_render(timeline, project_id, source, asset_id, deps)
+        report, otio_path = stage_render(
+            timeline,
+            project_id,
+            source,
+            asset_id,
+            deps,
+            enhanced_audio=enhance_info.enhanced_audio_map() if enhance_info else None,
+        )
 
         _update_job(deps.sessions(), job_id, JobStage.subtitles, 85.0)
         stage_subtitles(timeline, transcript, project_id, deps)
 
         _update_job(deps.sessions(), job_id, JobStage.qa, 90.0)
-        audit = stage_qa(report.final_path, dag_total_dur(timeline), job_id, project_id, deps)
+        audit = stage_qa(
+            report.final_path,
+            dag_total_dur(timeline),
+            job_id,
+            project_id,
+            deps,
+            transcript=transcript,
+            enhance_info=enhance_info,
+            raw_source=source,
+        )
         if not audit.ok:
             raise PipelineError(f"QA failed: {[c.detail for c in audit.failures]}")
     except Exception as e:
@@ -892,6 +972,11 @@ def make_deps(
     # REDACT_MODE env default ("tracked" | "yunet" | "modal") — explicit
     # overrides always win; unset env keeps the hermetic CPU default
     overrides.setdefault("redact_backend", os.getenv("REDACT_MODE", "").strip().lower() or None)
+    # AUDIO_MODE env default ("loudnorm_48k" | "isolate_2bus") — production
+    # bodycam runs set AUDIO_MODE=isolate_2bus + AUDIO_ENHANCER=deepfilter
+    overrides.setdefault(
+        "audio_mode", os.getenv("AUDIO_MODE", "").strip().lower() or "loudnorm_48k"
+    )
     return PipelineDeps(
         sessions=make_session_factory(engine),
         settings=resolved,

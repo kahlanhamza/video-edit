@@ -78,12 +78,22 @@ class SegmentRenderSpec(BaseModel):
     cards: list[CardOverlaySpec] = Field(default_factory=list)
     narration_text: str = ""
     codec_profile: str = ""
+    # --- 2-bus speech isolation (audio_mode=isolate_2bus): the segment's audio
+    # rides this pre-mixed master WAV instead of the raw source stream. The
+    # PATH is machine-local (excluded from the hash); the CONTENT digest is
+    # part of the cache key, so a re-enhance re-renders exactly these segments.
+    enhanced_audio_path: str | None = None
+    enhanced_audio_digest: str | None = None
 
 
 def segment_hash(spec: SegmentRenderSpec) -> str:
     payload = spec.model_dump(
         mode="json",
-        exclude={"cards": {"__all__": {"png_path"}}, "spotlight_png_path": True},
+        exclude={
+            "cards": {"__all__": {"png_path"}},
+            "spotlight_png_path": True,
+            "enhanced_audio_path": True,  # machine-local path; content digest rides in the key
+        },
     )
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     h = hashlib.sha256(("dos-seg-v1|" + canonical).encode()).hexdigest()
@@ -94,6 +104,9 @@ def segment_hash(spec: SegmentRenderSpec) -> str:
     if spec.spotlight_png_path:
         digest = _file_digest(spec.spotlight_png_path)
         h = hashlib.sha256((h + "|" + digest).encode()).hexdigest()
+    if spec.enhanced_audio_path:
+        digest = spec.enhanced_audio_digest or _file_digest(spec.enhanced_audio_path)
+        h = hashlib.sha256(("enh|" + h + "|" + digest).encode()).hexdigest()
     return h[:40]
 
 

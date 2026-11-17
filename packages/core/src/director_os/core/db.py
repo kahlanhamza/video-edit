@@ -56,6 +56,7 @@ class MediaAssetRow(Base):
     r2_raw_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     r2_proxy_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     r2_audio_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    r2_enhanced_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     duration_s: Mapped[float] = mapped_column(Float)
     fps: Mapped[float] = mapped_column(Float)
     width: Mapped[int] = mapped_column(Integer)

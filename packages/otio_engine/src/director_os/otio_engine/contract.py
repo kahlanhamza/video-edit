@@ -2,7 +2,8 @@
 
 Every `otio.schema.Clip` carries structured `metadata["director_os"]`:
 
-- raw_bwc clips:  {"kind": "raw", "audio_mode": "loudnorm_48k", "trim_silence": true,
+- raw_bwc clips:  {"kind": "raw", "audio_mode": "loudnorm_48k" | "isolate_2bus" | "silence",
+                   "trim_silence": true,
                    "zoom_keyframes": [...], "blur_regions": [...], "angle_id": "bwc_1",
                    "freeze_callout": {"freeze_at_s": ..., "hold_s": ..., "dim_alpha": ...,
                                       "spotlight_bbox": {...} | null} | null}
@@ -53,7 +54,9 @@ class FreezeCallout(BaseModel):
 class RawClipMeta(BaseModel):
     kind: Literal["raw"] = "raw"
     asset_id: str
-    audio_mode: Literal["loudnorm_48k", "silence"] = "loudnorm_48k"
+    # isolate_2bus: broadcast speech-isolation mix (neural enhancer + gate);
+    # the compiled master WAV must exist in `compile_timeline(enhanced_audio=)`
+    audio_mode: Literal["loudnorm_48k", "isolate_2bus", "silence"] = "loudnorm_48k"
     trim_silence: bool = True
     zoom_keyframes: list[ZoomKeyframe] = Field(default_factory=list)
     blur_regions: list[BlurRegion] = Field(default_factory=list)

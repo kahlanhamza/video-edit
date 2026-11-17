@@ -1,8 +1,18 @@
 FROM python:3.12-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends ffmpeg curl \
     && rm -rf /var/lib/apt/lists/*
+
+# deep-filter (DeepFilterNet3) — the Bus-1 neural speech extractor for the
+# 2-Bus Speech Isolation law. The release binary is static-pie (musl) with the
+# model EMBEDDED, so a plain copy is the whole install: no runtime downloads.
+ARG DEEPFILTER_VERSION=0.5.6
+RUN curl -fsSL \
+      "https://github.com/Rikorose/DeepFilterNet/releases/download/v${DEEPFILTER_VERSION}/deep-filter-${DEEPFILTER_VERSION}-x86_64-unknown-linux-musl" \
+      -o /usr/local/bin/deep-filter \
+    && chmod +x /usr/local/bin/deep-filter \
+    && deep-filter --version
 
 RUN pip install --no-cache-dir uv
 
