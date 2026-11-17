@@ -34,6 +34,7 @@ from director_os.core.db import (
     make_session_factory,
     new_id,
 )
+from director_os.core.http import download
 from director_os.core.models import ProjectStatus
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -789,3 +790,87 @@ def delete_redaction(project_id: str, region_id: str) -> Response:
     finally:
         s.close()
     return Response(status_code=204)
+
+
+# ------------------------------------------------------------------ ingest by URL (M3)
+class IngestRequest(BaseModel):
+    """M3 done-when: paste a media URL in the browser — no terminal needed.
+
+    `custom_headers` ride on top of the mandatory DirectorOS identity headers
+    (cookies / referer for FOIA portals that gate downloads)."""
+
+    url: str
+    custom_headers: dict[str, str] = Field(default_factory=dict)
+
+
+class IngestResponse(BaseModel):
+    job_id: str
+    source_path: str
+    enqueued: bool
+    detail: str
+
+
+def _source_filename(url: str) -> str:
+    """Deterministic, filesystem-safe name for a downloaded media URL."""
+    from urllib.parse import urlparse
+
+    path = urlparse(url).path
+    base = Path(path).name.strip()
+    if not base:
+        base = "media.mp4"
+    safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in base)
+    if not safe.lower().endswith((".mp4", ".mov", ".mkv", ".webm", ".avi", ".mp3", ".wav")):
+        safe += ".mp4"
+    return safe
+
+
+@app.post("/projects/{project_id}/ingest", response_model=IngestResponse, status_code=202)
+def ingest_url(project_id: str, body: IngestRequest) -> IngestResponse:
+    """Paste-a-URL ingest: download server-side (kill-safe .part rename),
+    register a queued pipeline job, hand it to the worker fleet.
+
+    The browser watches the returned `job_id` over SSE; the worker advances
+    ingest -> perception -> render (crash-safe stages)."""
+    s = session()
+    try:
+        if s.get(ProjectRow, project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+    finally:
+        s.close()
+    if not body.url.lower().startswith(("http://", "https://")):
+        raise HTTPException(status_code=422, detail="url must be http(s)")
+
+    dest_dir = get_settings().output_dir / "pipeline" / project_id / "sources"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / _source_filename(body.url)
+    try:
+        source = download(body.url, dest, extra_headers=body.custom_headers or None)
+    except Exception as e:  # httpx errors, bad status codes, disk failures
+        raise HTTPException(status_code=502, detail=f"media download failed: {e}") from e
+
+    s = session()
+    try:
+        job = JobRow(project_id=project_id, current_stage="ingest", progress_pct=0.0)
+        s.add(job)
+        s.commit()
+        job_id = job.id
+    finally:
+        s.close()
+
+    enqueued, detail = False, "job queued — worker fleet will advance it"
+    try:
+        from director_os.worker.celery_app import celery_app
+
+        celery_app.send_task(
+            "directoros.advance_job",
+            args=[job_id, project_id, str(source), get_settings().database_url],
+            retry=False,
+        )
+        enqueued = True
+        detail = "queued on the worker fleet"
+    except Exception as e:  # broker down / worker package absent: stays queued
+        detail = (
+            f"job queued — fleet enqueue failed ({type(e).__name__}); "
+            "start the worker fleet to advance"
+        )
+    return IngestResponse(job_id=job_id, source_path=str(source), enqueued=enqueued, detail=detail)

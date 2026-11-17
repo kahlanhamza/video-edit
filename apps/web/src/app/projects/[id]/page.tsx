@@ -47,6 +47,9 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     base_description: "Rendered by DirectorOS — private review draft.",
   });
   const [publishResult, setPublishResult] = useState<string | null>(null);
+  const [ingestUrl, setIngestUrl] = useState("");
+  const [ingestBusy, setIngestBusy] = useState(false);
+  const [ingestStatus, setIngestStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const esRef = useRef<EventSource | null>(null);
 
@@ -91,6 +94,24 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     esRef.current = es;
     return () => es.close();
   }, [id, jobs, refresh]);
+
+  async function doIngest() {
+    if (!ingestUrl.trim()) return;
+    setIngestBusy(true);
+    setIngestStatus(null);
+    try {
+      const r = await api.ingestUrl(id!, ingestUrl.trim());
+      setIngestStatus(
+        `${r.detail} — job ${r.job_id.slice(0, 8)}… watching progress below`,
+      );
+      setIngestUrl("");
+      await refresh();
+    } catch (e) {
+      setIngestStatus(`failed: ${e instanceof Error ? e.message : e}`);
+    } finally {
+      setIngestBusy(false);
+    }
+  }
 
   async function dispatch(tool: string, args: Record<string, unknown>) {
     try {
@@ -154,6 +175,28 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
             </code>
           </p>
         )}
+      </section>
+
+      <section className="card">
+        <h2 className="font-semibold">Paste media URL</h2>
+        <p className="mt-1 text-xs text-slate-500">
+          FOIA portal / CDN link — the gateway downloads it (UA-aware), registers
+          a queued job and the fleet advances ingest → perception → render. No
+          terminal involved.
+        </p>
+        <div className="mt-3 flex gap-2">
+          <input
+            className="input"
+            placeholder="https://portal.example/case/bodycam.mp4"
+            value={ingestUrl}
+            onChange={(e) => setIngestUrl(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && doIngest()}
+          />
+          <button className="btn" onClick={doIngest} disabled={ingestBusy || !ingestUrl.trim()}>
+            {ingestBusy ? "Ingesting…" : "Ingest"}
+          </button>
+        </div>
+        {ingestStatus && <p className="mt-2 text-sm text-slate-300">{ingestStatus}</p>}
       </section>
 
       <section className="card">

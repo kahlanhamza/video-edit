@@ -88,6 +88,14 @@ export const api = {
       body: JSON.stringify({ title, niche_skill: nicheSkill }),
     }),
   getProject: (id: string) => req<Project>(`/projects/${id}`),
+  ingestUrl: (id: string, url: string, customHeaders?: Record<string, string>) =>
+    req<{ job_id: string; source_path: string; enqueued: boolean; detail: string }>(
+      `/projects/${id}/ingest`,
+      {
+        method: "POST",
+        body: JSON.stringify({ url, custom_headers: customHeaders ?? {} }),
+      },
+    ),
   listJobs: (id: string) => req<Job[]>(`/projects/${id}/jobs`),
   timelineState: (id: string) => req<TimelineState>(`/projects/${id}/timeline`),
   dispatchTool: (
