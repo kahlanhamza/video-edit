@@ -133,7 +133,8 @@ class SegmentCache:
         return dest
 
     def count(self) -> int:
-        return sum(1 for _ in self.root.glob("*.mp4"))
+        # only admitted chunks — a killed worker's .tmp.mp4 corpse is NOT an entry
+        return sum(1 for p in self.root.glob("*.mp4") if not p.name.endswith(".tmp.mp4"))
 
 
 def _validate_chunk(path: Path, expect_dur_s: float | None) -> None:

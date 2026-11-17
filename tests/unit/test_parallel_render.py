@@ -191,3 +191,41 @@ def subprocess_ffmpeg(out: Path, dur: float) -> None:
         check=True,
         capture_output=True,
     )
+
+
+# ------------------------------------------------------------------ M5 drill
+def test_drill_kill_mid_encode_resumes_from_cache(fixture_video: Path, tmp_path):
+    """M5 crash-recovery drill (issue #13): kill a worker mid-encode, resume.
+
+    Deterministic simulation of the drill: segment A admitted to the cache
+    legitimately, the worker dies leaving a half-written B.tmp.mp4, segment C
+    never started. The resume run must (1) hit A from cache, (2) re-encode B
+    OVER the partial tmp — a partial tmp must never poison admission, (3)
+    render C, (4) concat all three into a QA-clean final of the right length.
+    """
+    cache, dag = compile_tree(tmp_path / "drill", fixture_video)
+    keys = [s.key for s in dag.segments]
+    assert len(keys) == 3
+
+    # -- the crash: A done, B half-encoded, C untouched
+    from director_os.otio_engine.renderer import render_one
+
+    render_one(dag.segments[0], cache)
+    garbage_tmp = cache.root / f"{keys[1]}.tmp.mp4"
+    garbage_tmp.write_bytes(b"\x00" * 100_000)  # half-written encode corpse
+    assert cache.count() == 1
+    assert garbage_tmp.exists()
+
+    # -- the resume
+    report = render_dag(dag, cache, log=lambda *_: None, max_workers=1)
+    assert report.cached == 1  # A skipped
+    assert report.rendered == 2  # B + C re-encoded
+    assert cache.count() == 3
+    assert not garbage_tmp.exists()  # partial tmp replaced by the real encode
+
+    # -- the final is whole: every chunk in DAG order, correct total duration
+    from director_os.core.qa_probe import probe
+
+    info = probe(dag.final_path)
+    assert abs(info.duration_s - 9.0) <= 0.5
+    assert info.has_video
