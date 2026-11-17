@@ -16,6 +16,11 @@ RUN curl -fsSL \
 
 RUN pip install --no-cache-dir uv
 
+# PaddleOCR — the LOCAL $0 overlay-OCR lane (perception.timestamp_ocr backend
+# "paddle", issue #12). Optional by the cost law: the pipeline falls back to
+# the keyed Gemini lane when absent. Uncomment to bake the CPU engine in:
+# RUN uv pip install --no-cache-dir paddleocr==2.7.3
+
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
 COPY packages ./packages

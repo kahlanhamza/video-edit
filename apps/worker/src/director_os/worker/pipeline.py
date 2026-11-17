@@ -461,54 +461,70 @@ def stage_vision_enrichment(asset_id: str, source: Path, deps: PipelineDeps) -> 
         except Exception as e:  # noqa: BLE001
             deps.log(f"  [vision] audio events skipped: {e}")
 
-    if deps.settings.vision_api_key:
-        if "visual_timeline" not in shots:
-            try:
-                from director_os.perception.vision_index import (
-                    build_contact_sheets,
-                    index_timeline,
-                    make_vision_clients,
-                )
+    if deps.settings.vision_api_key and "visual_timeline" not in shots:
+        try:
+            from director_os.perception.vision_index import (
+                build_contact_sheets,
+                index_timeline,
+                make_vision_clients,
+            )
 
-                sheets_dir = deps.settings.output_dir / "pipeline" / asset_id / "sheets"
-                sheets = build_contact_sheets(str(source), sheets_dir, window_s=30.0)
-                index_adapter, _ = make_vision_clients(deps.settings.vision_api_key)
-                insights = index_timeline(index_adapter, sheets, window_s=30.0)
-                shots["visual_timeline"] = {
-                    "model": index_adapter._client.model  # type: ignore[attr-defined]
-                    if hasattr(index_adapter._client, "model")
-                    else "fake",
-                    "sheets": len(sheets),
-                    "insights": [i.model_dump(mode="json") for i in insights],
-                }
-                deps.log(
-                    f"  [vision] timeline indexed: {len(sheets)} sheet(s) -> "
-                    f"{len(insights)} insight(s)"
-                )
-            except Exception as e:  # noqa: BLE001
-                deps.log(f"  [vision] contact-sheet indexing skipped: {e}")
+            sheets_dir = deps.settings.output_dir / "pipeline" / asset_id / "sheets"
+            sheets = build_contact_sheets(str(source), sheets_dir, window_s=30.0)
+            index_adapter, _ = make_vision_clients(deps.settings.vision_api_key)
+            insights = index_timeline(index_adapter, sheets, window_s=30.0)
+            shots["visual_timeline"] = {
+                "model": index_adapter._client.model  # type: ignore[attr-defined]
+                if hasattr(index_adapter._client, "model")
+                else "fake",
+                "sheets": len(sheets),
+                "insights": [i.model_dump(mode="json") for i in insights],
+            }
+            deps.log(
+                f"  [vision] timeline indexed: {len(sheets)} sheet(s) -> {len(insights)} insight(s)"
+            )
+        except Exception as e:  # noqa: BLE001
+            deps.log(f"  [vision] contact-sheet indexing skipped: {e}")
 
-        if "timestamp_ocr" not in red:
-            try:
-                from director_os.perception.timestamp_ocr import read_bodycam_timestamp
+    # Overlay OCR runs on EVERY asset: the LOCAL free PaddleOCR lane first
+    # (cost law — CPU, $0, no key), Gemini only as the fallback when paddleocr
+    # is not installed and the vision key exists. No stamp is a legit answer.
+    if "timestamp_ocr" not in red:
+        try:
+            from director_os.perception.timestamp_ocr import (
+                paddleocr_available,
+                read_bodycam_timestamp,
+            )
+
+            client = None
+            backend = "auto"
+            if paddleocr_available():
+                backend = "paddle"
+            elif deps.settings.vision_api_key:
                 from director_os.perception.vision import GeminiVisionClient
 
                 client = GeminiVisionClient(deps.settings.vision_api_key)
-                stamp = read_bodycam_timestamp(str(source), backend="gemini", client=client)
-                if stamp is not None:
-                    red["timestamp_ocr"] = {
-                        "raw_text": stamp.raw_text,
-                        "iso": stamp.iso,
-                        "device": stamp.device,
-                        "tz": stamp.tz,
-                        "confidence": stamp.confidence,
-                    }
-                    deps.log(f"  [vision] overlay OCR: {stamp.iso} ({stamp.device})")
-                else:
-                    red["timestamp_ocr"] = {"found": False}
-                    deps.log("  [vision] overlay OCR: no timestamp found")
-            except Exception as e:  # noqa: BLE001
-                deps.log(f"  [vision] timestamp OCR skipped: {e}")
+                backend = "gemini"
+            stamp = read_bodycam_timestamp(str(source), backend=backend, client=client)
+            if stamp is not None:
+                red["timestamp_ocr"] = {
+                    "engine": backend,
+                    "raw_text": stamp.raw_text,
+                    "iso": stamp.iso,
+                    "device": stamp.device,
+                    "tz": stamp.tz,
+                    "location_text": stamp.location_text,
+                    "confidence": stamp.confidence,
+                }
+                location = f" @ {stamp.location_text}" if stamp.location_text else ""
+                deps.log(
+                    f"  [vision] overlay OCR ({backend}): {stamp.iso} ({stamp.device}){location}"
+                )
+            else:
+                red["timestamp_ocr"] = {"found": False, "engine": backend}
+                deps.log(f"  [vision] overlay OCR ({backend}): no timestamp found")
+        except Exception as e:  # noqa: BLE001
+            deps.log(f"  [vision] timestamp OCR skipped: {e}")
 
     with deps.sessions() as s:
         row = s.get(PerceptionIndexRow, asset_id)
@@ -551,15 +567,19 @@ def stage_planning(
     seg_len = dur / n_segments
 
     # M4: the AXON overlay OCR populates the intro card when the vision stack
-    # read one (e.g. "AXON BODY 3 — 2022-07-04T18:11:55-04:00"); otherwise the
-    # deterministic v1 subtitle stays.
+    # read one (e.g. "AXON BODY 3 — 2022-07-04T18:11:55-04:00"); a street-sign
+    # read rides along for the location line; otherwise the deterministic v1
+    # subtitle stays.
     card_fields = {"title": "CASE FILE", "subtitle": "DirectorOS auto-cut v1"}
     with deps.sessions() as s:
         prow = s.get(PerceptionIndexRow, asset_id)
         ocr = (prow.redaction_tracks_json or {}).get("timestamp_ocr") if prow else None
         if ocr and ocr.get("iso"):
             device = ocr.get("device") or "BODYCAM"
-            card_fields["subtitle"] = f"{device} — {ocr['iso']}"
+            subtitle = f"{device} — {ocr['iso']}"
+            if ocr.get("location_text"):
+                subtitle += f" — {ocr['location_text']}"
+            card_fields["subtitle"] = subtitle
 
     _AUDIO_MODE_BY_ENV: dict[str, Any] = {
         "loudnorm_48k": "loudnorm_48k",

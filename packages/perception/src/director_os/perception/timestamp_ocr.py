@@ -2,15 +2,19 @@
 
 Job 4 of the vision stack: read `2022-07-04 18:11:55 -0400 / AXON BODY 3` off
 the corner of the footage so the Intro Location/Time Card populates itself with
-zero manual typing. Two interchangeable backends:
+zero manual typing — plus street signs / route shields for the location card.
+Three interchangeable backends (cost law: local-free first):
 
+- "paddle"  — PaddleOCR on CPU, LOCAL and $0 (lazy import; used when the
+              `paddleocr` package is installed — never a default-path dep)
 - "gemini"  — one cheap single-frame call through the existing GeminiVisionClient
               (works the moment VISION_API_KEY exists)
 - "modal"   — PaddleOCR on the serverless GPU fleet (`deploy/modal/redact_gpu.py`,
-              function `ocr_frame`)
+              function `ocr_frame`) — dormant until Modal is activated
 
-Both funnel into the same pure `parse_timestamp_text`, which is hermetic and
-pinned by tests; the pipeline never branches on the provider.
+All backends funnel into the same pure `parse_timestamp_text` /
+`parse_overlay_lines`, which are hermetic and pinned by tests; the pipeline
+never branches on the provider beyond the availability probe.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 class TimestampOcrError(RuntimeError):
@@ -27,12 +32,13 @@ class TimestampOcrError(RuntimeError):
 
 @dataclass(frozen=True)
 class BodycamStamp:
-    """Parsed overlay: media-wallclock time + device badge."""
+    """Parsed overlay: media-wallclock time + device badge + location hint."""
 
     raw_text: str
     iso: str | None = None  # e.g. 2022-07-04T18:11:55-04:00
     device: str | None = None  # e.g. AXON BODY 3
     tz: str | None = None  # e.g. -04:00 / EST
+    location_text: str | None = None  # e.g. "N OAK ST" / "US-192 W" / "MILE MARKER 205"
     confidence: float = 0.0
 
 
@@ -41,6 +47,18 @@ _TZ_RE = re.compile(r"([+-])(\d{2}):?(\d{2})\b|\b([A-Z]{2,5})\b(?=\s*/|\s*$)")
 _DEVICE_RE = re.compile(
     r"\b(AXON\s+BODY\s*\d|AXON\s+CAPTURE|AXON\s+FLEX|VW\s+ICON)\b", re.IGNORECASE
 )
+
+# Street-sign / route / mile-marker grammar (conservative: only lines that are
+# unmistakably location-ish become card facts — OCR noise must not ship).
+_STREET_RE = re.compile(
+    r"\b\d{1,5}\s+(?:[NSEW]\s+)?(?:[A-Z][A-Z'.]+\s+){0,3}"
+    r"(?:ST|STREET|AVE|AVENUE|BLVD|BOULEVARD|RD|ROAD|DR|DRIVE|HWY|HIGHWAY|"
+    r"LN|LANE|CT|COURT|WAY|PKWY|PARKWAY|PL|PLACE|TER|TERRACE|CIR|CIRCLE|TRL|TRAIL)\b\.?",
+)
+_ROUTE_RE = re.compile(
+    r"\b(?:US|SR|CR|FM|I|IH|RT|STATE\s+ROUTE)[- ]?\d{1,3}\s*[NSEW]?\b", re.IGNORECASE
+)
+_MARKER_RE = re.compile(r"\bMILE\s*(?:POST|MARKER)?\s*\d{1,4}\b", re.IGNORECASE)
 
 
 def parse_timestamp_text(text: str, confidence: float = 0.9) -> BodycamStamp | None:
@@ -72,8 +90,69 @@ def parse_timestamp_text(text: str, confidence: float = 0.9) -> BodycamStamp | N
         iso=iso,
         device=device,
         tz=tz,
+        location_text=_location_from_lines([text]),
         confidence=confidence,
     )
+
+
+def _location_from_lines(lines: list[str]) -> str | None:
+    """First unmistakable location line: street address > route shield > marker."""
+    for line in lines:
+        m = _STREET_RE.search(line)
+        if m:
+            return re.sub(r"\s+", " ", m.group(0)).strip(". ").upper()
+    for line in lines:
+        m = _ROUTE_RE.search(line)
+        if m:
+            return re.sub(r"\s+", " ", m.group(0)).strip(". ").upper()
+    for line in lines:
+        m = _MARKER_RE.search(line)
+        if m:
+            return re.sub(r"\s+", " ", m.group(0)).strip(". ").upper()
+    return None
+
+
+def parse_overlay_lines(
+    lines: list[str], confidences: list[float] | None = None
+) -> BodycamStamp | None:
+    """Parse a set of OCR text lines (one overlay frame) into a stamp.
+
+    The timestamp may live on one line and the device badge / street sign on
+    others (PaddleOCR returns reading-order blocks). The stamp carries the
+    highest-confidence date-bearing line; location rides from ALL lines.
+    """
+    if not lines:
+        return None
+    best: BodycamStamp | None = None
+    for i, line in enumerate(lines):
+        conf = 0.9
+        if confidences and i < len(confidences):
+            conf = float(confidences[i])
+        stamp = parse_timestamp_text(line, confidence=conf)
+        if stamp is not None and (best is None or stamp.confidence > best.confidence):
+            best = stamp
+    if best is None:
+        return None
+    patched: dict = {}
+    if best.device is None:
+        for line in lines:  # the badge often sits on its own line
+            dev = _DEVICE_RE.search(line)
+            if dev:
+                patched["device"] = re.sub(r"\s+", " ", dev.group(1)).upper()
+                break
+    location = _location_from_lines(lines)
+    if location and not best.location_text:
+        patched["location_text"] = location
+    if patched:
+        best = BodycamStamp(
+            raw_text=best.raw_text,
+            iso=best.iso,
+            device=patched.get("device", best.device),
+            tz=best.tz,
+            location_text=patched.get("location_text", best.location_text),
+            confidence=best.confidence,
+        )
+    return best
 
 
 def extract_frame(video_path: str, t_s: float = 0.5, out_png: str | Path | None = None) -> Path:
@@ -98,6 +177,61 @@ def extract_frame(video_path: str, t_s: float = 0.5, out_png: str | Path | None 
     if r.returncode != 0 or not out.exists():
         raise TimestampOcrError(f"frame extract failed: {r.stderr[-300:]}")
     return out
+
+
+# --------------------------------------------------------------- paddle (local)
+_PADDLE_ENGINE: Any = None  # one CPU engine per process (init is heavy)
+
+
+def paddleocr_available() -> bool:
+    """True when the `paddleocr` package is importable (lazy — never a default dep)."""
+    try:
+        import paddleocr  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def _paddle_lines_fn(frame_png: str | Path) -> list[str]:
+    """Run the LOCAL PaddleOCR engine on CPU; returns reading-order text lines.
+
+    The engine is cached per process (model init costs seconds). Raises
+    TimestampOcrError when paddleocr is absent so callers fall to the next
+    backend loudly, never silently.
+    """
+    global _PADDLE_ENGINE
+    try:
+        from paddleocr import PaddleOCR
+    except ImportError as e:
+        raise TimestampOcrError("paddleocr not installed (pip install paddleocr)") from e
+    if _PADDLE_ENGINE is None:
+        _PADDLE_ENGINE = PaddleOCR(lang="en", use_angle_cls=True, show_log=False)
+    result = _PADDLE_ENGINE.ocr(str(frame_png), cls=True)  # type: ignore[union-attr]
+    lines: list[str] = []
+    # paddleocr returns [[box, (text, conf)], ...] per image (list-of-lists
+    # changed across versions — handle both the single-image and wrapped form)
+    page = result[0] if result and isinstance(result[0], list) else result
+    for item in page or []:
+        try:
+            text, _conf = item[1]
+        except (IndexError, TypeError, ValueError):
+            continue
+        if text:
+            lines.append(str(text))
+    return lines
+
+
+def read_timestamp_paddle(
+    frame_png: str | Path,
+    lines_fn=None,
+    t_s: float = 0.5,
+) -> BodycamStamp | None:
+    """Backend 0 (LOCAL, $0): PaddleOCR on CPU. `lines_fn` is the port seam —
+    tests inject a fake line provider; production uses `_paddle_lines_fn`
+    (late-bound so monkeypatching the module attr works)."""
+    lines = (lines_fn or _paddle_lines_fn)(frame_png)
+    return parse_overlay_lines(lines)
 
 
 def read_timestamp_gemini(frame_png: str | Path, client, t_s: float = 0.5) -> BodycamStamp | None:
@@ -142,12 +276,16 @@ def read_bodycam_timestamp(
     ocr_fn=None,
     t_s: float = 0.5,
 ) -> BodycamStamp | None:
-    """Front door: 'auto' prefers the deployed PaddleOCR fleet, falls back to Gemini.
+    """Front door: 'auto' prefers the LOCAL free PaddleOCR lane, then the
+    deployed Modal fleet, then Gemini.
 
-    Raises TimestampOcrError only when NO backend is usable (no client, no fleet);
-    a backend that simply finds no stamp returns None — that is a legitimate
-    answer for footage without an overlay.
+    Raises TimestampOcrError only when NO backend is usable (no package, no
+    fleet, no key); a backend that simply finds no stamp returns None — that is
+    a legitimate answer for footage without an overlay.
     """
+    if backend == "paddle" or (backend == "auto" and paddleocr_available()):
+        frame = extract_frame(video_path, t_s=t_s)
+        return read_timestamp_paddle(frame, t_s=t_s)
     if backend == "modal" or (backend == "auto" and ocr_fn is not None):
         if ocr_fn is None:
             raise TimestampOcrError("backend 'modal' requested but no OCR function provided")
