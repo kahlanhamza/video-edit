@@ -706,12 +706,16 @@ source = { editable = "packages/audio_engine" }
 dependencies = [
     { name = "director-os-core" },
     { name = "edge-tts" },
+    { name = "numpy" },
+    { name = "onnxruntime" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "director-os-core", editable = "packages/core" },
     { name = "edge-tts", specifier = ">=6.1" },
+    { name = "numpy", specifier = ">=1.26" },
+    { name = "onnxruntime", specifier = ">=1.18" },
 ]
 
 [[package]]
@@ -757,6 +761,7 @@ name = "director-os-otio-engine"
 version = "0.1.0"
 source = { editable = "packages/otio_engine" }
 dependencies = [
+    { name = "director-os-audio-engine" },
     { name = "director-os-core" },
     { name = "director-os-vision-fx" },
     { name = "opentimelineio" },
@@ -764,6 +769,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "director-os-audio-engine", editable = "packages/audio_engine" },
     { name = "director-os-core", editable = "packages/core" },
     { name = "director-os-vision-fx", editable = "packages/vision_fx" },
     { name = "opentimelineio", specifier = ">=0.16" },

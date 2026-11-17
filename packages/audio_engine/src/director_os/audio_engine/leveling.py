@@ -31,8 +31,39 @@ class LevelingError(RuntimeError):
     pass
 
 
-def decode_pcm_mono(path: str | Path, sr: int = 48000) -> np.ndarray:
-    """One ffmpeg PCM decode -> float32 mono at `sr` (exact sample math)."""
+def decode_pcm_channels(path: str | Path, sr: int = 48000) -> tuple[np.ndarray, int]:
+    """One ffmpeg PCM decode -> interleaved float32 at `sr`, NATIVE channels.
+
+    No `-ac 1`: ffmpeg's automatic stereo->mono downmix uses a 1/sqrt(2) law,
+    which BOOSTS identical-channel material by +3.01 dB and would poison every
+    dBFS measurement built on top. Callers downmix explicitly:
+    - `decode_pcm_mono` averages channels (amplitude-preserving), so RMS/gain
+      math sees the true signal level;
+    - `snr.peak_true_dbfs` takes the max over channels (true stream peak).
+    """
+    import json as _json
+
+    r_info = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "quiet",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=channels",
+            "-of",
+            "json",
+            str(path),
+        ],
+        capture_output=True,
+    )
+    channels = 1
+    try:
+        payload = _json.loads(r_info.stdout or "{}")
+        channels = int(payload["streams"][0].get("channels") or 1)
+    except (ValueError, KeyError, IndexError):
+        channels = 1
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -44,8 +75,6 @@ def decode_pcm_mono(path: str | Path, sr: int = 48000) -> np.ndarray:
         "0:a:0",
         "-f",
         "f32le",
-        "-ac",
-        "1",
         "-ar",
         str(sr),
         "pipe:1",
@@ -53,7 +82,15 @@ def decode_pcm_mono(path: str | Path, sr: int = 48000) -> np.ndarray:
     r = subprocess.run(cmd, capture_output=True)
     if r.returncode != 0:
         raise LevelingError(f"pcm decode failed: {r.stderr[-300:].decode(errors='replace')}")
-    return np.frombuffer(r.stdout, dtype=np.float32).copy()
+    return np.frombuffer(r.stdout, dtype=np.float32).copy(), channels
+
+
+def decode_pcm_mono(path: str | Path, sr: int = 48000) -> np.ndarray:
+    """float32 MONO at `sr` — channels AVERAGED (no downmix gain inflation)."""
+    pcm, ch = decode_pcm_channels(path, sr)
+    if ch <= 1:
+        return pcm
+    return pcm.reshape(-1, ch).mean(axis=1).astype(np.float32)
 
 
 def rms_dbfs(samples: np.ndarray) -> float:
@@ -131,10 +168,12 @@ def speech_gated_chain(gain_db: float, limit_linear: float = LIMITER_LINEAR) -> 
 
     `alimiter` runs AFTER the gain so the boosted dialogue can never poke
     through the ceiling — the limiter is the guarantee, not an afterthought.
+    `level=disabled` is mandatory: alimiter's auto-level would normalize the
+    output back UP to 0 dBFS, silently destroying the calibrated ceiling.
     """
     return (
         f"volume={gain_db:+g}dB,"
-        f"alimiter=level_in=1:level_out=1:limit={limit_linear:g}:attack=5:release=50"
+        f"alimiter=level_in=1:level_out=1:level=disabled:limit={limit_linear:g}:attack=5:release=50"
     )
 
 
