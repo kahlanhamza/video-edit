@@ -62,6 +62,9 @@ Every R&D bug is a CI test — see `tests/unit/test_g1..g8`:
 
 | Script | Purpose |
 | --- | --- |
+| `scripts/e2e_real_video.py` | Full pipeline on REAL footage (resumable): ingest → YuNet face sweep → live Gladia ASR → render → subtitles → QA → burn-in |
+| `scripts/download_real_video.sh` | Rate-limit-aware Wikimedia download with backoff + checksum validation |
+| `scripts/demo_zoom_freeze.py` | Keyframed punch-in + freeze-callout demo over the real-footage master |
 | `scripts/e2e_smoke.py` | Full pipeline on a synthetic *spoken* fixture — live Gladia ASR, real render, QA audit |
 | `scripts/e2e_rerender.py` | Crash-resume semantics: reuse transcript/timeline, re-render only changed segments |
 | `scripts/llm_smoke_test.py` | Live AI Studio probe: model visibility + function-calling wire format |
@@ -74,8 +77,8 @@ Every R&D bug is a CI test — see `tests/unit/test_g1..g8`:
 | M1 | Modular core engine + OTIO + segment caching | **closed** — 1080p demo (42s, 48kHz stereo), parallel segment fleet, ffprobe-validated cache (zero-change re-render: 4/4 hits, 0.1s) |
 | M2 | Native agentic tool runtime + durable orchestration | **core landed** — 8 typed director tools, checkpoint/rollback store, planner-executor with auto-rollback, durable 5-stage pipeline (crash resume, ASR never re-run), Gladia ASR, shot boundaries + audio events, edge-tts `generate_tts`, SKILL.md prompt injection, SSE job progress, YouTube Private-Draft publisher + Human Review Gate |
 | M3 | Director Studio Next.js UI | **closed + acceptance-verified** — cases, live SSE pipeline progress, timeline versions, checkpoint-first dispatch with rollback, **proxy scrub player (480p) + mouse-drawn blur canvas + editable subtitle grid**, Human Review Gate publish (Next.js 15, `apps/web`). M3 acceptance was executed live in a real browser: a blur box drawn over the frame corner survived to the next render (cache-invalidation A/B + pixel proof) and an edited cue re-aligned via difflib without drift (see `docs/m3_acceptance/` evidence) |
-| M4 | Multimodal vision + Modal serverless GPU | **local surface landed** — `map_route` card, **Gemini vision client live behind the port (`VISION_API_KEY`)**, Modal GPU app scaffold (tokens configured) |
-| M5 | Cloud deployment + multi-channel hardening | **scaffolding landed** — compose healthchecks/restart policies, cost dashboard endpoint (durations + tokens), multi-channel publish fan-out with honest `not_configured` states, `.env.example` |
+| M4 | Multimodal vision + Modal serverless GPU | **local surface landed, real-footage proven** — YuNet face sweep → clustered redaction regions (model packaged, zero downloads), raw→render blur mapping, keyframed punch-in zoompan, freeze-callout spotlight, `sync_multicam` audio sync (±1 ms + drift), `timeline.switch_camera`, `map_route` card, **Gemini vision client live behind the port (`VISION_API_KEY`)**, Modal GPU app scaffold (tokens configured). Full e2e on real Eustis FL bodycam: auto face blur + burned ASR subtitles delivered |
+| M5 | Cloud deployment + multi-channel hardening | **scaffolding landed** — compose healthchecks/restart policies, cost dashboard endpoint (durations + tokens), multi-channel publish fan-out with honest `not_configured` states, `.env.example`, **kill-mid-encode crash-recovery drill executable** |
 
 Live credentials (verified 2026-11-17): **Gladia cloud ASR is end-to-end green**
 (real transcription + diarization through the v2 API, incl. the
