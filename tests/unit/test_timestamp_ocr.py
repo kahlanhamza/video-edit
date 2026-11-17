@@ -50,9 +50,18 @@ def tiny_video(tmp_path: Path) -> Path:
 
     out = tmp_path / "tiny.mp4"
     cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10:duration=2",
-        "-frames:v", "20", "-y", str(out),
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=320x240:rate=10:duration=2",
+        "-frames:v",
+        "20",
+        "-y",
+        str(out),
     ]
     r = subprocess.run(cmd, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr[-300:]

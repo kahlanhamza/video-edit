@@ -136,9 +136,7 @@ def score_frame_quality(
 
     if not frames:
         raise FrameQualityError(f"no frames sampled from {video_path}")
-    return FrameQualityReport(
-        source=str(video_path), sample_every_s=sample_every_s, frames=frames
-    )
+    return FrameQualityReport(source=str(video_path), sample_every_s=sample_every_s, frames=frames)
 
 
 def black_frame_probe(video_path: str, threshold: float = 0.98) -> list[tuple[float, float]]:
@@ -166,9 +164,7 @@ def black_frame_probe(video_path: str, threshold: float = 0.98) -> list[tuple[fl
 
     out: list[tuple[float, float]] = []
     for line in r.stderr.splitlines():
-        m = re.search(
-            r"black_start:([0-9]+\.?[0-9]*)\s+black_end:([0-9]+\.?[0-9]*)", line
-        )
+        m = re.search(r"black_start:([0-9]+\.?[0-9]*)\s+black_end:([0-9]+\.?[0-9]*)", line)
         if m:
             out.append((float(m.group(1)), float(m.group(2))))
     return out

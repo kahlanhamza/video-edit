@@ -121,7 +121,6 @@ class GeminiVisionClient:
         import base64
         import json as _json
 
-
         parts: list[dict[str, Any]] = [
             {
                 "text": (
@@ -144,8 +143,8 @@ class GeminiVisionClient:
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048},
         }
-        data = self._post(body, _json)
-        return self._parse(data, frames)
+        response: dict[str, Any] = self._post(body, _json)
+        return self._parse(response, frames)
 
     def _post(self, body: dict[str, Any], _json: Any) -> dict[str, Any]:
         import httpx
@@ -189,9 +188,7 @@ class GeminiVisionClient:
             if last_status not in (429, 500, 503):
                 break
             _time.sleep(4.0 * (attempt + 1))
-        raise VisionError(
-            f"vision provider via modal egress {last_status}: {last_body[:200]}"
-        )
+        raise VisionError(f"vision provider via modal egress {last_status}: {last_body[:200]}")
 
     def _parse(self, data: dict[str, Any], frames: Sequence[FrameRef]) -> list[SceneInsight]:
         import json as _json

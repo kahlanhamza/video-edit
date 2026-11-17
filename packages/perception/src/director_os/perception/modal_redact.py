@@ -76,6 +76,8 @@ def parse_tracks_payload(payload: dict) -> list[TrackedObject]:
             continue
         tid = tr.get("id", tr.get("track_id"))
         kind = str(tr.get("cls", tr.get("class", tr.get("kind", "face")))).lower()
+        if tid is None:
+            continue
         try:
             tid = int(tid)
         except (TypeError, ValueError):

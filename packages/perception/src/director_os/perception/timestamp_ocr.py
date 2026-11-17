@@ -36,9 +36,7 @@ class BodycamStamp:
     confidence: float = 0.0
 
 
-_DATE_RE = re.compile(
-    r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?"
-)
+_DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?")
 _TZ_RE = re.compile(r"([+-])(\d{2}):?(\d{2})\b|\b([A-Z]{2,5})\b(?=\s*/|\s*$)")
 _DEVICE_RE = re.compile(
     r"\b(AXON\s+BODY\s*\d|AXON\s+CAPTURE|AXON\s+FLEX|VW\s+ICON)\b", re.IGNORECASE
@@ -83,9 +81,18 @@ def extract_frame(video_path: str, t_s: float = 0.5, out_png: str | Path | None 
     out = Path(out_png or "/tmp/dos_ocr_frame.png")
     out.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-ss", f"{max(0.0, t_s):.3f}", "-i", str(video_path),
-        "-frames:v", "1", "-y", str(out),
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{max(0.0, t_s):.3f}",
+        "-i",
+        str(video_path),
+        "-frames:v",
+        "1",
+        "-y",
+        str(out),
     ]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0 or not out.exists():

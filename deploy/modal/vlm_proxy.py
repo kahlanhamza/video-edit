@@ -47,11 +47,7 @@ def main(model: str = "gemini-3.5-flash-lite"):
     out = vlm_call.remote(
         model=model,
         payload_json=json.dumps(
-            {
-                "contents": [
-                    {"role": "user", "parts": [{"text": "Reply with the single word: ok"}]}
-                ]
-            }
+            {"contents": [{"role": "user", "parts": [{"text": "Reply with the single word: ok"}]}]}
         ),
     )
     print(json.dumps(out, indent=2)[:600])

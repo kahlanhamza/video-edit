@@ -15,10 +15,18 @@ from director_os.perception.frame_quality import (
 
 def _ffmpeg_filter(filter_str: str, out: Path, dur: float = 2.0) -> Path:
     cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-f", "lavfi", "-i", filter_str.replace("{DUR}", str(dur)),
-        "-frames:v", str(int(dur * 10)),
-        "-y", str(out),
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        filter_str.replace("{DUR}", str(dur)),
+        "-frames:v",
+        str(int(dur * 10)),
+        "-y",
+        str(out),
     ]
     r = subprocess.run(cmd, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr[-300:]

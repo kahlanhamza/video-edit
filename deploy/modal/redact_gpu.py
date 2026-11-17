@@ -56,21 +56,25 @@ _GPU_REQUEST = os.getenv("DOS_MODAL_GPU", "1") != "0"
 GPU_KWARGS: dict = {"gpu": "T4"} if _GPU_REQUEST else {}
 
 # torch ships CUDA in the default PyPI wheel; ultralytics pulls it transitively.
-gpu_image = modal.Image.debian_slim(python_version="3.12").apt_install(
-    "libgl1", "libglib2.0-0"
-).pip_install(
-    "ultralytics>=8.3",
-    "opencv-python-headless",
-    "numpy<2.4",
-    "requests",
+gpu_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install("libgl1", "libglib2.0-0")
+    .pip_install(
+        "ultralytics>=8.3",
+        "opencv-python-headless",
+        "numpy<2.4",
+        "requests",
+    )
 )
-cpu_image = modal.Image.debian_slim(python_version="3.12").apt_install(
-    "libgl1", "libglib2.0-0"
-).pip_install(
-    "paddlepaddle==3.0.0",
-    "paddleocr>=3.0",
-    "opencv-python-headless",
-    "numpy<2.4",
+cpu_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install("libgl1", "libglib2.0-0")
+    .pip_install(
+        "paddlepaddle==3.0.0",
+        "paddleocr>=3.0",
+        "opencv-python-headless",
+        "numpy<2.4",
+    )
 )
 
 _W = Path("/weights")
@@ -246,7 +250,6 @@ def ocr_frame(image_b64: str, mime: str = "image/png") -> dict:
     texts: list[str] = []
     boxes: list[list[int]] = []
     try:
-
         ocr = _paddle_once()
         result = ocr.ocr(arr)
         for page in result or []:

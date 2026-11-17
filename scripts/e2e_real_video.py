@@ -229,9 +229,7 @@ def main() -> int:
             None
             if (args.skip_asr or args.stub_asr)
             else (
-                _stub_transcribe
-                if getattr(args, "stub_asr", False)
-                else make_transcribe(settings)
+                _stub_transcribe if getattr(args, "stub_asr", False) else make_transcribe(settings)
             )
         ),
         video=VideoRenderSpec(w=w, h=h, fps=30),

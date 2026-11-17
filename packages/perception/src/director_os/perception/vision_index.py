@@ -135,10 +135,22 @@ def build_contact_sheets(
         tmp_dir = out / f".tmp_sheet_{k}"
         tmp_dir.mkdir(parents=True, exist_ok=True)
         cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-ss", f"{t:.3f}", "-t", f"{span:.3f}", "-i", str(video_path),
-            "-vf", f"fps={n / span:.4f},scale={tile_w}:-2",
-            "-frames:v", str(n), "-q:v", "3",
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{t:.3f}",
+            "-t",
+            f"{span:.3f}",
+            "-i",
+            str(video_path),
+            "-vf",
+            f"fps={n / span:.4f},scale={tile_w}:-2",
+            "-frames:v",
+            str(n),
+            "-q:v",
+            "3",
             str(tmp_dir / "f_%02d.jpg"),
         ]
         r = subprocess.run(cmd, capture_output=True, text=True)
@@ -162,8 +174,12 @@ def build_contact_sheets(
             label = f"{int(ts // 60):02d}:{ts % 60:04.1f}"
             box = [gx * tile_w + 4, gy * tile_h + 4, gx * tile_w + 78, gy * tile_h + 22]
             draw.rectangle(box, fill=(0, 0, 0))
-            draw.text((gx * tile_w + 8, gy * tile_h + 6), label,
-                      font=_pfont(font_path, 13), fill=(255, 255, 80))
+            draw.text(
+                (gx * tile_w + 8, gy * tile_h + 6),
+                label,
+                font=_pfont(font_path, 13),
+                fill=(255, 255, 80),
+            )
 
         path = out / f"sheet_{k:04d}_{int(t):05d}.png"
         sheet.save(path)
@@ -205,9 +221,7 @@ def index_timeline(
         for ins in found:
             # clamp sheet-relative model answers into the sheet's absolute window
             if ins.timestamp_s < sheet.t_start_s - 1e-6 or ins.timestamp_s > sheet.t_end_s + 1e-6:
-                insights.append(
-                    ins.model_copy(update={"timestamp_s": sheet.t_start_s})
-                )
+                insights.append(ins.model_copy(update={"timestamp_s": sheet.t_start_s}))
             else:
                 insights.append(ins)
     return insights
@@ -235,10 +249,22 @@ def frames_on_demand(
     for i, ts in enumerate(times):
         path = out / f"fod_{int(ts * 1000):09d}_{i}.jpg"
         cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-ss", f"{ts:.3f}", "-i", str(video_path),
-            "-frames:v", "1", "-vf", f"scale={tile_w}:-2", "-q:v", "2",
-            "-y", str(path),
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{ts:.3f}",
+            "-i",
+            str(video_path),
+            "-frames:v",
+            "1",
+            "-vf",
+            f"scale={tile_w}:-2",
+            "-q:v",
+            "2",
+            "-y",
+            str(path),
         ]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0 or not path.exists():

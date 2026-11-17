@@ -68,9 +68,7 @@ def scale_region(region: BlurRegion, from_w: int, from_h: int, to_w: int, to_h: 
     return region.model_copy(update={"bbox": scale_bbox(region.bbox, from_w, from_h, to_w, to_h)})
 
 
-def clip_region_time(
-    region: BlurRegion, seg_start_s: float, seg_dur_s: float
-) -> BlurRegion | None:
+def clip_region_time(region: BlurRegion, seg_start_s: float, seg_dur_s: float) -> BlurRegion | None:
     """Translate a region's source-time window into one segment's LOCAL time.
 
     Region time bounds are absolute source-footage seconds; every segment renders

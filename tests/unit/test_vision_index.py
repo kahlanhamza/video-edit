@@ -28,9 +28,18 @@ from director_os.perception.vision_index import (
 def tiny_video(tmp_path: Path) -> Path:
     out = tmp_path / "tiny.mp4"
     cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10:duration=4",
-        "-frames:v", "40", "-y", str(out),
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=320x240:rate=10:duration=4",
+        "-frames:v",
+        "40",
+        "-y",
+        str(out),
     ]
     r = subprocess.run(cmd, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr[-300:]

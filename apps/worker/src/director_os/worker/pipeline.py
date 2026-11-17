@@ -227,7 +227,7 @@ def stage_redaction(
     if backend == "yunet":
         from director_os.perception.faces import cluster_to_regions, detect_faces
 
-        sweep = detect_faces(str(source), sample_every_s=1.0)
+        sweep = detect_faces(source, sample_every_s=1.0)
         regions = cluster_to_regions(
             sweep, max_regions=max_regions, frame_w=frame_w, frame_h=frame_h
         )
@@ -237,7 +237,7 @@ def stage_redaction(
             "detections": sweep.stats.detections,
         }
 
-    payload_json = {
+    payload_json: dict[str, Any] = {
         "regions": [r.model_dump(mode="json") for r in regions],
         "source": source_tag,
         "stats": stats,
@@ -283,9 +283,7 @@ def stage_vision_enrichment(asset_id: str, source: Path, deps: PipelineDeps) -> 
             shots["frame_quality"] = {
                 "sample_every_s": report.sample_every_s,
                 "usable_ratio": round(report.usable_ratio, 3),
-                "unusable_spans": [
-                    [round(a, 2), round(b, 2)] for a, b in report.unusable_spans
-                ],
+                "unusable_spans": [[round(a, 2), round(b, 2)] for a, b in report.unusable_spans],
                 "frames": [asdict(f) for f in report.frames[:600]],
             }
             deps.log(
