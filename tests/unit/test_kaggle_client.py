@@ -174,3 +174,57 @@ def test_kaggle_client_from_env_requires_key(monkeypatch):
     with pytest.raises(KaggleNotConfigured):
         kaggle_client_from_env()
     get_settings.cache_clear()
+
+
+# ------------------------------------------------- live-run regressions (2026-11-18)
+def test_kernel_output_file_objects_normalized_to_names():
+    """kernels/output returns file OBJECTS (fileName/fileNameNullable), not
+    strings. Regression: str(dict) reprs broke every caller that filters by
+    extension or passes 'files' straight into download_output_file."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/kernels/output":
+            return httpx.Response(
+                200,
+                json={
+                    "logNullable": "",
+                    "files": [
+                        {
+                            "fileNameNullable": "stems/htdemucs/x/vocals.wav",
+                            "urlNullable": "https://signed/vocals.wav",
+                        },
+                        {
+                            "fileName": "stems/htdemucs/x/no_vocals.wav",
+                            "url": "https://signed/no_vocals.wav",
+                        },
+                        {"fileName": "", "url": ""},  # nameless entry is dropped
+                    ],
+                },
+            )
+        return httpx.Response(404)
+
+    out = _client(handler).kernel_output("hamzakhl/some-kernel")
+    assert [f["name"] for f in out["files"]] == [
+        "stems/htdemucs/x/vocals.wav",
+        "stems/htdemucs/x/no_vocals.wav",
+    ]
+    assert all(f["url"] for f in out["files"])
+
+
+def test_download_output_file_follows_signed_url_redirect(tmp_path):
+    """The download endpoint 302s to a signed kaggleusercontent URL; httpx does
+    NOT follow redirects by default. Regression: harvest raised 302-as-error
+    instead of streaming the stem wav."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/api/v1/kernels/output/download/"):
+            return httpx.Response(302, headers={"Location": "https://signed.example/real.wav"})
+        if request.url.host == "signed.example":
+            return httpx.Response(200, content=b"RIFFwavdata")
+        return httpx.Response(404)
+
+    dest = _client(handler).download_output_file(
+        "hamzakhl/some-kernel", "stems/htdemucs/x/vocals.wav", tmp_path
+    )
+    assert dest.name == "vocals.wav"
+    assert dest.read_bytes() == b"RIFFwavdata"

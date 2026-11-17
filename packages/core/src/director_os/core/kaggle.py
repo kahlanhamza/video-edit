@@ -211,7 +211,18 @@ class KaggleClient:
                 log = [{"stream_name": "stdout", "data": raw_log[:10000]}]
         elif isinstance(raw_log, list):
             log = [rec for rec in raw_log if isinstance(rec, dict)]
-        return {"log": log, "files": [str(f) for f in data.get("files", [])]}
+        # The API returns file OBJECTS ({fileName/url} variants), not strings —
+        # normalize so callers get stable names (a str(dict) repr 404s downloads).
+        files: list[dict] = []
+        for f in data.get("files", []):
+            if isinstance(f, dict):
+                name = str(f.get("fileName") or f.get("fileNameNullable") or "")
+                url = str(f.get("url") or f.get("urlNullable") or "")
+                if name:
+                    files.append({"name": name, "url": url})
+            elif isinstance(f, str):
+                files.append({"name": f, "url": ""})
+        return {"log": log, "files": files}
 
     def download_output_file(self, slug: str, filename: str, dest_dir: Path) -> Path:
         if "/" not in slug:
@@ -224,6 +235,7 @@ class KaggleClient:
             c.stream(
                 "GET",
                 f"/api/v1/kernels/output/download/{user}/{kslug}/{filename}",
+                follow_redirects=True,  # 302 -> signed kaggleusercontent URL
             ) as r,
         ):
             if r.status_code != 200:
@@ -279,7 +291,8 @@ class KaggleClient:
             raise KaggleError(f"kernel {full_slug} failed:\n{tail}")
         files: list[str] = []
         if download_files and out["files"] and out_dir is not None:
-            for fname in out["files"]:
+            for entry in out["files"]:
+                fname = entry["name"] if isinstance(entry, dict) else str(entry)
                 self.download_output_file(full_slug, fname, Path(out_dir))
                 files.append(fname)
         return KernelRunResult(

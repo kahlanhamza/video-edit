@@ -295,7 +295,7 @@ class LocalOnnxCpuBackend:
             ) from e
         out = Path(out_dir) if out_dir else Path(os.getenv("OUTPUT_DIR", "./output")) / "stems"
         out.mkdir(parents=True, exist_ok=True)
-        # demucs.separate.main(["--two_stems", "vocals", "-o", str(out), str(audio_path)])
+        # demucs.separate.main(["--two-stems", "vocals", "-o", str(out), str(audio_path)])
         raise ComputeNotAvailable(
             "demucs CLI path is wired but unverified — prefer COMPUTE_BACKEND=kaggle for stems"
         )

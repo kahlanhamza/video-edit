@@ -120,7 +120,7 @@ DEMUCS_KERNEL_TEMPLATE = """# DirectorOS stems kernel — Demucs two-stems on fr
 import json, subprocess, urllib.request
 subprocess.run(["pip", "install", "-q", "demucs"], check=True)
 urllib.request.urlretrieve({audio_url!r}, "/kaggle/working/input_audio")
-subprocess.run(["python", "-m", "demucs.separate", "--two_stems", "vocals",
+subprocess.run(["python", "-m", "demucs.separate", "--two-stems", "vocals",
                 "-n", {model_name!r}, "-o", "/kaggle/working/stems",
                 "/kaggle/working/input_audio"], check=True)
 print("DIRECTOROS_RESULT=" + json.dumps({{"stems": ["vocals", "no_vocals"]}}))
