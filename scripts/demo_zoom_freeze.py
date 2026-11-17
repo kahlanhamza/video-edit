@@ -18,15 +18,15 @@ from pathlib import Path
 from director_os.core.models import BBox, ZoomKeyframe
 from director_os.otio_engine.compiler import compile_timeline
 from director_os.otio_engine.contract import FreezeCallout, RawClipMeta
+from director_os.otio_engine.renderer import render_dag
 from director_os.otio_engine.segment_cache import (
     AudioRenderSpec,
     SegmentCache,
     VideoRenderSpec,
 )
-from director_os.otio_engine.renderer import render_dag
 from director_os.otio_engine.timeline import (
-    ClipSpec,
     MASTER_TRACK,
+    ClipSpec,
     TimelineSpec,
     TrackSpec,
     build_timeline,
