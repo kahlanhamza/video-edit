@@ -1,29 +1,44 @@
-"""audio.generate_tts — edge-tts narration synthesis (PLAN §4.5, M2).
+"""audio.generate_tts — narration synthesis behind the TtsBackend port.
 
-Sync adapter around edge-tts with two hard properties:
+Port-and-adapter like LLMBackend: a `TtsBackend` port, provider selection via
+`build_tts_backend()` (env `TTS_PROVIDER`), and every backend zero-heavy-SDK:
 
-1. Backend injection: the `TtsBackend` port keeps tests hermetic — a fake
-   backend provides real audio bytes without network. The real backend lazily
-   imports `edge_tts` so the package stays optional at import time.
-2. Pause trimming + THE LAW: raw TTS arrives with dead padding on both ends;
-   `tts_pause_trim_chain` removes it, and `audio_output_args` pins 48 kHz
-   stereo aac on the stem (ADR-0005 audio law), so narration stems drop into
-   the mix unchanged.
+1. `EdgeTtsBackend`     — DEFAULT, $0, no key. Microsoft Edge neural voices
+   via `edge-tts`. Great for dev, tests and prototypes; keep it through M2-M5
+   so the pipeline burns $0.
+2. `ElevenLabsTtsBackend` — OPTIONAL studio grade (`ELEVENLABS_API_KEY` +
+   `ELEVENLABS_VOICE_ID`), pure httpx against
+   `/v1/text-to-speech/{voice_id}/with-timestamps`: base64 audio + character
+   alignment folded into word stamps for karaoke-accurate subtitles. Flip it
+   on when the first monetized channel video goes live — one .env key, no
+   code change (`TTS_PROVIDER=elevenlabs`).
+
+Both feed the same sync adapter: pause trimming + THE LAW (raw TTS arrives
+with dead padding on both ends; `tts_pause_trim_chain` removes it, and
+`audio_output_args` pins 48 kHz stereo aac on the stem, ADR-0005), so
+narration stems drop into the mix unchanged regardless of provider.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+import httpx
 from director_os.audio_engine.chains import tts_pause_trim_chain
 from director_os.core.ffmpeg_args import audio_output_args
 from director_os.core.qa_probe import probe
 
 DEFAULT_VOICE = "en-US-GuyNeural"
+ELEVENLABS_DEFAULT_BASE = "https://api.elevenlabs.io"
+# public shared voice (Rachel) — overridable via ELEVENLABS_VOICE_ID
+ELEVENLABS_DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
+ELEVENLABS_DEFAULT_MODEL = "eleven_multilingual_v2"
+ELEVENLABS_OUTPUT_FORMAT = "mp3_44100_128"
 
 
 class TtsError(RuntimeError):
@@ -38,6 +53,8 @@ class TtsBackend(Protocol):
 
 class EdgeTtsBackend:
     """Real backend: edge-tts (Microsoft Edge neural voices, no API key)."""
+
+    provider = "edge-tts"
 
     def synthesize(self, text: str, voice: str) -> bytes:
         try:
@@ -60,12 +77,145 @@ class EdgeTtsBackend:
 
 
 @dataclass(frozen=True)
+class WordStamp:
+    """One aligned word (ElevenLabs with-timestamps alignment -> words)."""
+
+    word: str
+    start_s: float
+    end_s: float
+
+
+@dataclass(frozen=True)
 class TtsResult:
     path: Path
     duration_s: float
     voice: str
     text_chars: int
     provider: str
+    words: tuple[WordStamp, ...] = ()
+
+
+def _words_from_character_alignment(
+    characters: list[str], starts: list[float], ends: list[float]
+) -> tuple[WordStamp, ...]:
+    """Fold per-character alignment into word stamps (whitespace is the split).
+
+    A word spans from its first character's start to its last character's
+    end; punctuation/space characters ride along inside the current word so
+    gaps never swallow a word boundary.
+    """
+    words: list[WordStamp] = []
+    buf = ""
+    start: float | None = None
+    prev_end = 0.0
+    for ch, s, e in zip(characters, starts, ends, strict=False):
+        if ch.isspace():
+            if buf:
+                words.append(
+                    WordStamp(word=buf, start_s=float(start or 0.0), end_s=float(prev_end))
+                )
+                buf = ""
+                start = None
+            continue
+        if start is None:
+            start = s
+        buf += ch
+        prev_end = e
+    if buf:
+        words.append(WordStamp(word=buf, start_s=float(start or 0.0), end_s=float(prev_end)))
+    return tuple(words)
+
+
+class ElevenLabsTtsBackend:
+    """Studio-grade provider — pure httpx, zero SDK, word-level timestamps.
+
+    Endpoint: POST /v1/text-to-speech/{voice_id}/with-timestamps
+              (?output_format=mp3_44100_128, header xi-api-key)
+    Response: {"audio_base64": ..., "alignment": {"characters": [...],
+              "character_start_times_seconds": [...],
+              "character_end_times_seconds": [...]}}
+    """
+
+    provider = "elevenlabs"
+
+    def __init__(
+        self,
+        api_key: str,
+        voice_id: str = "",
+        model_id: str = ELEVENLABS_DEFAULT_MODEL,
+        base_url: str = ELEVENLABS_DEFAULT_BASE,
+        transport: httpx.BaseTransport | None = None,
+        timeout_s: float = 120.0,
+    ):
+        if not api_key:
+            raise TtsError("ElevenLabsTtsBackend requires ELEVENLABS_API_KEY")
+        self.api_key = api_key
+        self.voice_id = voice_id or ELEVENLABS_DEFAULT_VOICE_ID
+        self.model_id = model_id
+        self.base_url = base_url.rstrip("/")
+        self._transport = transport
+        self._timeout_s = timeout_s
+
+    def _resolve_voice(self, voice: str) -> str:
+        # a Microsoft-style voice name means "use the configured default"
+        return self.voice_id if voice == DEFAULT_VOICE or not voice else voice
+
+    def synthesize(self, text: str, voice: str = "") -> bytes:
+        audio, _ = self.synthesize_with_timestamps(text, voice)
+        return audio
+
+    def synthesize_with_timestamps(
+        self, text: str, voice: str = ""
+    ) -> tuple[bytes, tuple[WordStamp, ...]]:
+        vid = self._resolve_voice(voice)
+        url = f"{self.base_url}/v1/text-to-speech/{vid}/with-timestamps"
+        params = {"output_format": ELEVENLABS_OUTPUT_FORMAT}
+        payload = {"text": text, "model_id": self.model_id}
+        try:
+            with httpx.Client(transport=self._transport, timeout=self._timeout_s) as client:
+                r = client.post(
+                    url, headers={"xi-api-key": self.api_key}, params=params, json=payload
+                )
+        except httpx.HTTPError as e:
+            raise TtsError(f"elevenlabs request failed: {e}") from e
+        if r.status_code != 200:
+            raise TtsError(f"elevenlabs {r.status_code}: {r.text[:300]}")
+        data = r.json()
+        audio = base64.b64decode(data.get("audio_base64", ""))
+        if not audio:
+            raise TtsError("elevenlabs returned empty audio")
+        align = data.get("alignment") or {}
+        words = _words_from_character_alignment(
+            align.get("characters", []),
+            align.get("character_start_times_seconds", []),
+            align.get("character_end_times_seconds", []),
+        )
+        return audio, words
+
+
+def build_tts_backend() -> TtsBackend:
+    """Env-driven provider choice (config is data, same as build_backend).
+
+    TTS_PROVIDER: `edge` (default, $0) | `elevenlabs` (needs ELEVENLABS_API_KEY).
+    Raises TtsError (never silently falls back) when the requested provider is
+    unconfigured — callers decide whether to degrade.
+    """
+    from director_os.core.config import get_settings
+
+    s = get_settings()
+    provider = (s.tts_provider or "edge").lower()
+    if provider == "elevenlabs":
+        if not s.elevenlabs_api_key:
+            raise TtsError(
+                "TTS_PROVIDER=elevenlabs requires ELEVENLABS_API_KEY "
+                "(+ optional ELEVENLABS_VOICE_ID/ELEVENLABS_MODEL_ID)"
+            )
+        return ElevenLabsTtsBackend(
+            api_key=s.elevenlabs_api_key,
+            voice_id=s.elevenlabs_voice_id,
+            model_id=s.elevenlabs_model_id,
+        )
+    return EdgeTtsBackend()
 
 
 def generate_tts(
@@ -86,8 +236,20 @@ def generate_tts(
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    backend = backend or EdgeTtsBackend()
-    raw = backend.synthesize(text, voice)
+    backend = backend or build_tts_backend()
+
+    # word stamps ride along when the provider aligns (ElevenLabs today) —
+    # call with-timestamps ONCE and reuse its audio bytes (never double-bill)
+    words: tuple[WordStamp, ...] = ()
+    raw: bytes | None = None
+    ts_method = getattr(backend, "synthesize_with_timestamps", None)
+    if ts_method is not None:
+        try:
+            raw, words = ts_method(text, voice)
+        except TypeError:
+            raw = None
+    if not raw:
+        raw = backend.synthesize(text, voice)
     if not raw:
         raise TtsError("tts backend returned empty audio")
 
@@ -113,5 +275,6 @@ def generate_tts(
         duration_s=result.duration_s,
         voice=voice,
         text_chars=len(text),
-        provider="edge-tts",
+        provider=getattr(backend, "provider", "unknown"),
+        words=words,
     )

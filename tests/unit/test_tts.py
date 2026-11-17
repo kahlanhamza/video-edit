@@ -4,8 +4,15 @@ from __future__ import annotations
 
 import subprocess
 
+import httpx
 import pytest
-from director_os.audio_engine.tts import EdgeTtsBackend, TtsError, generate_tts
+from director_os.audio_engine.tts import (
+    EdgeTtsBackend,
+    ElevenLabsTtsBackend,
+    TtsError,
+    WordStamp,
+    generate_tts,
+)
 
 RAW_S = 2.0
 TONE_HEAD_S = 0.4
@@ -98,3 +105,124 @@ def test_edge_tts_backend_exists_and_is_default():
 
     assert DEFAULT_VOICE.startswith("en-")
     assert isinstance(EdgeTtsBackend(), EdgeTtsBackend)
+
+
+# --------------------------------------------------------------------------- providers
+# ElevenLabsTtsBackend: pure httpx against /v1/text-to-speech/{vid}/with-timestamps
+# (MockTransport keeps tests hermetic — no key burned, no SDK installed).
+
+
+def _elevenlabs_payload(text: str) -> dict:
+    """Real response shape: base64 audio + per-character alignment."""
+    import base64
+
+    chars = list(text)
+    starts = [i * 0.05 for i in range(len(chars))]
+    ends = [s + 0.04 for s in starts]
+    return {
+        "audio_base64": base64.b64encode(b"ID3fake-mp3-bytes").decode(),
+        "alignment": {
+            "characters": chars,
+            "character_start_times_seconds": starts,
+            "character_end_times_seconds": ends,
+        },
+    }
+
+
+def _mock_elevenlabs(handler):
+    import httpx
+
+    return ElevenLabsTtsBackend(api_key="test-key", transport=httpx.MockTransport(handler))
+
+
+def test_elevenlabs_word_stamps_from_character_alignment():
+    text = "hello officer"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.startswith("/v1/text-to-speech/")
+        assert request.url.params["output_format"] == "mp3_44100_128"
+        assert request.headers["xi-api-key"] == "test-key"
+        assert request.read().decode().count("hello officer") == 1
+        return httpx.Response(200, json=_elevenlabs_payload(text))
+
+    backend = _mock_elevenlabs(handler)
+    audio, words = backend.synthesize_with_timestamps(text)
+    assert audio == b"ID3fake-mp3-bytes"
+    assert [w.word for w in words] == ["hello", "officer"]
+    # word boundary folds first char start -> last char end
+    assert words[0].start_s == pytest.approx(0.0)
+    assert words[0].end_s == pytest.approx(0.0 + 4 * 0.05 + 0.04)
+    assert words[1].start_s == pytest.approx(6 * 0.05)
+
+
+def test_elevenlabs_ms_voice_name_falls_back_to_configured_voice():
+    """generate_tts's DEFAULT_VOICE (en-US-*) must not leak into the ElevenLabs URL."""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["vid"] = request.url.path.split("/")[-2]
+        return httpx.Response(200, json=_elevenlabs_payload("ok"))
+
+    backend = _mock_elevenlabs(handler)
+    backend.synthesize("ok", "en-US-GuyNeural")
+    assert captured["vid"] == "21m00Tcm4TlvDq8ikWAM"
+
+
+def test_elevenlabs_http_error_raises_tts_error():
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"detail": {"status": "invalid_api_key"}})
+
+    backend = _mock_elevenlabs(handler)
+    with pytest.raises(TtsError, match="401"):
+        backend.synthesize("x")
+
+
+def test_build_tts_backend_selection(monkeypatch):
+    from director_os.audio_engine import tts as tts_mod
+    from director_os.core.config import get_settings
+
+    monkeypatch.setenv("TTS_PROVIDER", "edge")
+    get_settings.cache_clear()
+    assert isinstance(tts_mod.build_tts_backend(), EdgeTtsBackend)
+
+    monkeypatch.setenv("TTS_PROVIDER", "elevenlabs")
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "k1")
+    monkeypatch.setenv("ELEVENLABS_VOICE_ID", "v9")
+    get_settings.cache_clear()
+    b = tts_mod.build_tts_backend()
+    assert isinstance(b, ElevenLabsTtsBackend)
+    assert b.voice_id == "v9"
+
+    monkeypatch.delenv("ELEVENLABS_API_KEY")
+    get_settings.cache_clear()
+    with pytest.raises(TtsError, match="ELEVENLABS_API_KEY"):
+        tts_mod.build_tts_backend()
+
+    monkeypatch.setenv("TTS_PROVIDER", "edge")
+    get_settings.cache_clear()
+
+
+def test_generate_tts_word_stamps_flow_through(tmp_path):
+    """with-timestamps providers must be called ONCE (no double-billing)."""
+
+    class AligningBackend:
+        provider = "fake-align"
+
+        def __init__(self):
+            self.calls = 0
+
+        def synthesize(self, text: str, voice: str) -> bytes:
+            self.calls += 1
+            return _synthetic_narration_wav_bytes()
+
+        def synthesize_with_timestamps(self, text: str, voice: str):
+            self.calls += 1
+            return _synthetic_narration_wav_bytes(), (WordStamp("hi", 0.1, 0.5),)
+
+    b = AligningBackend()
+    result = generate_tts("word aligned narration", tmp_path / "n.mp3", backend=b)
+    assert b.calls == 1  # with-timestamps path, no second synthesize call
+    assert result.provider == "fake-align"
+    assert result.words[0].word == "hi"

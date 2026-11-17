@@ -170,6 +170,7 @@ Instead of relying on an external desktop MCP client (e.g., Claude Desktop over 
 | **On-Screen OCR** | `PaddleOCR` | `EasyOCR`, `Tesseract` (`pytesseract`) | Reading `AXON BODY 3` timestamps, car numbers, street signs |
 | **Non-Speech Audio Events** | `YAMNet` / `PANNs` (`panns-inference`) | `AST` (Audio Spectrogram Transformer), `CLAP` | Detecting sirens, shouting, cuffs, gunshots, impacts |
 | **Frame Quality Scoring** | `OpenCV` (Laplacian variance + HSV luma histograms) | `BRISQUE` | Rejecting dark/pocket/blurry bodycam angles |
+| **GPU/Compute Execution** | `ComputeBackend` port (`vision_fx/compute`): `LocalOnnxCpuBackend` DEFAULT ($0: yolov8n-face ONNX stride-3 + interp, YuNet fallback) | `KaggleBatchGpuBackend` ($0 free T4 via `/api/v1/kernels/push`, `KGAT_*` bearer — heavy WhisperX/Demucs/YOLO); `ModalGpuBackend` (dormant behind `MODAL_TOKEN_ID`) | One `COMPUTE_BACKEND` env switch; tracked faces return persistent `person_N` IDs in RAW pixel space |
 
 ### 4.5 Speech Recognition (ASR), Audio Cleaning & Voiceover (TTS)
 | Component | Primary Choice | Alternative Options | Purpose |
@@ -179,7 +180,7 @@ Instead of relying on an external desktop MCP client (e.g., Claude Desktop over 
 | **Active Speaker Detection** | `Columbia ASD` / `TalkNet` + `MediaPipe` | Audio-diarization-only fallback | Confirming who is speaking when faces are visible |
 | **Copyright Music Removal** | `Demucs` (`htdemucs`) | `audio-separator` (MDX-Net / RoFormer) | Stripping copyrighted car/store music while keeping dialogue |
 | **Speech Noise Reduction** | `DeepFilterNet` (`deepfilternet` / `deep-filter`, 48 kHz) | `noisereduce` (spectral gating), `ClearerVoice (MossFormer2)`, `RNNoise` | Reducing bodycam wind, engine & radio static |
-| **Voiceover TTS (Pluggable)** | `edge-tts` (`en-US-BrianMultilingualNeural`) | **Local/Free GPU:** `Kokoro-82M` (`kokoro-onnx`), `Chatterbox`, `Qwen3-TTS`<br>**Paid Studio:** `ElevenLabs API`, `Cartesia`, `Fish Audio` | Documentary narration |
+| **Voiceover TTS (Pluggable)** | `TtsBackend` port (`audio_engine/tts.py`): `EdgeTtsBackend` DEFAULT ($0, no key) | `ElevenLabsTtsBackend` (pure httpx `/v1/text-to-speech/{voice_id}/with-timestamps` → word-level stamps; NOTE: free tier blocks library voices via API — set `ELEVENLABS_VOICE_ID` to an owned voice). **Local/Free GPU:** `Kokoro-82M` (`kokoro-onnx`), `Chatterbox`, `Qwen3-TTS` | Documentary narration; `TTS_PROVIDER` env flips providers, zero SDK |
 | **Audio Mastering & Utilities** | `FFmpeg` (`silenceremove`, `loudnorm`, `sidechaincompress`, `acrossfade`) + `soundfile`, `numpy`, `scipy` | `pydub`, `sox` | Tight pacing, ducking & strict `48 kHz` stereo lock |
 
 ### 4.6 Computer Vision Redaction, Timeline, Subtitles & Rendering
@@ -293,9 +294,9 @@ director-os/
 * **Build:** `apps/web` (`Next.js 16 + shadcn/ui + WaveSurfer.js + react-konva + TanStack Table`).
 * **Done when:** You can paste a URL in the browser, watch SSE progress, scrub the 480p proxy, edit a subtitle/script line, draw a blur box with your mouse over a corner watermark, and publish a YouTube Private Draft without touching a terminal.
 
-### Milestone 4: Multimodal Vision + Modal Serverless GPU
-* **Build:** `gpu_services/modal_app.py` (`YOLO + ByteTrack` face/plate blur, `Demucs` music stripping, `DeepFilterNet`, `WhisperX` fallback) + `PySceneDetect` + VLM `"Frames-on-Demand"` + `syncstart` multi-cam switching + `Playwright` animated maps/cards.
-* **Done when:** Multi-camera FOIA packets auto-sync, strip background copyrighted music, auto-blur bystander faces/plates, and perform AI-directed punch-in zooms and freeze-callouts.
+### Milestone 4: Multimodal Vision + $0 Compute Stack (ComputeBackend Port)
+* **Build:** the `ComputeBackend` port (`vision_fx/compute`, port-and-adapter like `LLMBackend`/`TtsBackend`) with three adapters behind one `COMPUTE_BACKEND` env switch — `LocalOnnxCpuBackend` (DEFAULT, $0 zero card: `yolov8n-face.onnx` via onnxruntime, stride-3 sampling + constant-velocity tracking + linear interpolation, packaged YuNet fallback, on-demand Demucs only on music-flagged spans), `KaggleBatchGpuBackend` (OPTIONAL free cloud GPU, $0 zero card: `KGAT_*` bearer auth → `/api/v1/kernels/push` script kernels on a free Tesla T4 for heavy WhisperX / Demucs / YOLO sweeps, raw detections tracked host-side by the SAME tracker), `ModalGpuBackend` (DORMANT, wired behind `MODAL_TOKEN_ID`: sub-second serverless T4/L4/A10G bursts the day a card exists — Modal's card-verification fees are deliberately avoided). Plus `PySceneDetect` + VLM `Frames-on-Demand` + `syncstart` multi-cam switching + `Playwright` animated maps/cards.
+* **Done when:** Multi-camera FOIA packets auto-sync, strip background copyrighted music (Demucs via Kaggle or local extra), auto-blur bystander faces with persistent track IDs, and perform AI-directed punch-in zooms and freeze-callouts — at $0 compute burn with no payment method on file.
 
 ### Milestone 5: Cloud Deployment & Multi-Channel Hardening
 * **Build:** Production deploy on `Hetzner` (or `Oracle Always Free`) + `Cloudflare R2` + `Modal` + `Sentry` + `Langfuse/Logfire` cost dashboards + multiple `SKILL.md` niche templates.

@@ -6,10 +6,13 @@ requires-python = ">=3.12"
 dependencies = [
     "director-os-core",
     "pillow>=10.4",
+    "numpy>=1.26",
+    "onnxruntime>=1.18",
 ]
 
 [project.optional-dependencies]
 map = ["playwright>=1.40"]
+demucs = ["demucs>=4.0"]
 
 [build-system]
 requires = ["hatchling"]

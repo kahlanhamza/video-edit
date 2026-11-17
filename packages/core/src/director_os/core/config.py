@@ -42,9 +42,18 @@ class Settings:
     llm_model: str
     # --- vision LLM (M4)
     vision_api_key: str
-    # --- Modal GPU (M4)
+    # --- compute backend (M4: local ONNX default / Kaggle free GPU / Modal optional)
+    compute_backend: str
+    kaggle_username: str
+    kaggle_key: str
+    # --- Modal GPU (M4, dormant until a card exists)
     modal_token_id: str
     modal_token_secret: str
+    # --- tts providers (M2-M5: edge default $0, elevenlabs optional studio grade)
+    tts_provider: str
+    elevenlabs_api_key: str
+    elevenlabs_voice_id: str
+    elevenlabs_model_id: str
 
 
 def _load() -> Settings:
@@ -72,8 +81,15 @@ def _load() -> Settings:
         llm_base_url=os.getenv("LLM_BASE_URL", ""),
         llm_model=os.getenv("LLM_MODEL", ""),
         vision_api_key=os.getenv("VISION_API_KEY", ""),
+        compute_backend=os.getenv("COMPUTE_BACKEND", "local").strip().lower(),
+        kaggle_username=os.getenv("KAGGLE_USERNAME", ""),
+        kaggle_key=os.getenv("KAGGLE_KEY", ""),
         modal_token_id=os.getenv("MODAL_TOKEN_ID", ""),
         modal_token_secret=os.getenv("MODAL_TOKEN_SECRET", ""),
+        tts_provider=os.getenv("TTS_PROVIDER", "edge").strip().lower(),
+        elevenlabs_api_key=os.getenv("ELEVENLABS_API_KEY", ""),
+        elevenlabs_voice_id=os.getenv("ELEVENLABS_VOICE_ID", ""),
+        elevenlabs_model_id=os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2"),
     )
 
 

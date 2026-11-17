@@ -1,4 +1,4 @@
-"""DirectorOS vision FX — cards, punch-ins, redaction, spotlight callouts (PLAN §3.3E/F)."""
+"""DirectorOS vision FX — cards, punch-ins, redaction, spotlight, compute port."""
 
 from director_os.vision_fx.spotlight import (
     SpotlightError,
