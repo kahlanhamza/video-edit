@@ -66,8 +66,7 @@ class _DetectorProtocol(Protocol):
 
     name: str
 
-    def detect(self, frame_bgr: np.ndarray) -> list[tuple[int, int, int, int, float]]:
-        ...
+    def detect(self, frame_bgr: np.ndarray) -> list[tuple[int, int, int, int, float]]: ...
 
 
 class YuNetFaceDetector:

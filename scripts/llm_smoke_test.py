@@ -32,9 +32,7 @@ def list_models(key: str) -> list[str]:
         return []
     models = r.json().get("models", [])
     return [
-        m["name"]
-        for m in models
-        if "generateContent" in m.get("supportedGenerationMethods", [])
+        m["name"] for m in models if "generateContent" in m.get("supportedGenerationMethods", [])
     ]
 
 

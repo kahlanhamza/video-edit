@@ -27,9 +27,7 @@ def _clamp_region(
     return x, y, w, h
 
 
-def scale_region(
-    region: BlurRegion, from_w: int, from_h: int, to_w: int, to_h: int
-) -> BlurRegion:
+def scale_region(region: BlurRegion, from_w: int, from_h: int, to_w: int, to_h: int) -> BlurRegion:
     """Map a region from source pixel space to render pixel space (letterbox-aware).
 
     Studio canvas boxes and detector sweeps are stored in RAW-FOOTAGE pixels,

@@ -31,8 +31,11 @@ class FakeDetector:
 def _sweep(dets: list[FaceDetection]) -> FaceSweep:
     return FaceSweep(
         stats=FaceSweepStats(
-            frames_sampled=len({d.t_s for d in dets}), frames_decoded_failed=0,
-            detections=len(dets), detector="fake", sample_every_s=1.0,
+            frames_sampled=len({d.t_s for d in dets}),
+            frames_decoded_failed=0,
+            detections=len(dets),
+            detector="fake",
+            sample_every_s=1.0,
         ),
         detections=dets,
     )
@@ -85,10 +88,23 @@ def test_cluster_no_survivors_returns_empty() -> None:
 def _tiny_video(tmp_path: Path) -> Path:
     dest = tmp_path / "tiny.mp4"
     subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
-         "-i", "testsrc2=size=320x240:rate=10:duration=3",
-         "-c:v", "libx264", "-preset", "ultrafast", str(dest)],
-        check=True, capture_output=True,
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=10:duration=3",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            str(dest),
+        ],
+        check=True,
+        capture_output=True,
     )
     return dest
 

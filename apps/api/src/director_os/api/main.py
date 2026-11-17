@@ -377,9 +377,7 @@ def agent_plan(project_id: str, body: AgentPlanRequest | None = None) -> AgentPl
         rolled_back_to=run.rolled_back_to,
         tokens_in=usage.get("tokens_in"),
         tokens_out=usage.get("tokens_out"),
-        detail="plan executed"
-        if run.ok
-        else f"rolled back to version {run.rolled_back_to}",
+        detail="plan executed" if run.ok else f"rolled back to version {run.rolled_back_to}",
     )
 
 

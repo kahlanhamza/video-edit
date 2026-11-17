@@ -227,9 +227,7 @@ def test_gemini_401_access_token_type_unsupported_falls_back_to_key_param():
             )
         return httpx.Response(200, json=GEMINI_OK)
 
-    be = GeminiRestBackend(
-        "k-ai", "m", mini_registry(), transport=httpx.MockTransport(handler)
-    )
+    be = GeminiRestBackend("k-ai", "m", mini_registry(), transport=httpx.MockTransport(handler))
     steps = be.propose("s", "director")
 
     assert len(attempts) == 2  # header attempt, then ?key= retry

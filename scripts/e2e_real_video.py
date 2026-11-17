@@ -71,9 +71,18 @@ def ensure_source(src: Path) -> Path:
         print(f"[source] {src} missing — downloading from Wikimedia (448 MB, respects 429 backoff)")
         REPO.joinpath("data/media").mkdir(parents=True, exist_ok=True)
         subprocess.run(
-            ["curl", "-sL", "--retry", "5", "--retry-all-errors",
-             "-A", "DirectorOS-Pipeline/1.0 (E2E; dev@director-os.local)",
-             "-o", str(DEFAULT_SOURCE), DOWNLOAD_URL],
+            [
+                "curl",
+                "-sL",
+                "--retry",
+                "5",
+                "--retry-all-errors",
+                "-A",
+                "DirectorOS-Pipeline/1.0 (E2E; dev@director-os.local)",
+                "-o",
+                str(DEFAULT_SOURCE),
+                DOWNLOAD_URL,
+            ],
             check=True,
         )
     return src
@@ -83,9 +92,21 @@ def cut_segment(src: Path, start: float, dur: float, dest: Path) -> Path:
     """Stream-copy cut (keyframe-snapped): fast, keeps real pixels untouched."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-ss", f"{start:.2f}", "-i", str(src), "-t", f"{dur:.2f}",
-        "-c", "copy", "-avoid_negative_ts", "make_zero", str(dest),
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{start:.2f}",
+        "-i",
+        str(src),
+        "-t",
+        f"{dur:.2f}",
+        "-c",
+        "copy",
+        "-avoid_negative_ts",
+        "make_zero",
+        str(dest),
     ]
     subprocess.run(cmd, check=True, capture_output=True)
     return dest
@@ -98,9 +119,22 @@ def make_transcribe(settings) -> object:
     def transcribe(path: Path, asset_id: str) -> Transcript:
         wav = Path(path).with_suffix(".asr.wav")
         subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(path),
-             "-vn", "-ac", "1", "-ar", "16000", str(wav)],
-            check=True, capture_output=True,
+            [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-i",
+                str(path),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                str(wav),
+            ],
+            check=True,
+            capture_output=True,
         )
         size_mb = wav.stat().st_size / 1e6
         print(f"  [asr] uploading {size_mb:.1f} MB 16k mono wav to Gladia...")
@@ -160,10 +194,27 @@ def burn_subtitles(master: Path, ass_path: Path, dest: Path) -> Path:
     escaped = str(ass_path).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
     vf = f"ass='{escaped}'"
     subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(master),
-         "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-         "-c:a", "copy", str(dest)],
-        check=True, capture_output=True,
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            str(master),
+            "-vf",
+            vf,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-c:a",
+            "copy",
+            str(dest),
+        ],
+        check=True,
+        capture_output=True,
     )
     return dest
 
@@ -174,8 +225,10 @@ def main() -> int:
 
     src = ensure_source(Path(args.source))
     info = probe(src)
-    print(f"[source] {src.name}: {info.duration_s:.1f}s {info.width}x{info.height}@{info.fps:.2f} "
-          f"({src.stat().st_size / 1e6:.0f} MB)")
+    print(
+        f"[source] {src.name}: {info.duration_s:.1f}s {info.width}x{info.height}@{info.fps:.2f} "
+        f"({src.stat().st_size / 1e6:.0f} MB)"
+    )
 
     if args.full:
         segment = src
