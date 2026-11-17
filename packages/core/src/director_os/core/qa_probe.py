@@ -1,7 +1,8 @@
 """FFprobe-based QA probe — the deterministic half of qa.audit_technical (PLAN §3.3G).
 
 Also owns the *probe side* of the audio law (ADR-0005): a rendered file that is not
-48 kHz stereo is a failed render, full stop.
+48 kHz stereo is a failed render, full stop. Speech-gated loudness (issue #15)
+rides here too: RMS measured strictly on ASR spoken-word intervals.
 """
 
 from __future__ import annotations
@@ -159,11 +160,17 @@ def audit_technical(
     expected_dur_s: float | None = None,
     max_black_seconds: float = 3.0,
     duration_tolerance: float = 1.0,
+    speech_intervals: list[tuple[float, float]] | None = None,
+    speech_lo_dbfs: float = -12.0,
+    speech_hi_dbfs: float = -6.0,
 ) -> AuditReport:
     """Deterministic technical QA of a rendered master (the `qa` pipeline stage).
 
     Gates: playable streams present, the 48 kHz stereo audio law, black-frame
-    budget, and (when a target is given) duration drift vs. the compiled DAG.
+    budget, (when a target is given) duration drift vs. the compiled DAG, and
+    (when ASR speech intervals are given) speech-gated loudness — dialogue RMS
+    measured ONLY on spoken spans must sit inside the -12..-6 dBFS window so
+    sirens and slams cannot skew the meter (issue #15).
     """
     path = Path(path)
     checks: list[AuditCheck] = []
@@ -213,6 +220,27 @@ def audit_technical(
                 f"(drift {drift:.2f}s, tol {duration_tolerance:.2f}s)",
             )
         )
+
+    if speech_intervals:
+        try:
+            # soft import keeps core standalone-installable without audio_engine
+            from director_os.audio_engine.leveling import check_speech_window, measure_speech_levels
+
+            levels = measure_speech_levels(path, speech_intervals)
+            speech_db = levels["speech_rms_dbfs"]
+            ok = check_speech_window(speech_db, speech_lo_dbfs, speech_hi_dbfs)
+            checks.append(
+                AuditCheck(
+                    name="speech_gated_loudness",
+                    ok=ok,
+                    detail=(
+                        f"speech RMS {speech_db:.1f} dBFS (window {speech_lo_dbfs:g}..{speech_hi_dbfs:g}), "
+                        f"file RMS {levels['file_rms_dbfs']:.1f} — siren does not skew the meter"
+                    ),
+                )
+            )
+        except Exception as e:
+            checks.append(AuditCheck(name="speech_gated_loudness", ok=False, detail=str(e)))
 
     return AuditReport(path=str(path), ok=all(c.ok for c in checks), checks=checks)
 
