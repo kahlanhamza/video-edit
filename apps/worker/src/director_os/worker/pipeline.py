@@ -67,6 +67,9 @@ class PipelineDeps:
     video: VideoRenderSpec = field(default_factory=VideoRenderSpec)
     audio: AudioRenderSpec = field(default_factory=AudioRenderSpec)
     max_workers: int | None = None
+    # --- M4 vision stack (all optional; None/False keeps the CPU-only pipeline)
+    redact_backend: str | None = None  # "yunet" (CPU, offline) | "modal" (GPU fleet)
+    vision_enrich: bool = False  # frame-quality score + VLM timeline + timestamp OCR
     log: Callable[[str], None] = lambda _msg: None
 
 
@@ -176,6 +179,181 @@ def stage_perception(asset_id: str, source: Path, project_id: str, deps: Pipelin
     return payload
 
 
+def stage_redaction(
+    asset_id: str, source: Path, project_id: str, deps: PipelineDeps, max_regions: int = 8
+) -> list:
+    """Auto-detect redaction regions — idempotent, pluggable backend (M4).
+
+    backend "modal": YOLOv8-face + plate + ByteTrack on the serverless GPU fleet
+    (persistent Person/Plate IDs, time-binned tracked regions). backend "yunet":
+    the zero-download CPU sweep used since the first real-footage run. Both write
+    the same `redaction_tracks_json.regions` contract the studio canvas and the
+    renderer already consume, so a region the backend fails to produce is a
+    skipped stage, never a broken pipeline.
+    """
+    with deps.sessions() as s:
+        row = s.get(PerceptionIndexRow, asset_id)
+        existing = (row.redaction_tracks_json or {}).get("regions") if row else None
+        if existing:
+            deps.log(f"  [redaction] {len(existing)} region(s) already persisted — skip sweep")
+            return existing
+        asset = s.get(MediaAssetRow, asset_id)
+    frame_w = int(asset.width or 0)
+    frame_h = int(asset.height or 0)
+    if frame_w <= 0 or frame_h <= 0:
+        deps.log("  [redaction] asset geometry unknown — skipping auto sweep")
+        return []
+
+    backend = deps.redact_backend or "yunet"
+    if backend == "modal":
+        from director_os.perception.modal_redact import (
+            ModalRedactError,
+            parse_tracks_payload,
+            redact_video_modal,
+            tracks_to_regions,
+        )
+
+        try:
+            payload = redact_video_modal(str(source))
+            tracks = parse_tracks_payload(payload)
+            regions = tracks_to_regions(tracks, frame_w, frame_h)
+            geo = payload.get("video", {})
+            source_tag = "modal_yolo_bytetrack"
+            stats = {"tracks": len(tracks), "gpu_video": geo}
+        except ModalRedactError as e:
+            deps.log(f"  [redaction] Modal fleet unavailable ({e}) — falling back to YuNet")
+            backend = "yunet"
+
+    if backend == "yunet":
+        from director_os.perception.faces import cluster_to_regions, detect_faces
+
+        sweep = detect_faces(str(source), sample_every_s=1.0)
+        regions = cluster_to_regions(
+            sweep, max_regions=max_regions, frame_w=frame_w, frame_h=frame_h
+        )
+        source_tag = f"yunet_autodetect:{sweep.stats.detector}"
+        stats = {
+            "frames_sampled": sweep.stats.frames_sampled,
+            "detections": sweep.stats.detections,
+        }
+
+    payload_json = {
+        "regions": [r.model_dump(mode="json") for r in regions],
+        "source": source_tag,
+        "stats": stats,
+    }
+    with deps.sessions() as s:
+        row = s.get(PerceptionIndexRow, asset_id)
+        if row is None:
+            row = PerceptionIndexRow(asset_id=asset_id)
+            s.add(row)
+        # fresh rows hold None until flush (SQL column default applies at INSERT)
+        row.redaction_tracks_json = {**(row.redaction_tracks_json or {}), **payload_json}
+        s.commit()
+    deps.log(
+        f"  [redaction] {len(regions)} region(s) via {source_tag} "
+        f"({', '.join(sorted({r.track_id or 'box' for r in regions}))[:4]}...)"
+    )
+    return payload_json["regions"]
+
+
+def stage_vision_enrichment(asset_id: str, source: Path, deps: PipelineDeps) -> None:
+    """M4 vision stack enrichment — every product optional, every failure soft.
+
+    Persists into the existing free-form JSON columns (no migration):
+    - `shots_json["frame_quality"]`    — CPU blur/darkness pre-filter (always on)
+    - `shots_json["visual_timeline"]`  — lite-tier contact-sheet indexing (needs key)
+    - `redaction_tracks_json["timestamp_ocr"]` — AXON overlay OCR (needs key/fleet)
+    """
+    from dataclasses import asdict
+
+    with deps.sessions() as s:
+        row = s.get(PerceptionIndexRow, asset_id)
+        if row is None:
+            row = PerceptionIndexRow(asset_id=asset_id)
+            s.add(row)
+        shots = dict(row.shots_json or {})
+        red = dict(row.redaction_tracks_json or {})
+
+    if "frame_quality" not in shots:
+        try:
+            from director_os.perception.frame_quality import score_frame_quality
+
+            report = score_frame_quality(str(source), sample_every_s=2.0)
+            shots["frame_quality"] = {
+                "sample_every_s": report.sample_every_s,
+                "usable_ratio": round(report.usable_ratio, 3),
+                "unusable_spans": [
+                    [round(a, 2), round(b, 2)] for a, b in report.unusable_spans
+                ],
+                "frames": [asdict(f) for f in report.frames[:600]],
+            }
+            deps.log(
+                f"  [vision] frame quality: {report.usable_ratio:.0%} usable, "
+                f"{len(report.unusable_spans)} bad span(s)"
+            )
+        except Exception as e:  # noqa: BLE001 — enrichment never kills the pipeline
+            deps.log(f"  [vision] frame quality skipped: {e}")
+
+    if deps.settings.vision_api_key:
+        if "visual_timeline" not in shots:
+            try:
+                from director_os.perception.vision_index import (
+                    build_contact_sheets,
+                    index_timeline,
+                    make_vision_clients,
+                )
+
+                sheets_dir = deps.settings.output_dir / "pipeline" / asset_id / "sheets"
+                sheets = build_contact_sheets(str(source), sheets_dir, window_s=30.0)
+                index_adapter, _ = make_vision_clients(deps.settings.vision_api_key)
+                insights = index_timeline(index_adapter, sheets, window_s=30.0)
+                shots["visual_timeline"] = {
+                    "model": index_adapter._client.model  # type: ignore[attr-defined]
+                    if hasattr(index_adapter._client, "model")
+                    else "fake",
+                    "sheets": len(sheets),
+                    "insights": [i.model_dump(mode="json") for i in insights],
+                }
+                deps.log(
+                    f"  [vision] timeline indexed: {len(sheets)} sheet(s) -> "
+                    f"{len(insights)} insight(s)"
+                )
+            except Exception as e:  # noqa: BLE001
+                deps.log(f"  [vision] contact-sheet indexing skipped: {e}")
+
+        if "timestamp_ocr" not in red:
+            try:
+                from director_os.perception.timestamp_ocr import read_bodycam_timestamp
+                from director_os.perception.vision import GeminiVisionClient
+
+                client = GeminiVisionClient(deps.settings.vision_api_key)
+                stamp = read_bodycam_timestamp(str(source), backend="gemini", client=client)
+                if stamp is not None:
+                    red["timestamp_ocr"] = {
+                        "raw_text": stamp.raw_text,
+                        "iso": stamp.iso,
+                        "device": stamp.device,
+                        "tz": stamp.tz,
+                        "confidence": stamp.confidence,
+                    }
+                    deps.log(f"  [vision] overlay OCR: {stamp.iso} ({stamp.device})")
+                else:
+                    red["timestamp_ocr"] = {"found": False}
+                    deps.log("  [vision] overlay OCR: no timestamp found")
+            except Exception as e:  # noqa: BLE001
+                deps.log(f"  [vision] timestamp OCR skipped: {e}")
+
+    with deps.sessions() as s:
+        row = s.get(PerceptionIndexRow, asset_id)
+        if row is None:
+            row = PerceptionIndexRow(asset_id=asset_id)
+            s.add(row)
+        row.shots_json = shots
+        row.redaction_tracks_json = red
+        s.commit()
+
+
 def stage_planning(
     asset_id: str, transcript: dict, project_id: str, deps: PipelineDeps
 ) -> tuple[Any, int]:
@@ -206,6 +384,17 @@ def stage_planning(
     n_segments = max(1, math.ceil(dur / AUTO_CUT_MAX_SEGMENT_S))
     seg_len = dur / n_segments
 
+    # M4: the AXON overlay OCR populates the intro card when the vision stack
+    # read one (e.g. "AXON BODY 3 — 2022-07-04T18:11:55-04:00"); otherwise the
+    # deterministic v1 subtitle stays.
+    card_fields = {"title": "CASE FILE", "subtitle": "DirectorOS auto-cut v1"}
+    with deps.sessions() as s:
+        prow = s.get(PerceptionIndexRow, asset_id)
+        ocr = (prow.redaction_tracks_json or {}).get("timestamp_ocr") if prow else None
+        if ocr and ocr.get("iso"):
+            device = ocr.get("device") or "BODYCAM"
+            card_fields["subtitle"] = f"{device} — {ocr['iso']}"
+
     master_items: list[ClipSpec | GapSpec] = [
         ClipSpec(
             name=f"raw_{i + 1}",
@@ -222,10 +411,7 @@ def stage_planning(
                 name="card_location",
                 source_start_s=0.0,
                 dur_s=3.0,
-                meta=CardMeta(
-                    template="location_intro",
-                    fields={"title": "CASE FILE", "subtitle": "DirectorOS auto-cut v1"},
-                ),
+                meta=CardMeta(template="location_intro", fields=card_fields),
             )
         )
 
@@ -339,7 +525,8 @@ def _project_redaction_regions(sessions: Any, asset_id: str) -> list[BlurRegion]
 
     Tolerant reader: the studio API persists the flat studio shape
     ({x, y, w, h, sigma, id, ...}); the canonical BlurRegion shape
-    ({bbox: {x, y, w, h}, scope, mode}) is accepted too. A region that
+    ({bbox: {x, y, w, h}, scope, mode}) is accepted too, including the tracked
+    (t_start_s/t_end_s) windows the Modal ByteTrack sweep writes. A region that
     fails validation is skipped, never fatal to the render.
     """
     from director_os.core.models import BBox
@@ -361,7 +548,9 @@ def _project_redaction_regions(sessions: Any, asset_id: str) -> list[BlurRegion]
                     ),
                     mode=item.get("mode", "static"),
                     sigma=int(item.get("sigma", 24)),
-                    track_id=item.get("id"),
+                    track_id=item.get("id") or item.get("track_id"),
+                    t_start_s=item.get("t_start_s"),
+                    t_end_s=item.get("t_end_s"),
                 )
             )
         except (TypeError, ValueError):
@@ -457,8 +646,15 @@ def run_pipeline(
         _update_job(deps.sessions(), job_id, JobStage.ingest, 5.0)
         asset_id = stage_ingest(source, project_id, deps)
 
+        if deps.redact_backend:
+            _update_job(deps.sessions(), job_id, JobStage.redaction, 15.0)
+            stage_redaction(asset_id, source, project_id, deps)
+
         _update_job(deps.sessions(), job_id, JobStage.perception, 25.0)
         transcript = stage_perception(asset_id, source, project_id, deps)
+
+        if deps.vision_enrich:
+            stage_vision_enrichment(asset_id, source, deps)
 
         _update_job(deps.sessions(), job_id, JobStage.planning, 45.0)
         timeline, version = stage_planning(asset_id, transcript, project_id, deps)

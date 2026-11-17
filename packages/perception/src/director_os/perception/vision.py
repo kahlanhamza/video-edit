@@ -98,9 +98,10 @@ class GeminiVisionClient:
     def __init__(
         self,
         api_key: str,
-        model: str = "gemini-2.5-flash",
+        model: str = "gemini-3.5-flash-lite",
         base_url: str = "https://generativelanguage.googleapis.com",
         transport: httpx.BaseTransport | None = None,
+        modal_egress: bool = True,
     ):
         if not api_key:
             raise VisionError("GeminiVisionClient requires VISION_API_KEY")
@@ -109,12 +110,17 @@ class GeminiVisionClient:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.last_usage: dict[str, int] | None = None
+        # Some datacenter regions are geo-blocked by the Generative Language API
+        # (400 FAILED_PRECONDITION "User location is not supported"). When that
+        # happens and MODAL_TOKEN_* exist, the call retries through the deployed
+        # Modal fleet's `vlm_call` (US/EU egress) and the decision sticks.
+        self.modal_egress = modal_egress
+        self._egress_active: str = "direct"
 
     def analyze(self, question: str, frames: Sequence[FrameRef]) -> list[SceneInsight]:
         import base64
         import json as _json
 
-        import httpx
 
         parts: list[dict[str, Any]] = [
             {
@@ -134,18 +140,62 @@ class GeminiVisionClient:
                 {"text": f"frame at {f.timestamp_s}s:"},
             )
             parts.append({"inline_data": {"mime_type": mime, "data": data}})
+        body = {
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048},
+        }
+        data = self._post(body, _json)
+        return self._parse(data, frames)
+
+    def _post(self, body: dict[str, Any], _json: Any) -> dict[str, Any]:
+        import httpx
+
+        if self._egress_active == "modal":
+            return self._post_via_modal(body, _json)
         with httpx.Client(transport=self._transport, timeout=90.0) as client:
             r = client.post(
                 f"{self.base_url}/v1beta/models/{self.model}:generateContent",
                 headers={"x-goog-api-key": self.api_key},
-                json={
-                    "contents": [{"role": "user", "parts": parts}],
-                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048},
-                },
+                json=body,
             )
         if r.status_code != 200:
+            if self.modal_egress and "location is not supported" in r.text:
+                self._egress_active = "modal"
+                return self._post_via_modal(body, _json)
             raise VisionError(f"vision provider {r.status_code}: {r.text[:200]}")
-        data = r.json()
+        return r.json()
+
+    def _post_via_modal(self, body: dict[str, Any], _json: Any) -> dict[str, Any]:
+        import time as _time
+
+        from director_os.core.config import get_settings
+
+        settings = get_settings()
+        if not (settings.modal_token_id and settings.modal_token_secret):
+            raise VisionError(
+                "Gemini geo-blocked from this region and MODAL_TOKEN_ID/SECRET "
+                "not configured for fleet egress"
+            )
+        import modal
+
+        fn = modal.Function.from_name("directoros-vlm", "vlm_call")
+        payload = _json.dumps(body)
+        last_status, last_body = None, ""
+        for attempt in range(3):  # 503/429 demand spikes are transient — back off and retry
+            out = fn.remote(model=self.model, payload_json=payload)
+            last_status, last_body = int(out.get("status", 0)), str(out.get("body", ""))
+            if last_status == 200:
+                return _json.loads(last_body)
+            if last_status not in (429, 500, 503):
+                break
+            _time.sleep(4.0 * (attempt + 1))
+        raise VisionError(
+            f"vision provider via modal egress {last_status}: {last_body[:200]}"
+        )
+
+    def _parse(self, data: dict[str, Any], frames: Sequence[FrameRef]) -> list[SceneInsight]:
+        import json as _json
+
         usage = data.get("usageMetadata", {})
         self.last_usage = {
             "tokens_in": int(usage.get("promptTokenCount", 0)),
@@ -159,9 +209,10 @@ class GeminiVisionClient:
             if text.startswith("```"):
                 text = text.strip("`").removeprefix("json").strip()
             raw = _json.loads(text)
+            fallback_ts = frames[0].timestamp_s if frames else 0.0
             return [
                 SceneInsight(
-                    timestamp_s=float(i.get("timestamp_s", f.timestamp_s)),
+                    timestamp_s=float(i.get("timestamp_s", fallback_ts)),
                     kind=str(i.get("kind", "observation")),
                     description=str(i.get("description", ""))[:500],
                     confidence=float(i.get("confidence", 0.5)),

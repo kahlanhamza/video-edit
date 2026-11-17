@@ -1,14 +1,16 @@
 """Full e2e pipeline on REAL footage — no synthetic fixtures, no mocks.
 
 Takes a real source video (default: the Eustis FL bodycam file from Wikimedia
-Commons), cuts a working segment, sweeps it with the YuNet face detector,
-persists the consolidated blur regions as project redactions, then drives
+Commons), cuts a working segment, runs the M4 vision stack (redaction sweep +
+optional frame-quality/VLM-index/timestamp-OCR enrichment), then drives
 run_pipeline through every stage on real pixels and real speech:
 
   ingest (probe + 480p proxy + scrubsheet)
+  -> redaction sweep (yuNet CPU | Modal GPU YOLO+ByteTrack; idempotent)
   -> perception (LIVE Gladia v2 ASR with diarization)
-  -> planning (auto-cut v1)
-  -> render (segment cache + face/studio blur + location card + loudnorm)
+  -> vision enrichment (--vision: frame quality + contact-sheet indexing + AXON OCR)
+  -> planning (auto-cut v1; OCR populates the intro card when present)
+  -> render (segment cache + tracked/static blur + location card + loudnorm)
   -> subtitles (json/ass/srt from the real transcript)
   -> QA audit
   -> burn-in pass (speaker-colored .ass subtitles into the master)
@@ -17,7 +19,8 @@ Run from repo root with .env exported:
     set -a; . ./.env; set +a; uv run python scripts/e2e_real_video.py
 
 Options: --start/--dur (segment window, default 60s + 240s), --full (skip
-segmenting, use the whole source), --render WxH (default 1280x720).
+segmenting, use the whole source), --render WxH (default 1280x720),
+--redaction-backend yunet|modal|none, --vision (VLM enrichment when keys exist).
 """
 
 from __future__ import annotations
@@ -34,10 +37,14 @@ from director_os.core.config import get_settings  # noqa: E402
 from director_os.core.db import MediaAssetRow, PerceptionIndexRow, ProjectRow, new_id  # noqa: E402
 from director_os.core.qa_probe import probe  # noqa: E402
 from director_os.otio_engine.segment_cache import VideoRenderSpec  # noqa: E402
-from director_os.perception.faces import cluster_to_regions, detect_faces  # noqa: E402
 from director_os.perception.gladia import GladiaClient  # noqa: E402
 from director_os.perception.transcript import Transcript  # noqa: E402
-from director_os.worker.pipeline import PipelineDeps, make_deps, run_pipeline, stage_ingest  # noqa: E402
+from director_os.worker.pipeline import (  # noqa: E402
+    make_deps,
+    run_pipeline,
+    stage_ingest,
+    stage_redaction,
+)
 
 DEFAULT_SOURCE = REPO / "data" / "media" / "bodycam_eustis.webm"
 DOWNLOAD_URL = (
@@ -54,7 +61,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--full", action="store_true", help="use the whole source, no segment cut")
     p.add_argument("--render", default="1280x720", help="render geometry WxH")
     p.add_argument("--max-face-regions", type=int, default=6)
+    p.add_argument(
+        "--redaction-backend",
+        choices=("yunet", "modal", "none"),
+        default="yunet",
+        help="yuNet CPU sweep (offline) | Modal GPU YOLO-face+plate+ByteTrack | skip",
+    )
+    p.add_argument(
+        "--vision",
+        action="store_true",
+        help="vision enrichment: frame-quality scoring + VLM contact-sheet "
+        "indexing + AXON timestamp OCR (VLM parts need VISION_API_KEY)",
+    )
     p.add_argument("--skip-asr", action="store_true", help="reuse persisted transcript if any")
+    p.add_argument(
+        "--stub-asr",
+        action="store_true",
+        help="keyless smoke: empty transcript, real pixels/sweep/render (no Gladia)",
+    )
     p.add_argument(
         "--project-id",
         default=None,
@@ -143,50 +167,9 @@ def make_transcribe(settings) -> object:
     return transcribe
 
 
-def face_sweep_and_persist(
-    asset_id: str, segment: Path, deps: PipelineDeps, max_regions: int
-) -> int:
-    """YuNet sweep -> clustered BlurRegions -> perception_index.redaction_tracks_json.
-
-    Idempotent: existing regions short-circuit the sweep (the heavy part).
-    """
-    with deps.sessions() as s:
-        row = s.get(PerceptionIndexRow, asset_id)
-        if row is not None and (row.redaction_tracks_json or {}).get("regions"):
-            print("  [faces] redaction regions already persisted — skip sweep")
-            return len(row.redaction_tracks_json["regions"])
-
-    sweep = detect_faces(segment, sample_every_s=1.0)
-    print(
-        f"  [faces] detector={sweep.stats.detector} sampled={sweep.stats.frames_sampled} "
-        f"hits={sweep.stats.detections}"
-    )
-    info = probe(segment)
-    regions = cluster_to_regions(
-        sweep,
-        min_hits=3,
-        max_regions=max_regions,
-        frame_w=int(info.width or 1920),
-        frame_h=int(info.height or 1080),
-    )
-    print(f"  [faces] {len(regions)} consolidated region(s):")
-    for r in regions:
-        b = r.bbox
-        print(f"    - {r.track_id}: bbox=({b.x},{b.y},{b.w},{b.h}) sigma={r.sigma}")
-    with deps.sessions() as s:
-        row = s.get(PerceptionIndexRow, asset_id)
-        if row is None:
-            row = PerceptionIndexRow(asset_id=asset_id, transcript_json={"words": []})
-            s.add(row)
-        row.redaction_tracks_json = {
-            "regions": [r.model_dump(mode="json") for r in regions],
-            "source": f"yunet_autodetect:{sweep.stats.detector}",
-            "frames_sampled": sweep.stats.frames_sampled,
-        }
-        s.commit()
-    out = deps.settings.output_dir / "pipeline" / "face_sweep_debug.json"
-    out.write_text(sweep.model_dump_json(indent=2))
-    return len(regions)
+def _stub_transcribe(path: Path, asset_id: str) -> Transcript:
+    """Keyless smoke: empty transcript — everything else stays real."""
+    return Transcript(asset_id=asset_id, duration_s=probe(path).duration_s)
 
 
 def burn_subtitles(master: Path, ass_path: Path, dest: Path) -> Path:
@@ -242,8 +225,18 @@ def main() -> int:
     w, h = (int(x) for x in args.render.lower().split("x"))
     deps = make_deps(
         settings.database_url,
-        transcribe=None if args.skip_asr else make_transcribe(settings),
+        transcribe=(
+            None
+            if (args.skip_asr or args.stub_asr)
+            else (
+                _stub_transcribe
+                if getattr(args, "stub_asr", False)
+                else make_transcribe(settings)
+            )
+        ),
         video=VideoRenderSpec(w=w, h=h, fps=30),
+        redact_backend=None if args.redaction_backend == "none" else args.redaction_backend,
+        vision_enrich=args.vision,
         log=lambda m: print(m),
     )
 
@@ -261,13 +254,28 @@ def main() -> int:
             pid = project.id
         print(f"[project] {pid}")
 
-    # stage 1 up front so face regions can be persisted before the render stage
+    # stage 1 up front so the redaction sweep lands before the render stage
     asset_id = stage_ingest(segment, pid, deps)
-    n_regions = face_sweep_and_persist(asset_id, segment, deps, args.max_face_regions)
+    if args.redaction_backend != "none":
+        stage_redaction(asset_id, segment, pid, deps, max_regions=args.max_face_regions)
     with deps.sessions() as s:
         asset = s.get(MediaAssetRow, asset_id)
         assert asset is not None
+        prow = s.get(PerceptionIndexRow, asset_id)
+        red = (prow.redaction_tracks_json or {}) if prow else {}
+        n_regions = len(red.get("regions", []))
+        shots = (prow.shots_json or {}) if prow else {}
         print(f"[asset] {asset_id} {asset.width}x{asset.height} {asset.duration_s:.1f}s")
+        print(f"[redaction] backend={red.get('source', 'none')} regions={n_regions}")
+        if args.vision:
+            fq = shots.get("frame_quality") or {}
+            ocr = red.get("timestamp_ocr") or {}
+            vt = shots.get("visual_timeline") or {}
+            print(
+                f"[vision] quality={fq.get('usable_ratio', 'n/a')} "
+                f"timeline_insights={len(vt.get('insights', []))} "
+                f"ocr={ocr.get('iso', 'not found')}"
+            )
 
     result = run_pipeline(segment, pid, deps)
 
@@ -277,7 +285,7 @@ def main() -> int:
     print(f"otio ver:  {result.otio_version}")
     print(f"final:     {result.final_path} ({result.final_path.stat().st_size / 1e6:.1f} MB)")
     print(f"render:    {result.render.rendered} rendered / {result.render.cached} cached")
-    print(f"face blur regions applied: {n_regions}")
+    print(f"redaction regions applied: {n_regions}")
     print(f"audit ok:  {result.audit.ok}")
     for c in result.audit.checks:
         print(f"  - {c.name}: {c.detail}")

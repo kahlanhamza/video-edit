@@ -1,8 +1,12 @@
 """Privacy redaction — blur filter chains for faces, plates and corner watermarks.
 
-M1 ships deterministic static-region blur chains for the CPU renderer. Tracked
-(YOLO + ByteTrack) regions arrive in M4 and feed the same chain builder with
-per-frame boxes; the FFmpeg-side contract does not change.
+M1 shipped deterministic static-region blur chains. M4 closes the tracked loop:
+Modal GPU (YOLO-face + plate + ByteTrack) produces regions with persistent track
+IDs and SOURCE-footage time windows; `clip_region_time` maps those windows into
+per-segment local time and `build_blur_chain` gates each overlay with an FFmpeg
+`enable=between(t,...)` window — so blur boxes appear, follow and disappear with
+their object instead of smearing the whole timeline. The FFmpeg-side contract
+(crop+boxblur+overlay) does not change.
 """
 
 from __future__ import annotations
@@ -64,6 +68,26 @@ def scale_region(region: BlurRegion, from_w: int, from_h: int, to_w: int, to_h: 
     return region.model_copy(update={"bbox": scale_bbox(region.bbox, from_w, from_h, to_w, to_h)})
 
 
+def clip_region_time(
+    region: BlurRegion, seg_start_s: float, seg_dur_s: float
+) -> BlurRegion | None:
+    """Translate a region's source-time window into one segment's LOCAL time.
+
+    Region time bounds are absolute source-footage seconds; every segment renders
+    a trim of that footage and the filtergraph `t` clock restarts at 0 per
+    segment. Returns None when the window does not intersect the segment at all.
+    Untimed (static) regions pass through unchanged.
+    """
+    if region.t_start_s is None and region.t_end_s is None:
+        return region
+    lo = 0.0 if region.t_start_s is None else region.t_start_s - seg_start_s
+    hi = seg_dur_s if region.t_end_s is None else region.t_end_s - seg_start_s
+    lo, hi = max(lo, 0.0), min(hi, seg_dur_s)
+    if hi - lo < 0.05:  # sub-frame overlap — not worth an overlay node
+        return None
+    return region.model_copy(update={"t_start_s": round(lo, 3), "t_end_s": round(hi, 3)})
+
+
 def _safe_sigmas(sigma: int, box_w: int, box_h: int) -> tuple[int, int]:
     """boxblur radius must be < half the plane size — luma AND chroma planes differ
     on yuv420p (chroma is half-res), so clamp them independently."""
@@ -83,14 +107,17 @@ def build_blur_chain(
 
     `in_label`/`out_label` include brackets, e.g. `"[v0]"`, `"[vblur]"`.
     """
-    usable: list[tuple[int, int, int, int, int, int]] = []
+    usable: list[tuple[int, int, int, int, int, int, str]] = []
     for r in regions:
         box = _clamp_region(r, frame_w, frame_h)
         if box is None:
             continue
         x, y, w, h = box
         luma, chroma = _safe_sigmas(r.sigma, w, h)
-        usable.append((x, y, w, h, luma, chroma))
+        enable = ""
+        if r.t_start_s is not None and r.t_end_s is not None:
+            enable = f":enable='between(t,{r.t_start_s:.2f},{r.t_end_s:.2f})'"
+        usable.append((x, y, w, h, luma, chroma, enable))
     if not usable:
         return f"{in_label}null{out_label}"
 
@@ -98,14 +125,14 @@ def build_blur_chain(
     split_outs = "".join(f"[sp{i}]" for i in range(n + 1))
     parts = [f"{in_label}split={n + 1}{split_outs}"]
     cur = "[sp0]"
-    for i, (x, y, w, h, luma, chroma) in enumerate(usable):
+    for i, (x, y, w, h, luma, chroma, enable) in enumerate(usable):
         parts.append(
             f"[sp{i + 1}]crop={w}:{h}:{x}:{y},"
             f"boxblur=luma_radius={luma}:luma_power=2:"
             f"chroma_radius={chroma}:chroma_power=2[rg{i}]"
         )
         out = out_label if i == n - 1 else f"[ov{i}]"
-        parts.append(f"{cur}[rg{i}]overlay={x}:{y}{out}")
+        parts.append(f"{cur}[rg{i}]overlay={x}:{y}{enable}{out}")
         cur = f"[ov{i}]"
     return ";".join(parts)
 

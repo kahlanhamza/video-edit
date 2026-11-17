@@ -37,7 +37,7 @@ from director_os.otio_engine.timeline import (
     track_by_name,
 )
 from director_os.vision_fx.cards import pick_corner, render_card
-from director_os.vision_fx.redact import scale_bbox, scale_region
+from director_os.vision_fx.redact import clip_region_time, scale_bbox, scale_region
 from director_os.vision_fx.spotlight import render_spotlight_overlay
 
 
@@ -155,6 +155,14 @@ def compile_timeline(
                 # detector sweep) — the renderer blurs AFTER scale+pad, so map
                 # them into render space or they land in the wrong place
                 blur = [scale_region(r, raw_geo[0], raw_geo[1], video.w, video.h) for r in blur]
+            # tracked regions carry SOURCE-footage time windows: translate them
+            # into this segment's local clock (or drop segments they miss) so
+            # the blur only appears while the tracked object is actually on screen
+            blur = [
+                clipped
+                for clipped in (clip_region_time(r, start_s, dur) for r in blur)
+                if clipped is not None
+            ]
             freeze = None
             spotlight_png = None
             if meta.freeze_callout is not None:

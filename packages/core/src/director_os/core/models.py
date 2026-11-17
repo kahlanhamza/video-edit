@@ -89,13 +89,20 @@ class BBox(BaseModel):
 
 
 class BlurRegion(BaseModel):
-    """Privacy/watermark redaction spec (consumed by vision_fx filter builder)."""
+    """Privacy/watermark redaction spec (consumed by vision_fx filter builder).
+
+    Optional `t_start_s`/`t_end_s` bound the region to a SOURCE-footage time
+    window — tracked ByteTrack outputs produce one region per time bin. None
+    on both = active for the whole timeline (static studio/detector boxes).
+    """
 
     scope: Literal["global", "clip", "range"] = "global"
     bbox: BBox
     mode: Literal["static", "tracked"] = "static"
     sigma: int = Field(default=24, ge=1, le=200)
     track_id: str | None = None
+    t_start_s: float | None = Field(default=None, ge=0.0)
+    t_end_s: float | None = Field(default=None, ge=0.0)
 
 
 class ZoomKeyframe(BaseModel):
