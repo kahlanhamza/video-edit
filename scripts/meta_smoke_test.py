@@ -21,6 +21,29 @@ from director_os.agent_runtime.meta import META_DEFAULT_BASE, SpendLedger, estim
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# Signature: Bearer auth succeeds (200 on /models, 401 without the header) but
+# the listing is empty and every model id returns 404 `model_not_found` —
+# docs (Error handling): that is "the model does not exist OR the team does
+# not have access", confirmed absent (a transient backend outage returns 503
+# instead). It is NOT a billing error (that is 402 `billing_not_configured`)
+# and NOT an auth error (401). Server-side entitlement: the team that owns the
+# key has zero Model API model grants.
+ENTITLEMENT_HELP = """\
+  ENTITLEMENT SIGNATURE: key is valid but its team has zero Model API model
+  grants (200 with empty /models + 404 model_not_found on every id, both
+  /chat/completions and /responses). Code side is correct; fix on the account:
+    1. Open dev.meta.ai from the SAME team/project that holds the ~$20 credits
+       (docs URL carries team_id/project_id) and create a NEW API key there —
+       a key minted under a different (default) team inherits that team's zero
+       entitlements. Swap it into .env as LLM_API_KEY and re-run.
+    2. Check that team's dashboard for a Billing/Usage tab: Muse Code
+       subscription credits do NOT bill Model API pay-as-you-go — the Model API
+       balance/payment method must exist for the SAME team.
+    3. If there is no Billing tab at all, Model API pay-as-you-go is not yet
+       self-serve for this account — use Contact Sales / waitlist access.
+  Nothing in the repo needs to change: once the key sees models, re-run this
+  script and the pipeline goes live with muse-ember-1.0 + spend guard."""
+
 
 def load_env() -> None:
     """Parse .env into os.environ without overriding existing vars."""
@@ -94,10 +117,7 @@ def main() -> int:
             listing = models.json().get("data", []) if models.status_code == 200 else []
             print(f"  /models -> {models.status_code}, {len(listing)} model(s) for this key")
             if not listing:
-                print(
-                    "  WARNING: key sees no models. In dev.meta.ai (team/project dashboard) "
-                    "enable Model API models + attach pay-as-you-go billing, then re-run."
-                )
+                print(ENTITLEMENT_HELP)
 
             tools = [
                 {
@@ -132,10 +152,7 @@ def main() -> int:
             total += report("chat.tools", data_tools, model, ledger)
     except httpx.HTTPStatusError as e:
         print(f"  FAILED: {e.response.status_code}: {e.response.text[:200]}")
-        print(
-            "  Fix in the dev.meta.ai dashboard: enable the Model API models for this "
-            "team/project and attach the pay-as-you-go billing / credits, then re-run."
-        )
+        print(ENTITLEMENT_HELP)
         return 1
 
     print(f"cumulative ledger total: ${ledger.total_usd():.6f} (this run ${total:.6f})")
