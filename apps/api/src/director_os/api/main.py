@@ -874,3 +874,76 @@ def ingest_url(project_id: str, body: IngestRequest) -> IngestResponse:
             "start the worker fleet to advance"
         )
     return IngestResponse(job_id=job_id, source_path=str(source), enqueued=enqueued, detail=detail)
+
+
+# ------------------------------------------------------- approve & render gate
+class ApproveResponse(BaseModel):
+    ok: bool
+    job_id: str
+    status: str
+    version: int | None = None
+    enqueued: bool
+    detail: str
+
+
+@app.post("/projects/{project_id}/approve", response_model=ApproveResponse, status_code=202)
+def approve_project(project_id: str) -> ApproveResponse:
+    """Human gate (M3): approve the reviewed cut -> re-render ONLY dirty segments.
+
+    Requires `awaiting_review` (QA passed, studio edits done through
+    agent/dispatch + PATCH subtitles + drawn redactions, which advance the
+    ACTIVE timeline version). The approve job re-runs the idempotent pipeline:
+    planning reuses the active version pointer and the content-addressed
+    segment cache serves every unchanged segment — cache misses (the dirty
+    segments) are the only render work paid for. The browser watches the
+    returned `job_id` over SSE exactly like an ingest job.
+    """
+    s = session()
+    try:
+        project = s.get(ProjectRow, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        if project.active_otio_version_id is None:
+            raise HTTPException(
+                status_code=422, detail="project has no timeline yet — run the pipeline first"
+            )
+        if project.status != ProjectStatus.awaiting_review.value:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"project status is '{project.status}' — the approve gate opens at "
+                    "'awaiting_review' (run the pipeline to QA-pass first)"
+                ),
+            )
+        asset = _primary_asset(s, project_id)
+        source = asset.source_url
+        if not source:
+            raise HTTPException(status_code=422, detail="asset has no source path")
+        project.status = ProjectStatus.approved.value
+        job = JobRow(project_id=project_id, current_stage="render", progress_pct=0.0)
+        s.add(job)
+        s.commit()
+        job_id = job.id
+        version = project.active_otio_version_id
+    finally:
+        s.close()
+
+    enqueued, detail = False, "approve job queued — worker fleet will advance it"
+    try:
+        from director_os.worker.celery_app import celery_app
+
+        celery_app.send_task(
+            "directoros.advance_job",
+            args=[job_id, project_id, source, get_settings().database_url],
+            retry=False,
+        )
+        enqueued = True
+        detail = "approved — re-render queued on the worker fleet (cache hits are free)"
+    except Exception as e:  # broker down / worker package absent: stays queued
+        detail = (
+            f"approve job queued — fleet enqueue failed ({type(e).__name__}); "
+            "start the worker fleet to advance"
+        )
+    return ApproveResponse(
+        ok=True, job_id=job_id, status="approved", version=version, enqueued=enqueued, detail=detail
+    )
