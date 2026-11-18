@@ -26,21 +26,29 @@ provider-agnostic:
      (not "Gemini API", a known GCP dropdown trap).
 - `OpenAICompatBackend` — any OpenAI-compatible `/chat/completions` endpoint
   (vLLM, OpenRouter, GLM, a Gemini-to-OpenAI gateway) via `LLM_BASE_URL`.
+- `MetaModelBackend` (`meta.py`) — Meta Model API (Muse) at `api.meta.ai`:
+  same wire shape plus cached-token parsing, USD cost estimation, a persistent
+  spend ledger and a hard budget cap. Selected when the base URL host is
+  `api.meta.ai` or `LLM_PROVIDER=meta`.
 
-`build_backend()` picks per env: `LLM_BASE_URL` set -> OpenAI-compatible;
-blank -> native Gemini. No heavyweight SDK: httpx only, so CI stays hermetic
-(`ScriptedBackend` covers offline tests).
+`build_backend()` picks per env: `LLM_BASE_URL` set -> OpenAI-compatible
+(Meta-flavoured when it points at api.meta.ai); blank -> native Gemini.
+No heavyweight SDK: httpx only, so CI stays hermetic (`ScriptedBackend`
+covers offline tests).
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from director_os.agent_runtime.agents import AgentRole, ToolStep
 from director_os.agent_runtime.prompting import compose_agent_prompt
 from director_os.agent_runtime.registry import ToolRegistry
+
+if TYPE_CHECKING:
+    from director_os.agent_runtime.meta import MetaModelBackend
 
 GEMINI_DEFAULT_BASE = "https://generativelanguage.googleapis.com"
 PROPOSE_TIMEOUT_S = 90.0
@@ -246,7 +254,7 @@ class OpenAICompatBackend:
         self.last_usage: dict[str, int] | None = None
         self.last_system_prompt = ""
 
-    def propose(self, state_summary: str, role: AgentRole) -> list[ToolStep]:
+    def _payload(self, state_summary: str, role: AgentRole) -> dict[str, Any]:
         self.last_system_prompt = compose_agent_prompt(
             agent=f"{role}_agent",
             role=role,
@@ -254,7 +262,7 @@ class OpenAICompatBackend:
             state_summary=state_summary,
             registry=self.registry,
         )
-        payload = {
+        return {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": self.last_system_prompt},
@@ -270,20 +278,39 @@ class OpenAICompatBackend:
             "tool_choice": "auto",
             "temperature": 0.4,
         }
+
+    def _extra_payload(self) -> dict[str, Any]:
+        """Provider-optional request fields (merged after the vanilla payload)."""
+        return {}
+
+    def _absorb_usage(self, usage: dict[str, Any]) -> None:
+        """Extract token accounting from the response usage object."""
+        self.last_usage = {
+            "tokens_in": int(usage.get("prompt_tokens", 0)),
+            "tokens_out": int(usage.get("completion_tokens", 0)),
+        }
+
+    def propose(self, state_summary: str, role: AgentRole) -> list[ToolStep]:
+        payload = self._payload(state_summary, role)
+        extras = self._extra_payload()
+        payload.update(extras)
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         try:
             with httpx.Client(transport=self._transport, timeout=PROPOSE_TIMEOUT_S) as client:
                 r = client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
+                if r.status_code == 400 and extras:
+                    # a provider rejected an optional extra (e.g. a reasoning-effort
+                    # naming variant): retry once with the vanilla payload
+                    vanilla = {k: v for k, v in payload.items() if k not in extras}
+                    r = client.post(
+                        f"{self.base_url}/chat/completions", headers=headers, json=vanilla
+                    )
         except httpx.HTTPError as e:
             raise LLMBackendError(f"openai-compat request failed: {e}") from e
         if r.status_code != 200:
             raise LLMBackendError(f"openai-compat {r.status_code}: {r.text[:300]}")
         data = r.json()
-        usage = data.get("usage", {})
-        self.last_usage = {
-            "tokens_in": int(usage.get("prompt_tokens", 0)),
-            "tokens_out": int(usage.get("completion_tokens", 0)),
-        }
+        self._absorb_usage(data.get("usage", {}))
         msg = data.get("choices", [{}])[0].get("message", {})
         steps: list[ToolStep] = []
         known = self.registry.names()
@@ -315,19 +342,23 @@ def build_backend(
     llm_api_key: str = "",
     llm_base_url: str = "",
     llm_model: str = "",
+    llm_provider: str = "",
 ) -> GeminiRestBackend | OpenAICompatBackend:
     """Env-driven provider choice (ADR: config is data).
 
-    LLM_BASE_URL non-blank -> OpenAI-compatible gateway; blank -> native Gemini
-    SDK endpoint. Raises (not falls back) when unconfigured — callers decide
-    whether to degrade to ScriptedBackend.
+    LLM_BASE_URL non-blank -> OpenAI-compatible gateway (Meta-flavoured when
+    the host is api.meta.ai or LLM_PROVIDER=meta); blank -> native Gemini SDK
+    endpoint (or Meta when LLM_PROVIDER=meta). Raises (not falls back) when
+    unconfigured — callers decide whether to degrade to ScriptedBackend.
     """
+    from director_os.agent_runtime.meta import META_DEFAULT_BASE
     from director_os.core.config import get_settings
 
     s = get_settings()
     api_key = llm_api_key or s.llm_api_key
     base_url = (llm_base_url or s.llm_base_url).strip()
     model = llm_model or s.llm_model
+    provider = (llm_provider or s.llm_provider).strip().lower()
     if not api_key:
         raise LLMBackendError(
             "LLM not configured: set LLM_API_KEY (and optionally LLM_BASE_URL/LLM_MODEL)"
@@ -335,5 +366,36 @@ def build_backend(
     if not model:
         raise LLMBackendError("LLM_MODEL is required when LLM_API_KEY is set")
     if base_url:
+        if provider == "meta" or "api.meta.ai" in base_url:
+            return _meta_backend(api_key, model, registry, niche, base_url)
         return OpenAICompatBackend(api_key, model, registry, niche, base_url=base_url)
+    if provider == "meta":
+        return _meta_backend(api_key, model, registry, niche, META_DEFAULT_BASE)
     return GeminiRestBackend(api_key, model, registry, niche)
+
+
+def _meta_backend(
+    api_key: str, model: str, registry: ToolRegistry, niche: str, base_url: str
+) -> MetaModelBackend:
+    """Assemble the Meta backend with its spend ledger + budget guard."""
+    # lazy: meta.py imports this module (OpenAICompatBackend) at module scope
+    from director_os.agent_runtime.meta import MetaModelBackend, SpendLedger
+    from director_os.core.config import get_settings
+
+    s = get_settings()
+    if "contributor" in model and not s.llm_allow_training_on_content:
+        raise LLMBackendError(
+            f"{model} lets Meta train on the content you send. Bodycam footage carries "
+            "PII — use the standard tier (e.g. muse-ember-1.0), or set "
+            "LLM_ALLOW_TRAINING_ON_CONTENT=1 to accept explicitly."
+        )
+    ledger_path = s.llm_spend_ledger or str(s.output_dir / "llm_spend.jsonl")
+    return MetaModelBackend(
+        api_key,
+        model,
+        registry,
+        niche,
+        base_url=base_url,
+        ledger=SpendLedger(ledger_path),
+        budget_usd=s.llm_budget_usd,
+    )

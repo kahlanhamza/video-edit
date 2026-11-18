@@ -40,6 +40,11 @@ class Settings:
     llm_api_key: str
     llm_base_url: str
     llm_model: str
+    # --- Meta Model API cost guard (M2: provider = meta)
+    llm_provider: str
+    llm_budget_usd: float
+    llm_spend_ledger: str
+    llm_allow_training_on_content: bool
     # --- vision LLM (M4)
     vision_api_key: str
     # --- compute backend (M4: local ONNX default / Kaggle free GPU / Modal optional)
@@ -80,6 +85,12 @@ def _load() -> Settings:
         llm_api_key=os.getenv("LLM_API_KEY", ""),
         llm_base_url=os.getenv("LLM_BASE_URL", ""),
         llm_model=os.getenv("LLM_MODEL", ""),
+        llm_provider=os.getenv("LLM_PROVIDER", ""),
+        llm_budget_usd=float(os.getenv("LLM_BUDGET_USD", "15.0")),
+        llm_spend_ledger=os.getenv("LLM_SPEND_LEDGER", ""),
+        llm_allow_training_on_content=(
+            os.getenv("LLM_ALLOW_TRAINING_ON_CONTENT", "").lower() in {"1", "true", "yes"}
+        ),
         vision_api_key=os.getenv("VISION_API_KEY", ""),
         compute_backend=os.getenv("COMPUTE_BACKEND", "local").strip().lower(),
         kaggle_username=os.getenv("KAGGLE_USERNAME", ""),

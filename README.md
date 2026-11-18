@@ -87,14 +87,24 @@ Live credentials (verified 2026-11-17): **Gladia cloud ASR is end-to-end green**
 (480p proxy + scrubsheet) → live Gladia transcription (25 words, diarized) →
 auto-cut → segment-cached render → subtitle trio → QA audit all green
 (`scripts/e2e_smoke.py`). The **LLM backends are live behind the existing
-`LLMBackend` port**: native Gemini (`LLM_API_KEY`, REST function-calling with
-the three Gemini 3.x REST traps handled — `parametersJsonSchema` full-JSON-Schema
-declarations, verbatim `thoughtSignature` replay across multi-step tool turns,
-`?key=` fallback on 401 `ACCESS_TOKEN_TYPE_UNSUPPORTED`) and any
-OpenAI-compatible gateway (`LLM_BASE_URL`). `POST /projects/{id}/agent/plan`
-runs the real provider loop. The sandbox IP is region-blocked by Google
-("User location is not supported"), so point `LLM_BASE_URL` at a reachable
-gateway when running there; the wire format itself is MockTransport-pinned.
+`LLMBackend` port**: **Meta Model API / Muse** (`agent_runtime/meta.py` — the
+default: `LLM_BASE_URL=https://api.meta.ai/v1`, `LLM_MODEL=muse-ember-1.0`,
+cost-engineered for the ~$20 credit balance: $0.10/M in / $0.004/M cached in /
+$0.50/M out on Ember vs $1.25/$4.25 on Spark and $4/$20 on Wonder; every call
+is priced from the real usage incl. prompt-cache hits, appended to a
+persistent JSONL spend ledger, and a hard `LLM_BUDGET_USD` cap refuses calls
+BEFORE the HTTP request; contributor variants — cheaper but Meta trains on
+your content, a PII hazard for bodycam footage — are rejected unless
+`LLM_ALLOW_TRAINING_ON_CONTENT=1`; per-proposal USD lands in
+`agent_tool_logs.token_cost_usd` feeding the M5 cost dashboard), native
+Gemini (`LLM_API_KEY`, REST function-calling with the three Gemini 3.x REST
+traps handled — `parametersJsonSchema` full-JSON-Schema declarations,
+verbatim `thoughtSignature` replay across multi-step tool turns, `?key=`
+fallback on 401 `ACCESS_TOKEN_TYPE_UNSUPPORTED`) and any OpenAI-compatible
+gateway (`LLM_BASE_URL`). `POST /projects/{id}/agent/plan` runs the real
+provider loop. The sandbox IP is region-blocked by Google ("User location is
+not supported"), which is why the default provider is Meta; the wire format
+itself is MockTransport-pinned (`tests/unit/test_meta_backend.py`).
 **Modal tokens validated** against the real API (`modal.App.lookup` auth round-
 trip; `modal` added to deps). Remaining: YouTube refresh token
 (`YOUTUBE_REFRESH_TOKEN` — run `scripts/gen_youtube_refresh_token.py` on any

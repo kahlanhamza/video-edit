@@ -181,6 +181,7 @@ class PlannerExecutor:
             ok=True,
             tokens_in=usage.get("tokens_in") if isinstance(usage, dict) else None,
             tokens_out=usage.get("tokens_out") if isinstance(usage, dict) else None,
+            token_cost_usd=getattr(backend, "last_cost_usd", None),
         )
         run = self.execute_plan(steps, timeline)
         # Multi-turn providers replay tool results into the next proposal

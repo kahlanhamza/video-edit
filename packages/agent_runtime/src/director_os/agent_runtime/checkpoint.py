@@ -112,6 +112,7 @@ class CheckpointStore:
         error: str | None = None,
         tokens_in: int | None = None,
         tokens_out: int | None = None,
+        token_cost_usd: float | None = None,
     ) -> None:
         summary = result_summary if ok else f"ERROR: {error}"
         with self._sessions() as s:
@@ -125,6 +126,7 @@ class CheckpointStore:
                     duration_ms=duration_ms,
                     tokens_in=tokens_in,
                     tokens_out=tokens_out,
+                    token_cost_usd=token_cost_usd,
                 )
             )
             s.commit()
@@ -146,6 +148,7 @@ class CheckpointStore:
                     "duration_ms": r.duration_ms,
                     "tokens_in": r.tokens_in,
                     "tokens_out": r.tokens_out,
+                    "token_cost_usd": r.token_cost_usd,
                 }
                 for r in rows
             ]
