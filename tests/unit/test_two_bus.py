@@ -226,7 +226,6 @@ def test_ceiling_limit_pcm_passthrough_below_ceiling():
     the gain refinement walked to -32 dB. Below-ceiling content is a no-op.
     """
     import numpy as np
-
     from director_os.audio_engine.leveling import ceiling_limit_pcm
 
     sr = 48000
