@@ -23,6 +23,10 @@ from director_os.vision_fx.redact import build_blur_chain
 ZOOM_PAN_MAX = 3.0
 
 
+# narration b-roll law (Colab editorial rule): muted AND slightly darkened
+NARRATION_DIM = "eq=brightness=-0.06:saturation=0.92"
+
+
 def base_geometry(w: int, h: int) -> list[str]:
     return [
         f"scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos",
@@ -153,9 +157,12 @@ def spotlight_overlay_fragment(
 
 
 def plain_video_chain(spec: SegmentRenderSpec) -> str:
-    return ",".join(
+    chain = (
         base_geometry(spec.video.w, spec.video.h) + zoom_filters(spec) + list(spec.video_filters)
     )
+    if spec.kind == "narration":
+        chain = [NARRATION_DIM] + chain  # muted, slightly darkened b-roll
+    return ",".join(chain)
 
 
 def compose_filter_complex(spec: SegmentRenderSpec) -> tuple[str, bool, int]:
@@ -169,7 +176,10 @@ def compose_filter_complex(spec: SegmentRenderSpec) -> tuple[str, bool, int]:
     n_overlay_inputs = len(spec.cards) + (1 if spec.spotlight_png_path else 0)
 
     parts: list[str] = []
-    parts.append(f"[0:v]{','.join(base_geometry(spec.video.w, spec.video.h))}[vg]")
+    base = base_geometry(spec.video.w, spec.video.h)
+    if spec.kind == "narration":
+        base = [NARRATION_DIM] + base  # muted, slightly darkened b-roll
+    parts.append(f"[0:v]{','.join(base)}[vg]")
     cur = "vg"
 
     if spec.blur_regions:

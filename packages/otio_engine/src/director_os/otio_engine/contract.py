@@ -62,6 +62,7 @@ class RawClipMeta(BaseModel):
     blur_regions: list[BlurRegion] = Field(default_factory=list)
     freeze_callout: FreezeCallout | None = None
     angle_id: str | None = None
+    act_name: str | None = None  # 6-act documentary marker (M5 Director session)
 
 
 class NarratorClipMeta(BaseModel):
@@ -73,6 +74,7 @@ class NarratorClipMeta(BaseModel):
     broll_range: tuple[float, float] | None = None
     broll_audio_volume: float = 0.0
     jl_cut: JLCut | None = None
+    act_name: str | None = None  # 6-act documentary marker (M5 Director session)
 
 
 class CardMeta(BaseModel):

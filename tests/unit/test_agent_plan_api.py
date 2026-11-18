@@ -114,7 +114,7 @@ def test_agent_plan_503_without_provider(api_client, project_with_timeline):
     pid, _ = project_with_timeline
     r = api_client.post(f"/projects/{pid}/agent/plan", json={})
     assert r.status_code == 503
-    assert "not configured" in r.json()["detail"]
+    assert "LLM not configured" in r.json()["detail"]
 
 
 def test_agent_plan_422_without_timeline(api_client):
@@ -136,12 +136,12 @@ def test_agent_plan_full_loop_native_gemini(api_client, project_with_timeline, m
         bodies.append(json.loads(request.content.decode()))
         return httpx.Response(200, json=GEMINI_PLAN_OK)
 
-    def fake_build(registry, niche="bodycam_documentary", **_kw):
+    def fake_build_chain(registry, niche="bodycam_documentary", **_kw):
         return GeminiRestBackend(
             "k", "gemini-3.8-flash", registry, transport=httpx.MockTransport(handler)
         )
 
-    monkeypatch.setattr(api_main, "build_backend", fake_build)
+    monkeypatch.setattr(api_main, "build_backend_chain", fake_build_chain)
     pid, v0 = project_with_timeline
 
     r = api_client.post(f"/projects/{pid}/agent/plan", json={"role": "director"})

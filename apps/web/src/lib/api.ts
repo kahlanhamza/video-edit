@@ -67,6 +67,69 @@ export interface Redaction {
   created_at: string;
 }
 
+// --- WS4: multi-source case ingest + CaseDossier ---
+
+/** Source payload accepted at case creation (POST /projects). */
+export interface SourceIn {
+  kind: "url" | "text";
+  label?: string;
+  url?: string;
+  text?: string;
+}
+
+/** Source payload accepted by POST /projects/{id}/sources. */
+export interface AddSourceIn {
+  kind: "url" | "text" | "source_page";
+  label?: string;
+  url?: string;
+  text?: string;
+}
+
+export type CaseSourceKind = "source_page" | "url" | "pdf" | "text";
+export type CaseSourceStatus = "pending" | "extracting" | "ready" | "failed";
+
+export interface CaseSourceOut {
+  id: string;
+  kind: CaseSourceKind;
+  label: string;
+  status: CaseSourceStatus;
+  error: string | null;
+  created_at: string;
+}
+
+export interface DossierFact {
+  fact: string;
+  date: string | null;
+  source_id: string;
+  citation: string;
+}
+
+export interface DossierSourceRef {
+  source_id: string;
+  kind: string;
+  label: string;
+  citation: string;
+}
+
+export interface CaseDossier {
+  subject_name: string | null;
+  age: number | null;
+  role_or_agency: string | null;
+  incident_datetime: string | null;
+  location: string | null;
+  inciting_reason: string | null;
+  key_facts: DossierFact[];
+  charges: string[];
+  test_results: string[];
+  verdict_outcome: string | null;
+  sources: DossierSourceRef[];
+}
+
+export interface RefreshSourcesResult {
+  refreshed: number;
+  dossier: CaseDossier;
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const r = await fetch(`${API_BASE}${path}`, {
     headers: { "Content-Type": "application/json" },
@@ -82,11 +145,31 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   listProjects: () => req<Project[]>("/projects"),
-  createProject: (title: string, nicheSkill = "bodycam_documentary") =>
-    req<Project>("/projects", {
+  createProject: (
+    title: string,
+    opts?: {
+      niche_skill?: string;
+      video_urls?: string[];
+      auto_discover?: boolean;
+      sources?: SourceIn[];
+    },
+  ) => {
+    const body: {
+      title: string;
+      niche_skill?: string;
+      video_urls?: string[];
+      auto_discover?: boolean;
+      sources?: SourceIn[];
+    } = { title, niche_skill: opts?.niche_skill ?? "bodycam_documentary" };
+    if (opts?.video_urls) body.video_urls = opts.video_urls;
+    // only sent when true — unchecked means "let the pipeline default"
+    if (opts?.auto_discover) body.auto_discover = opts.auto_discover;
+    if (opts?.sources) body.sources = opts.sources;
+    return req<Project>("/projects", {
       method: "POST",
-      body: JSON.stringify({ title, niche_skill: nicheSkill }),
-    }),
+      body: JSON.stringify(body),
+    });
+  },
   getProject: (id: string) => req<Project>(`/projects/${id}`),
   ingestUrl: (id: string, url: string, customHeaders?: Record<string, string>) =>
     req<{ job_id: string; source_path: string; enqueued: boolean; detail: string }>(
@@ -148,6 +231,35 @@ export const api = {
     }),
   deleteRedaction: (id: string, regionId: string) =>
     req<void>(`/projects/${id}/redactions/${regionId}`, { method: "DELETE" }),
+  // --- WS4: multi-source case ingest + CaseDossier
+  listSources: (id: string) => req<CaseSourceOut[]>(`/projects/${id}/sources`),
+  addSource: (id: string, body: AddSourceIn) =>
+    req<CaseSourceOut>(`/projects/${id}/sources`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  uploadSource: async (id: string, file: File, label?: string) => {
+    // dedicated fetch — the multipart boundary must be set by the browser,
+    // so this must not go through the JSON `req` helper.
+    const form = new FormData();
+    form.append("file", file);
+    if (label) form.append("label", label);
+    const r = await fetch(`${API_BASE}/projects/${id}/sources/upload`, {
+      method: "POST",
+      body: form,
+      cache: "no-store",
+    });
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      throw new Error(body.detail ?? `${r.status} ${r.statusText}`);
+    }
+    return r.json() as Promise<CaseSourceOut>;
+  },
+  getDossier: (id: string) => req<CaseDossier>(`/projects/${id}/dossier`),
+  refreshSources: (id: string) =>
+    req<RefreshSourcesResult>(`/projects/${id}/sources/refresh`, {
+      method: "POST",
+    }),
 };
 
 export function assetProxyUrl(assetId: string): string {

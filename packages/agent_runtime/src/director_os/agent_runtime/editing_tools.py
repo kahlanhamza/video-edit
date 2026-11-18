@@ -76,6 +76,138 @@ class DirectorToolbox:
         self.w, self.h = resolution
 
     # ------------------------------------------------------------ master cut
+    def _raw_asset_id(self) -> str:
+        """Asset id of the first raw clip on the master track."""
+        for item in _master(self.timeline):
+            meta = item.metadata.get("director_os") if not isinstance(item, ot_schema.Gap) else None
+            if meta and meta.get("kind") == "raw":
+                return str(meta.get("asset_id", ""))
+        raise ToolOperationError("master track has no raw clip to inherit asset_id from")
+
+    def _new_raw_clip(
+        self, name: str, asset_id: str, source_start_s: float, dur_s: float, act: str | None = None
+    ):
+        rate = 30.0
+        clip = ot_schema.Clip(name=name)
+        clip.source_range = ot_time.TimeRange(
+            start_time=ot_time.RationalTime(source_start_s * rate, rate),
+            duration=ot_time.RationalTime(dur_s * rate, rate),
+        )
+        meta: dict[str, Any] = {
+            "kind": "raw",
+            "asset_id": asset_id,
+            "audio_mode": "loudnorm_48k",
+            "trim_silence": True,
+            "zoom_keyframes": [],
+            "blur_regions": [],
+            "freeze_callout": None,
+        }
+        if act:
+            meta["act_name"] = act
+        clip.metadata.update({"director_os": meta})
+        return clip
+
+    def insert_raw_clip(
+        self,
+        source_start_s: float,
+        dur_s: float,
+        at_index: int | None = None,
+        asset_id: str = "",
+        act_name: str = "",
+    ) -> dict[str, Any]:
+        """Insert a raw clip from ANY point of the source (cold-open hooks).
+
+        The Colab-proven cold open needs climax clips pulled from LATER in the
+        video; trim-only tools can never reach them. `at_index=None` appends.
+        """
+        if dur_s <= 0:
+            raise ToolOperationError("dur_s must be > 0")
+        if source_start_s < 0:
+            raise ToolOperationError("source_start_s must be >= 0")
+        asset = asset_id.strip() or self._raw_asset_id()
+        track = _master(self.timeline)
+        items = list(track)
+        if at_index is None:
+            at_index = len(items)
+        if not 0 <= at_index <= len(items):
+            raise ToolOperationError(
+                f"at_index {at_index} out of range (master has {len(items)} items)"
+            )
+        clip = self._new_raw_clip(f"raw_{at_index}", asset, source_start_s, dur_s, act_name or None)
+        track.insert(at_index, clip)
+        return {
+            "ok": True,
+            "detail": (
+                f"raw clip inserted at {at_index}: src {source_start_s:.2f}s "
+                f"+{dur_s:.2f}s (asset {asset[:8]})"
+            ),
+        }
+
+    def insert_narration_block(
+        self,
+        script_text: str,
+        dur_s: float,
+        at_index: int | None = None,
+        broll_source_start_s: float | None = None,
+        act_name: str = "",
+    ) -> dict[str, Any]:
+        """Add a narrator block (TTS over muted, darkened B-roll).
+
+        B-roll defaults to the source range of the preceding raw clip (a quiet
+        moment of the same scene the narration describes). Volume is 0 by the
+        audio law for narration bridges (speech rides the TTS bus).
+        """
+        if not script_text.strip():
+            raise ToolOperationError("script_text must not be empty")
+        if not 1.0 <= dur_s <= 120.0:
+            raise ToolOperationError("dur_s must be 1..120s")
+        track = _master(self.timeline)
+        items = list(track)
+        if at_index is None:
+            at_index = len(items)
+        if not 0 <= at_index <= len(items):
+            raise ToolOperationError(
+                f"at_index {at_index} out of range (master has {len(items)} items)"
+            )
+
+        asset = self._raw_asset_id()
+        if broll_source_start_s is None:
+            broll_source_start_s = 0.0
+            for item in reversed(items[:at_index]):
+                if isinstance(item, ot_schema.Gap):
+                    continue
+                prev_meta = item.metadata.get("director_os") or {}
+                if prev_meta.get("kind") == "raw" and item.source_range is not None:
+                    broll_source_start_s = item.source_range.start_time.to_seconds()
+                    break
+        rate = 30.0
+        clip = ot_schema.Clip(name=f"narration_{at_index}")
+        clip.source_range = ot_time.TimeRange(
+            start_time=ot_time.RationalTime(broll_source_start_s * rate, rate),
+            duration=ot_time.RationalTime(dur_s * rate, rate),
+        )
+        narr_meta: dict[str, Any] = {
+            "kind": "narration",
+            "tts_provider": "edge",
+            "voice_id": "en-US-BrianMultilingualNeural",
+            "script_text": script_text,
+            "broll_asset_id": asset,
+            "broll_range": [broll_source_start_s, broll_source_start_s + dur_s],
+            "broll_audio_volume": 0.0,
+            "jl_cut": {"j_s": 0.4},
+        }
+        if act_name:
+            narr_meta["act_name"] = act_name
+        clip.metadata.update({"director_os": narr_meta})
+        track.insert(at_index, clip)
+        return {
+            "ok": True,
+            "detail": (
+                f"narration at {at_index}: {dur_s:.1f}s over broll "
+                f"{broll_source_start_s:.1f}s — {script_text[:60]!r}"
+            ),
+        }
+
     def trim_clip(self, item_index: int, new_start_s: float, new_dur_s: float) -> dict[str, Any]:
         """Move the clip's in-point and set a new duration (source seconds)."""
         clip = _master_clip(self.timeline, item_index)
@@ -450,6 +582,20 @@ def build_director_registry(toolbox: DirectorToolbox) -> ToolRegistry:
         lambda **kw: toolbox.trim_clip(**kw),
     )
     reg.register(
+        "timeline.insert_raw_clip",
+        "Insert a raw clip from any source time (e.g. a cold-open climax hook "
+        "pulled from later in the video) at a master track position.",
+        _InsertRawInput,
+        lambda **kw: toolbox.insert_raw_clip(**kw),
+    )
+    reg.register(
+        "timeline.add_narration",
+        "Insert a NEW narrator block (TTS script over muted, darkened B-roll "
+        "from any source moment) at a master track position.",
+        _AddNarrationInput,
+        lambda **kw: toolbox.insert_narration_block(**kw),
+    )
+    reg.register(
         "timeline.split_clip",
         "Split a master clip at a track-local offset; both halves keep metadata.",
         _SplitInput,
@@ -519,6 +665,22 @@ class _TrimInput(BaseModel):
     item_index: int = Field(ge=0)
     new_start_s: float = Field(ge=0.0)
     new_dur_s: float = Field(gt=0.0)
+
+
+class _InsertRawInput(BaseModel):
+    source_start_s: float = Field(ge=0.0)
+    dur_s: float = Field(gt=0.0, le=600.0)
+    at_index: int | None = Field(default=None, ge=0)
+    asset_id: str = Field(default="", max_length=120)
+    act_name: str = Field(default="", max_length=120)
+
+
+class _AddNarrationInput(BaseModel):
+    script_text: str = Field(min_length=1, max_length=4000)
+    dur_s: float = Field(ge=1.0, le=120.0)
+    at_index: int | None = Field(default=None, ge=0)
+    broll_source_start_s: float | None = Field(default=None, ge=0.0)
+    act_name: str = Field(default="", max_length=120)
 
 
 class _SplitInput(BaseModel):

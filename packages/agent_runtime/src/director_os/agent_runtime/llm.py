@@ -104,6 +104,17 @@ class LLMBackendError(RuntimeError):
     pass
 
 
+def strip_code_fences(text: str) -> str:
+    """Lenient JSON extraction: drop ```json fences, keep the outermost object."""
+    import re
+
+    text = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", text.strip())
+    first, last = text.find("{"), text.rfind("}")
+    if first >= 0 and last > first:
+        return text[first : last + 1]
+    return text
+
+
 def _modal_vlm_fn():
     """Seam for the deployed fleet proxy (lazy `modal` import keeps CI hermetic)."""
     import modal
@@ -376,6 +387,34 @@ class GeminiRestBackend:
                 break
         return steps
 
+    def complete_json(self, system: str, user: str, max_tokens: int = 4096) -> str:
+        """Plain-text JSON completion (Phase A macro plan — no tools).
+
+        Walks the tier's model fallbacks: a geo/capacity failure on one
+        model downgrades to the next before the tier ever raises.
+        """
+        payload: dict[str, Any] = {
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": [{"text": user}]}],
+            "generationConfig": {"temperature": 0.3, "maxOutputTokens": max_tokens},
+        }
+        last_err = ""
+        for candidate in [self.model, *self._fallbacks]:
+            self.model = candidate
+            try:
+                data = self._generate(payload, model_path=candidate)
+            except LLMBackendError as e:
+                last_err = str(e)
+                continue
+            usage = data.get("usageMetadata", {})
+            self.last_usage = {
+                "tokens_in": int(usage.get("promptTokenCount", 0)),
+                "tokens_out": int(usage.get("candidatesTokenCount", 0)),
+            }
+            parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+            return "".join(str(p.get("text", "")) for p in parts)
+        raise LLMBackendError(f"gemini complete_json exhausted fallbacks: {last_err[:200]}")
+
 
 class OpenAICompatBackend:
     """OpenAI-compatible /chat/completions backend (LLM_BASE_URL route).
@@ -389,6 +428,12 @@ class OpenAICompatBackend:
 
     ``prompt_char_budget`` (Groq: 6000) clamps the state summary so a proposal
     fits inside Groq's ~8k TPM window.
+
+    Multi-turn (M5 story-map Director): every propose() replays the
+    conversation so far (`self._history`) — assistant tool_calls verbatim
+    (ids must survive), tool results via `record_results()` as
+    ``role="tool"`` messages. `complete_json()` runs the same capacity
+    ladder WITHOUT tools for the Phase A macro plan.
     """
 
     provider = "openai_compat"
@@ -420,6 +465,19 @@ class OpenAICompatBackend:
             if fallback_models is not None
             else _env_model_list(os.getenv("LLM_FALLBACK_MODELS", ""))
         )
+        self._history: list[dict[str, Any]] = []
+
+    def reset_history(self) -> None:
+        """Drop replayed turns (new conversation on the next propose)."""
+        self._history.clear()
+
+    def record_results(self, steps: list[ToolStep], results: list[str]) -> None:
+        """Append tool results as ``role="tool"`` messages (OpenAI shape)."""
+        for step, res in zip(steps, results, strict=False):
+            call_id = (step.provider_meta or {}).get("call_id") or f"call_{len(self._history)}"
+            self._history.append(
+                {"role": "tool", "tool_call_id": call_id, "content": str(res)[:4000]}
+            )
 
     def _sanitize_schemas(self) -> list[dict[str, Any]]:
         """OpenAI-compat tool schemas with DOT-FREE names.
@@ -455,6 +513,11 @@ class OpenAICompatBackend:
             "model": self.model,
             "messages": [
                 {"role": "system", "content": self.last_system_prompt},
+                # multi-turn: replay the conversation so far (assistant
+                # tool_calls verbatim + role=tool results) between system and
+                # the fresh user turn — the Phase B refinement loop depends
+                # on the model seeing its own previous edits
+                *self._history,
                 {
                     "role": "user",
                     "content": "Timeline state:\n"
@@ -549,6 +612,13 @@ class OpenAICompatBackend:
         data = r.json()
         self._absorb_usage(data.get("usage", {}))
         msg = data.get("choices", [{}])[0].get("message", {})
+        # multi-turn: remember the assistant turn VERBATIM so tool_call ids
+        # survive into the next replay (Groq/OpenRouter require id pairing
+        # for the role="tool" responses)
+        if msg.get("tool_calls"):
+            self._history.append(msg)
+        elif msg.get("content"):
+            self._history.append({"role": "assistant", "content": str(msg["content"])[:2000]})
         steps: list[ToolStep] = []
         known = self.registry.names()
         for call in msg.get("tool_calls") or []:
@@ -561,16 +631,65 @@ class OpenAICompatBackend:
                 args = json.loads(fn.get("arguments") or "{}")
             except json.JSONDecodeError:
                 args = {}
+            meta = {"call_id": call.get("id")} if call.get("id") else None
             steps.append(
                 ToolStep(
                     tool=name,
                     args=args,
                     checkpoint_note=f"{self.provider}:{self.model} proposal",
+                    provider_meta=meta,
                 )
             )
             if len(steps) >= MAX_STEPS_PER_PROPOSAL:
                 break
         return steps
+
+    def complete_json(self, system: str, user: str, max_tokens: int = 4096) -> str:
+        """Plain-text JSON completion (Phase A macro plan — no tools attached).
+
+        Walks the same [model, *fallbacks] capacity ladder as propose(): a
+        429 honors Retry-After once per candidate, dead model names skip to
+        the next, and only full exhaustion raises to the tier above.
+        """
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        candidates = [self.model, *self._fallbacks]
+        last_status, last_body = 0, ""
+        for candidate in candidates:
+            self.model = candidate
+            payload: dict[str, Any] = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "temperature": 0.3,
+                "max_tokens": max_tokens,
+            }
+            r = self._post_candidate(payload, headers)
+            if r.status_code == 200:
+                data = r.json()
+                self._absorb_usage(data.get("usage", {}))
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                return str(content)
+            last_status, last_body = r.status_code, r.text
+            if r.status_code == 429:
+                time.sleep(self._retry_after_s(r))
+                r = self._post_candidate(payload, headers)
+                if r.status_code == 200:
+                    data = r.json()
+                    self._absorb_usage(data.get("usage", {}))
+                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    return str(content)
+                last_status, last_body = r.status_code, r.text
+                if r.status_code in CAPACITY_STATUSES:
+                    continue
+            elif self._model_not_found(r) or r.status_code in CAPACITY_STATUSES:
+                continue
+            raise LLMBackendError(f"openai-compat {r.status_code}: {r.text[:300]}")
+        raise LLMBackendError(
+            f"openai-compat capacity exhausted across {len(candidates)} model(s): "
+            f"{last_status} {last_body[:200]}"
+        )
 
 
 def build_backend(
@@ -649,6 +768,43 @@ class FailoverBackend:
     @property
     def tier_names(self) -> list[str]:
         return [f"{getattr(b, 'provider', '?')}:{getattr(b, 'model', '')}" for b in self._backends]
+
+    @property
+    def model(self) -> str:
+        """Active tier label (provider:model) — logging/pipeline face."""
+        return f"{getattr(self.active, 'provider', '?')}:{getattr(self.active, 'model', '')}"
+
+    def complete_json(self, system: str, user: str, max_tokens: int = 4096) -> str:
+        """Phase A macro plan across the tier chain (capacity-walking)."""
+        failures: list[str] = []
+        for backend in self._backends:
+            complete = getattr(backend, "complete_json", None)
+            if not callable(complete):
+                continue
+            try:
+                text = complete(system, user, max_tokens=max_tokens)
+            except LLMBackendError as e:
+                msg = str(e).lower()
+                if any(marker in msg for marker in _CAPACITY_ERROR_MARKERS):
+                    failures.append(f"{getattr(backend, 'provider', '?')}: {e}")
+                    continue
+                raise
+            self.active = backend
+            self.last_usage = getattr(backend, "last_usage", None)
+            return text
+        raise LLMBackendError(
+            "all LLM tiers exhausted for complete_json ("
+            + " | ".join(failures)
+            + " | tiers: "
+            + ",".join(self.tier_names)
+            + ")"
+        )
+
+    def reset_history(self) -> None:
+        for backend in self._backends:
+            reset = getattr(backend, "reset_history", None)
+            if callable(reset):
+                reset()
 
     def propose(self, state_summary: str, role: AgentRole) -> list[ToolStep]:
         failures: list[str] = []

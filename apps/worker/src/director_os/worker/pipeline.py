@@ -35,6 +35,8 @@ from typing import Any
 
 from director_os.core.config import Settings, get_settings
 from director_os.core.db import (
+    CaseDossierRow,
+    CaseSourceRow,
     JobRow,
     MediaAssetRow,
     PerceptionIndexRow,
@@ -64,6 +66,11 @@ from director_os.otio_engine.timeline import (
 from sqlalchemy import select
 
 AUTO_CUT_MAX_SEGMENT_S = 8.0
+# sources >= this get the 6-act documentary treatment (LLM story-map Director
+# or deterministic fallback); shorter sources keep the v1 auto-cut
+DOCUMENTARY_MIN_SOURCE_S = 900.0
+# retention QA floors only bind at >= 20 min raw (Eustis postmortem rule)
+RETENTION_QA_MIN_SOURCE_S = 1200.0
 
 
 class PipelineError(RuntimeError):
@@ -88,6 +95,11 @@ class PipelineDeps:
     # --- M2 close-out: LLM Director autodrive (Gemini controls the edit)
     llm_direct: bool = False  # stage_director after planning (soft-fails to the v1 cut)
     director_max_rounds: int | None = None  # None -> DIRECTOR_MAX_ROUNDS env (default 4)
+    # --- M5 story-map Director session (Phase A/B) + CaseDossier injection
+    # points; tests fake these, production resolves the live routing chain
+    director_backend_factory: Callable[[], Any] | None = None
+    complete_json: Callable[[str, str], str] | None = None  # dossier synthesis
+    fetch: Callable[[str], Any] | None = None  # case-source fetching (tests)
     log: Callable[[str], None] = lambda _msg: None
 
 
@@ -101,6 +113,9 @@ class PipelineResult:
     otio_path: Path
     render: RenderReport
     audit: AuditReport
+    timeline: Any = None  # the shipped master timeline (act-breakdown reads)
+    source_duration_s: float = 0.0
+    dossier: dict | None = None
 
 
 def _update_job(s, job_id: str, stage: JobStage, progress: float, error: str | None = None) -> None:
@@ -937,18 +952,364 @@ def stage_vision_enrichment(asset_id: str, source: Path, deps: PipelineDeps) -> 
         s.commit()
 
 
-def stage_planning(
-    asset_id: str, transcript: dict, project_id: str, deps: PipelineDeps
-) -> tuple[Any, int]:
-    """Deterministic v1 auto-cut -> `timeline_versions`; idempotent via the project pointer.
+def _persist_timeline_version(
+    timeline, project_id: str, deps: PipelineDeps, *, created_by: str, note: str
+) -> int:
+    """Write a new timeline_versions row + advance the active pointer."""
+    with deps.sessions() as s:
+        last = s.execute(
+            select(TimelineVersionRow.version_num)
+            .where(TimelineVersionRow.project_id == project_id)
+            .order_by(TimelineVersionRow.version_num.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        version = (last or 0) + 1
+        s.add(
+            TimelineVersionRow(
+                project_id=project_id,
+                version_num=version,
+                otio_json=to_json_dict(timeline),
+                created_by=created_by,
+                checkpoint_note=note[:500],
+            )
+        )
+        project = s.get(ProjectRow, project_id)
+        project.active_otio_version_id = version
+        _set_status(s, project_id, ProjectStatus.planned)
+        s.commit()
+    return version
 
-    v1 rule (documented, no LLM yet): cut the raw asset into <=8s segments and
-    open with a location card. The Director agent (M2 close-out) replaces this
-    with LLM planning on top of the same timeline_versions durability.
+
+def _load_dossier(project_id: str, deps: PipelineDeps) -> dict | None:
+    with deps.sessions() as s:
+        row = s.get(CaseDossierRow, project_id)
+        return dict(row.dossier_json) if row and row.dossier_json else None
+
+
+def stage_dossier(project_id: str, deps: PipelineDeps) -> dict | None:
+    """Extract every pending/failed case source and re-synthesize the dossier.
+
+    Auto-discovery: a `source_page` source (the video's own page, e.g.
+    Wikimedia/COPA) contributes Hop-1 links; each discovered pdf/url becomes a
+    fresh `pending` source extracted in the same pass (Hop 2). The
+    synthesized CaseDossier is persisted to `case_dossiers` for both the
+    Director prompt and the Studio inspector. Adding a source later and
+    calling this again refreshes the dossier WITHOUT re-running ASR.
+    """
+    from director_os.core.models import CaseSource
+    from director_os.perception.case_dossier import extract_case_source, synthesize_dossier
+
+    settings = deps.settings
+    fetch = deps.fetch
+    complete_json = deps.complete_json
+    if complete_json is None:
+        try:
+            from director_os.agent_runtime.llm import build_backend_chain
+            from director_os.agent_runtime.registry import ToolRegistry
+
+            chain = build_backend_chain(ToolRegistry())
+            complete_json = lambda sys_p, user_p: chain.complete_json(sys_p, user_p)  # noqa: E731
+        except Exception:
+            complete_json = None  # heuristic synthesis (no LLM rung reachable)
+
+    for _hop in range(2):  # hop1: attached sources; hop2: discovered links
+        with deps.sessions() as s:
+            rows = (
+                s.execute(
+                    select(CaseSourceRow)
+                    .where(CaseSourceRow.project_id == project_id)
+                    .where(CaseSourceRow.status.in_(["pending", "failed", "extracting"]))
+                    .order_by(CaseSourceRow.created_at)
+                )
+                .scalars()
+                .all()
+            )
+        if not rows:
+            break
+        for row in rows:
+            with deps.sessions() as s:
+                row.status = "extracting"
+                s.commit()
+            source = CaseSource(
+                id=row.id,
+                project_id=project_id,
+                kind=row.kind,  # type: ignore[arg-type]
+                label=row.label or "",
+                uri_or_storage_key=row.uri_or_storage_key or "",
+                text=row.text or "",
+                extracted_text="",
+            )
+            try:
+                kwargs: dict = {"log": deps.log}
+                if fetch is not None:
+                    kwargs["fetch"] = fetch
+                if settings.vision_api_key:
+                    kwargs["vision_api_key"] = settings.vision_api_key
+                    kwargs["vision_model"] = settings.vision_model or "gemini-3.5-flash-lite"
+                text, discovered = extract_case_source(source, **kwargs)
+                with deps.sessions() as s:
+                    row = s.get(CaseSourceRow, row.id)
+                    row.extracted_text = text[:200_000]
+                    row.status = "ready"
+                    row.error = None
+                    s.commit()
+                deps.log(f"  [dossier] {row.kind} '{row.label[:40]}' ready ({len(text)} chars)")
+                for d in discovered:
+                    with deps.sessions() as s:
+                        dup = s.execute(
+                            select(CaseSourceRow)
+                            .where(CaseSourceRow.project_id == project_id)
+                            .where(CaseSourceRow.uri_or_storage_key == d["url"])
+                        ).scalar_one_or_none()
+                        if dup is None:
+                            s.add(
+                                CaseSourceRow(
+                                    project_id=project_id,
+                                    kind=d["kind"],
+                                    label=d["label"],
+                                    uri_or_storage_key=d["url"],
+                                    status="pending",
+                                )
+                            )
+                            s.commit()
+                            deps.log(f"  [dossier] auto-discovered {d['kind']}: {d['url'][:80]}")
+            except Exception as e:
+                with deps.sessions() as s:
+                    row = s.get(CaseSourceRow, row.id)
+                    row.status = "failed"
+                    row.error = str(e)[:1000]
+                    s.commit()
+                deps.log(f"  [dossier] {row.kind} '{row.label[:40]}' FAILED: {e}")
+
+    with deps.sessions() as s:
+        rows = (
+            s.execute(
+                select(CaseSourceRow)
+                .where(CaseSourceRow.project_id == project_id)
+                .order_by(CaseSourceRow.created_at)
+            )
+            .scalars()
+            .all()
+        )
+        sources = [
+            CaseSource(
+                id=r.id,
+                project_id=project_id,
+                kind=r.kind,  # type: ignore[arg-type]
+                label=r.label or "",
+                uri_or_storage_key=r.uri_or_storage_key or "",
+                text=r.text or "",
+                extracted_text=r.extracted_text or "",
+                status=r.status,  # type: ignore[arg-type]
+            )
+            for r in rows
+        ]
+    if not sources:
+        return _load_dossier(project_id, deps)
+
+    dossier = synthesize_dossier(sources, None, complete_json=complete_json)
+    payload = dossier.model_dump(mode="json")
+    with deps.sessions() as s:
+        row = s.get(CaseDossierRow, project_id)
+        if row is None:
+            row = CaseDossierRow(project_id=project_id, dossier_json=payload)
+            s.add(row)
+        else:
+            row.dossier_json = payload
+        s.commit()
+    deps.log(
+        f"  [dossier] synthesized: subject={dossier.subject_name} "
+        f"facts={len(dossier.key_facts)} charges={len(dossier.charges)} "
+        f"verdict={'yes' if dossier.verdict_outcome else 'none'}"
+    )
+    return payload
+
+
+def _apply_audio_mode(timeline, deps: PipelineDeps) -> None:
+    """Rewrite raw-clip audio_mode to the configured law (2-bus etc.)."""
+    from director_os.otio_engine.timeline import MASTER_TRACK, is_gap, track_by_name
+
+    mode_map = {
+        "loudnorm_48k": "loudnorm_48k",
+        "isolate_2bus": "isolate_2bus",
+        "silence": "silence",
+    }
+    mode = mode_map.get(deps.audio_mode, "loudnorm_48k")
+    master = track_by_name(timeline, MASTER_TRACK)
+    if master is None:
+        return
+    for item in master:
+        if is_gap(item):
+            continue
+        meta = item.metadata.get("director_os") or {}
+        if meta.get("kind") == "raw":
+            meta["audio_mode"] = mode
+
+
+def _documentary_scaffold(
+    asset_id: str, dur: float, fps: int, w: int, h: int, audio_mode: str
+) -> Any:
+    """Full-length raw clip + overlay gap track — the Phase B canvas."""
+    spec = TimelineSpec(
+        name=f"doc_scaffold_{asset_id[:8]}",
+        fps=fps,
+        width=w,
+        height=h,
+        tracks=[
+            TrackSpec(
+                name="V1_master",
+                items=[
+                    ClipSpec(
+                        name="raw_scaffold",
+                        source_start_s=0.0,
+                        dur_s=dur,
+                        meta=RawClipMeta(asset_id=asset_id, audio_mode=audio_mode),  # type: ignore[arg-type]
+                    )
+                ],
+            ),
+            TrackSpec(name="V2_overlay_cards", items=[GapSpec(dur_s=dur)]),
+        ],
+    )
+    return build_timeline(spec)
+
+
+def _director_backend(deps: PipelineDeps):
+    """Live routing chain from env, or the injected test factory; None = fallback."""
+    if deps.director_backend_factory is not None:
+        return deps.director_backend_factory()
+    try:
+        from director_os.agent_runtime.llm import build_backend_chain
+        from director_os.agent_runtime.registry import ToolRegistry
+
+        return build_backend_chain(ToolRegistry())
+    except Exception as e:
+        deps.log(f"  [planning] no LLM rung ({e}) — deterministic 6-act fallback")
+        return None
+
+
+def _plan_documentary(
+    asset_id: str,
+    transcript: dict,
+    project_id: str,
+    deps: PipelineDeps,
+    *,
+    dur: float,
+    fps: int,
+    card_fields: dict,
+) -> tuple[Any, int]:
+    """LLM 6-act story-map path with deterministic fallback (>= 15 min sources)."""
+    from director_os.agent_runtime.checkpoint import CheckpointStore
+    from director_os.agent_runtime.director_session import DirectorSession
+    from director_os.agent_runtime.editing_tools import DirectorToolbox, build_director_registry
+    from director_os.agent_runtime.fallback_cut import build_fallback_documentary
+    from director_os.agent_runtime.plan_invariants import audit_retention
+    from director_os.agent_runtime.story_map import build_story_map
+
+    dossier = _load_dossier(project_id, deps) or stage_dossier(project_id, deps)
+    buckets = build_story_map(transcript, source_duration_s=dur, shots=[], audio_events=[])
+    deps.log(
+        f"  [planning] story map: {len(buckets)} minute-buckets, "
+        f"{sum(1 for b in buckets if b.has_signal)} with signal"
+    )
+
+    mode_map = {
+        "loudnorm_48k": "loudnorm_48k",
+        "isolate_2bus": "isolate_2bus",
+        "silence": "silence",
+    }
+    audio_mode = mode_map.get(deps.audio_mode, "loudnorm_48k")
+
+    backend = _director_backend(deps)
+    if backend is not None:
+        store = CheckpointStore(deps.sessions)
+        scaffold = _documentary_scaffold(asset_id, dur, fps, deps.video.w, deps.video.h, audio_mode)
+        toolbox = DirectorToolbox(scaffold, project_id, (deps.video.w, deps.video.h))
+        registry = build_director_registry(toolbox)
+        session = DirectorSession(registry, store, project_id, backend, source_duration_s=dur)
+        plan, plan_err = session.plan_macro(buckets, dossier)
+        if plan is None:
+            deps.log(f"  [planning] Phase A failed ({plan_err}) — deterministic fallback")
+        else:
+            label = getattr(backend, "model", getattr(backend, "provider", "llm"))
+            deps.log(
+                f"  [planning] Phase A ok via {label}: {len(plan.acts)} acts, "
+                f"{plan.raw_count} raw, {plan.narration_count} narration, "
+                f"{plan.total_dur_s:.0f}s"
+            )
+            timeline, report = session.execute(plan, scaffold)
+            retention = audit_retention(timeline, dur)
+            if retention.ok and report.steps_failed == 0:
+                _apply_audio_mode(timeline, deps)
+                comp = report.composition
+                total_s = comp.final_duration_s if comp else 0.0
+                version = _persist_timeline_version(
+                    timeline,
+                    project_id,
+                    deps,
+                    created_by="director_agent",
+                    note=(
+                        f"LLM 6-act doc ({label}): {total_s:.0f}s, "
+                        f"turns={report.turns}, steps={report.steps_ok}"
+                    ),
+                )
+                deps.log(
+                    f"  [planning] Director timeline v{version}: "
+                    f"{(comp.final_duration_s if comp else 0):.1f}s, "
+                    f"{(comp.raw_segment_count if comp else 0)} raw, "
+                    f"{(comp.narrator_segment_count if comp else 0)} narration"
+                )
+                return timeline, version
+            deps.log(
+                f"  [planning] LLM plan rejected (steps_failed={report.steps_failed}, "
+                f"retention_ok={retention.ok}) — deterministic fallback"
+            )
+
+    spec = build_fallback_documentary(
+        asset_id,
+        dur,
+        transcript,
+        fps=fps,
+        width=deps.video.w,
+        height=deps.video.h,
+        project_id=project_id,
+    )
+    timeline = build_timeline(spec)
+    _apply_audio_mode(timeline, deps)
+    retention = audit_retention(timeline, dur)
+    if not retention.ok:
+        raise PipelineError(
+            f"deterministic fallback failed retention: {[c.detail for c in retention.failures]}"
+        )
+    version = _persist_timeline_version(
+        timeline,
+        project_id,
+        deps,
+        created_by="assembler_agent",
+        note=f"deterministic 6-act fallback ({dur / 60:.0f}min source)",
+    )
+    deps.log(f"  [planning] fallback timeline v{version} (retention ok)")
+    return timeline, version
+
+
+def stage_planning(
+    asset_id: str,
+    transcript: dict,
+    project_id: str,
+    deps: PipelineDeps,
+    *,
+    force_replan: bool = False,
+) -> tuple[Any, int]:
+    """Stage 6 — auto-cut v1 for short sources; the 2-phase story-map
+    documentary for >= 15 min sources (Phase A macro plan over the FULL
+    story index + dossier, Phase B act-by-act tool expansion + refinement
+    loop, deterministic 6-act fallback when no LLM rung is reachable).
+
+    `force_replan=True` invalidates the active-version shortcut (a refreshed
+    CaseDossier re-runs Stage 6 without touching ingest or ASR).
     """
     with deps.sessions() as s:
         project = s.get(ProjectRow, project_id)
-        if project.active_otio_version_id is not None:
+        if project.active_otio_version_id is not None and not force_replan:
             version = project.active_otio_version_id
             row = s.execute(
                 select(TimelineVersionRow).where(
@@ -964,8 +1325,6 @@ def stage_planning(
         asset = s.get(MediaAssetRow, asset_id)
     dur = asset.duration_s
     fps = int(round(asset.fps))
-    n_segments = max(1, math.ceil(dur / AUTO_CUT_MAX_SEGMENT_S))
-    seg_len = dur / n_segments
 
     # M4: the AXON overlay OCR populates the intro card when the vision stack
     # read one (e.g. "AXON BODY 3 — 2022-07-04T18:11:55-04:00"); a street-sign
@@ -981,6 +1340,16 @@ def stage_planning(
             if ocr.get("location_text"):
                 subtitle += f" — {ocr['location_text']}"
             card_fields["subtitle"] = subtitle
+
+    # >= 15 min sources: the 6-act documentary owns the edit — never a
+    # 1-minute slice (Eustis postmortem), never an 8s-grained full dump
+    if dur >= DOCUMENTARY_MIN_SOURCE_S:
+        return _plan_documentary(
+            asset_id, transcript, project_id, deps, dur=dur, fps=fps, card_fields=card_fields
+        )
+
+    n_segments = max(1, math.ceil(dur / AUTO_CUT_MAX_SEGMENT_S))
+    seg_len = dur / n_segments
 
     _AUDIO_MODE_BY_ENV: dict[str, Any] = {
         "loudnorm_48k": "loudnorm_48k",
@@ -1244,8 +1613,17 @@ def stage_qa(
     transcript: dict | None = None,
     enhance_info: Any | None = None,
     raw_source: Path | None = None,
+    *,
+    timeline=None,
+    source_duration_s: float = 0.0,
 ) -> AuditReport:
-    """Deterministic QA + the 2-bus acoustic verification (SNR/clipping/engine)."""
+    """Deterministic QA + the 2-bus acoustic verification (SNR/clipping/engine).
+
+    Full-arc retention gate (M5 postmortem): for >= 20-minute raw sources the
+    master must hold 600s+/6+ narration/8+ raw clips/0.70+ source span. A
+    failed master is QUARANTINED (renamed `<stem>.qa_failed<ext>`) — a
+    truncated `eustis_llm_directed_master.mp4` can never ship.
+    """
     audio_verification = None
     speech_intervals = None
     if enhance_info is not None:
@@ -1266,6 +1644,17 @@ def stage_qa(
         speech_intervals=speech_intervals,
         audio_verification=audio_verification,
     )
+    retention_failed = False
+    if timeline is not None and source_duration_s >= RETENTION_QA_MIN_SOURCE_S:
+        from director_os.agent_runtime.plan_invariants import audit_retention
+
+        retention = audit_retention(timeline, source_duration_s)
+        retention_failed = not retention.ok
+        audit = AuditReport(
+            path=audit.path,
+            ok=audit.ok and retention.ok,
+            checks=[*audit.checks, *retention.checks],
+        )
     if enhance_info is not None:
         # ear evidence next to the metrics: 15 s raw-vs-clean pair
         from director_os.worker.audio_enhance import export_enhance_ab
@@ -1279,6 +1668,11 @@ def stage_qa(
             failures = "; ".join(f"{c.name}: {c.detail}" for c in audit.failures)
             _update_job(s, job_id, JobStage.qa, 90.0, error=f"qa_failed: {failures}")
             _set_status(s, project_id, ProjectStatus.qa_failed)
+            if retention_failed and final_path.exists():
+                quarantine = final_path.with_name(
+                    final_path.stem + ".qa_failed" + final_path.suffix
+                )
+                final_path.rename(quarantine)
     return audit
 
 
@@ -1321,12 +1715,18 @@ def run_pipeline(
     project_id: str,
     deps: PipelineDeps,
     job_id: str | None = None,
+    *,
+    force_replan: bool = False,
 ) -> PipelineResult:
     """Full autonomous run; safe to re-invoke after a crash at any stage.
 
     `source` may be a local path or an http(s) URL — URLs are downloaded first
     through the guardrail UA layer (`core.http.download`), and the pipeline
     proceeds against the local copy exactly as with a file.
+
+    `force_replan=True` invalidates the planning shortcut (a refreshed
+    CaseDossier re-runs Stage 6+ without re-downloading the video or
+    re-running Stage 3 ASR — the transcript short-circuit stays intact).
     """
     if isinstance(source, str) and source.startswith(("http://", "https://")):
         name = Path(source.split("?")[0]).name or "ingest.bin"
@@ -1374,12 +1774,18 @@ def run_pipeline(
             stage_vision_enrichment(asset_id, source, deps)
 
         _update_job(deps.sessions(), job_id, JobStage.planning, 40.0)
-        timeline, version = stage_planning(asset_id, transcript, project_id, deps)
+        timeline, version = stage_planning(
+            asset_id, transcript, project_id, deps, force_replan=force_replan
+        )
 
-        # Stage 6.5 — the Director agent re-cuts the v1 timeline when enabled.
-        # Soft-fail: no key / provider outage / bad rounds -> the deterministic
-        # cut rides on. Every accepted edit is a persisted timeline version.
-        if deps.llm_direct:
+        # Stage 6.5 — the legacy Director autodrive re-cuts the v1 timeline
+        # when enabled. The M5 story-map session already owns >= 15 min
+        # sources end-to-end, so the autodrive only runs for short sources.
+        documentary_planned = False
+        with deps.sessions() as s:
+            _asset = s.get(MediaAssetRow, asset_id)
+            documentary_planned = bool(_asset and _asset.duration_s >= DOCUMENTARY_MIN_SOURCE_S)
+        if deps.llm_direct and not documentary_planned:
             _update_job(deps.sessions(), job_id, JobStage.planning, 42.0)
             from director_os.worker.director import stage_director
 
@@ -1480,6 +1886,8 @@ def run_pipeline(
             transcript=transcript,
             enhance_info=enhance_info,
             raw_source=source,
+            timeline=timeline,
+            source_duration_s=_source_duration(deps, asset_id),
         )
         if not audit.ok:
             raise PipelineError(f"QA failed: {[c.detail for c in audit.failures]}")
@@ -1535,7 +1943,16 @@ def run_pipeline(
         otio_path=otio_path,
         render=report,
         audit=audit,
+        timeline=timeline,
+        source_duration_s=_source_duration(deps, asset_id),
+        dossier=_load_dossier(project_id, deps),
     )
+
+
+def _source_duration(deps: PipelineDeps, asset_id: str) -> float:
+    with deps.sessions() as s:
+        asset = s.get(MediaAssetRow, asset_id)
+        return float(asset.duration_s) if asset else 0.0
 
 
 def _current_stage(sessions, job_id: str) -> tuple[JobStage, float]:
@@ -1583,14 +2000,21 @@ def make_deps(
     )
 
 
-def advance_job(job_id: str, project_id: str, source: str, database_url: str) -> dict:
+def advance_job(
+    job_id: str | None,
+    project_id: str,
+    source: str,
+    database_url: str,
+    *,
+    force_replan: bool = False,
+) -> dict:
     """Fleet entrypoint: resume/advance one pipeline job (crash-safe by design).
 
     Registered as a Celery task in `director_os.worker.tasks`; kept as a plain
     function here so tests and a future Temporal workflow call it unchanged.
     """
     deps = make_deps(database_url)
-    result = run_pipeline(Path(source), project_id, deps, job_id=job_id)
+    result = run_pipeline(Path(source), project_id, deps, job_id=job_id, force_replan=force_replan)
     return {
         "job_id": result.job_id,
         "final": str(result.final_path),

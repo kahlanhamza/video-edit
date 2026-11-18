@@ -17,6 +17,7 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     String,
+    Text,
     create_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
@@ -128,6 +129,33 @@ class JobRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class CaseSourceRow(Base):
+    """One attached case source (M5 multi-source bundle)."""
+
+    __tablename__ = "case_sources"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(20))  # source_page | url | pdf | text
+    label: Mapped[str] = mapped_column(String(300), default="")
+    uri_or_storage_key: Mapped[str] = mapped_column(String(2048), default="")
+    text: Mapped[str] = mapped_column(Text, default="")
+    extracted_text: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class CaseDossierRow(Base):
+    """Latest synthesized dossier per project (rebuilt whenever sources change)."""
+
+    __tablename__ = "case_dossiers"
+
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), primary_key=True)
+    dossier_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 ALL_TABLES = (
     ProjectRow,
     MediaAssetRow,
@@ -136,6 +164,8 @@ ALL_TABLES = (
     SegmentCacheRow,
     AgentToolLogRow,
     JobRow,
+    CaseSourceRow,
+    CaseDossierRow,
 )
 
 

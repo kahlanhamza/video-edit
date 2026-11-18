@@ -3,7 +3,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import ProxyPlayer from "@/components/ProxyPlayer";
 import SubtitleGrid from "@/components/SubtitleGrid";
-import { api, Asset, DispatchResult, Job, Project, TimelineState, sseUrl } from "@/lib/api";
+import {
+  api,
+  Asset,
+  CaseDossier,
+  CaseSourceOut,
+  DispatchResult,
+  Job,
+  Project,
+  TimelineState,
+  sseUrl,
+} from "@/lib/api";
 
 const TOOLS = [
   {
@@ -33,6 +43,139 @@ const TOOLS = [
   },
 ];
 
+// --- WS4: Case Sources & Dossier ---
+
+const SOURCE_KIND_BADGE: Record<string, string> = {
+  url: "bg-sky-500/10 text-sky-300",
+  pdf: "bg-rose-500/10 text-rose-300",
+  text: "bg-emerald-500/10 text-emerald-300",
+  source_page: "bg-violet-500/10 text-violet-300",
+};
+
+const SOURCE_STATUS_CHIP: Record<string, string> = {
+  pending: "bg-slate-800 text-slate-400",
+  extracting: "bg-amber-500/10 text-amber-300 animate-pulse",
+  ready: "bg-emerald-500/10 text-emerald-300",
+  failed: "bg-red-500/10 text-red-400",
+};
+
+function isEmptyDossier(d: CaseDossier): boolean {
+  return (
+    !d.subject_name &&
+    d.age == null &&
+    !d.role_or_agency &&
+    !d.incident_datetime &&
+    !d.location &&
+    !d.inciting_reason &&
+    (d.key_facts?.length ?? 0) === 0 &&
+    (d.charges?.length ?? 0) === 0 &&
+    (d.test_results?.length ?? 0) === 0 &&
+    !d.verdict_outcome
+  );
+}
+
+function DossierView({ dossier }: { dossier: CaseDossier }) {
+  const sourceLabel = (sourceId: string) =>
+    dossier.sources?.find((s) => s.source_id === sourceId)?.label ??
+    `${sourceId.slice(0, 8)}…`;
+  const facts = dossier.key_facts ?? [];
+  return (
+    <div className="mt-2 space-y-3">
+      <div className="text-sm">
+        <span className="font-semibold text-slate-100">
+          {dossier.subject_name ?? "Unknown subject"}
+        </span>
+        {dossier.age != null && (
+          <span className="text-slate-400"> · age {dossier.age}</span>
+        )}
+        {dossier.role_or_agency && (
+          <span className="text-slate-400"> · {dossier.role_or_agency}</span>
+        )}
+      </div>
+
+      <dl className="space-y-1 text-sm">
+        {(
+          [
+            ["Incident", dossier.incident_datetime],
+            ["Location", dossier.location],
+            ["Inciting reason", dossier.inciting_reason],
+          ] as Array<[string, string | null]>
+        ).map(([label, value]) => (
+          <div key={label} className="flex gap-2">
+            <dt className="w-28 shrink-0 text-xs uppercase tracking-wide text-slate-500">
+              {label}
+            </dt>
+            <dd className="min-w-0 flex-1 text-slate-200">{value ?? "—"}</dd>
+          </div>
+        ))}
+      </dl>
+
+      {dossier.verdict_outcome && (
+        <p className="rounded bg-amber-500/10 px-2 py-1 text-sm text-amber-300">
+          Verdict / outcome: {dossier.verdict_outcome}
+        </p>
+      )}
+
+      {facts.length > 0 && (
+        <div>
+          <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+            Key facts
+          </h4>
+          <ul className="mt-1 space-y-1">
+            {facts.map((f, i) => (
+              <li key={i} className="text-sm">
+                <span className="text-slate-200">{f.fact}</span>
+                {f.date && (
+                  <span className="ml-1 text-xs text-slate-500">({f.date})</span>
+                )}
+                <span className="block text-xs text-slate-500" title={f.citation}>
+                  — from {sourceLabel(f.source_id)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {(dossier.charges?.length ?? 0) > 0 && (
+        <div>
+          <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+            Charges
+          </h4>
+          <div className="mt-1 flex flex-wrap gap-1">
+            {(dossier.charges ?? []).map((c, i) => (
+              <span
+                key={i}
+                className="rounded bg-slate-800 px-2 py-0.5 text-xs text-slate-300"
+              >
+                {c}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {(dossier.test_results?.length ?? 0) > 0 && (
+        <div>
+          <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+            Test results
+          </h4>
+          <div className="mt-1 flex flex-wrap gap-1">
+            {(dossier.test_results ?? []).map((t, i) => (
+              <span
+                key={i}
+                className="rounded bg-slate-800 px-2 py-0.5 text-xs text-slate-300"
+              >
+                {t}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function ProjectPage({ params }: { params: Promise<{ id: string }> }) {
   const [id, setId] = useState<string | null>(null);
   const [project, setProject] = useState<Project | null>(null);
@@ -50,6 +193,14 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
   const [ingestUrl, setIngestUrl] = useState("");
   const [ingestBusy, setIngestBusy] = useState(false);
   const [ingestStatus, setIngestStatus] = useState<string | null>(null);
+  const [sources, setSources] = useState<CaseSourceOut[]>([]);
+  const [dossier, setDossier] = useState<CaseDossier | null>(null);
+  const [sourcesBusy, setSourcesBusy] = useState(false);
+  const [refreshNote, setRefreshNote] = useState<string | null>(null);
+  const [addSourceKind, setAddSourceKind] = useState<"url" | "text">("url");
+  const [addSourceUrl, setAddSourceUrl] = useState("");
+  const [addSourceText, setAddSourceText] = useState("");
+  const [addSourceLabel, setAddSourceLabel] = useState("");
   const [error, setError] = useState<string | null>(null);
   const esRef = useRef<EventSource | null>(null);
 
@@ -73,6 +224,25 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  // WS4: case sources + dossier — 404 / empty just means "not built yet"
+  const loadSources = useCallback(async () => {
+    if (!id) return;
+    try {
+      setSources(await api.listSources(id));
+    } catch {
+      setSources([]);
+    }
+    try {
+      setDossier(await api.getDossier(id));
+    } catch {
+      setDossier(null);
+    }
+  }, [id]);
+
+  useEffect(() => {
+    loadSources();
+  }, [loadSources]);
 
   // live progress over SSE for the newest job
   useEffect(() => {
@@ -120,6 +290,50 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
       await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function refreshAndReplan() {
+    if (!id || sourcesBusy) return;
+    setSourcesBusy(true);
+    setRefreshNote(null);
+    try {
+      const r = await api.refreshSources(id);
+      await loadSources();
+      await refresh();
+      setRefreshNote(`refreshed ${r.refreshed} source(s) — dossier re-planned`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSourcesBusy(false);
+    }
+  }
+
+  async function addSourceLater() {
+    if (!id || sourcesBusy) return;
+    const kind = addSourceKind;
+    const url = addSourceUrl.trim();
+    const text = addSourceText.trim();
+    if (kind === "url" && !url) return;
+    if (kind === "text" && !text) return;
+    setSourcesBusy(true);
+    setRefreshNote(null);
+    try {
+      await api.addSource(
+        id,
+        kind === "text"
+          ? { kind, label: addSourceLabel.trim() || undefined, text }
+          : { kind, label: addSourceLabel.trim() || undefined, url },
+      );
+      setAddSourceUrl("");
+      setAddSourceText("");
+      setAddSourceLabel("");
+      await loadSources();
+      setRefreshNote("source attached — hit Refresh & re-plan to extract + re-cut");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSourcesBusy(false);
     }
   }
 
@@ -210,6 +424,130 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
             no 480p proxy yet — ingest builds one automatically (480p + scrubsheet + 64k audio)
           </p>
         )}
+      </section>
+
+      <section className="card">
+        <div className="flex items-center justify-between gap-2">
+          <div>
+            <h2 className="font-semibold">Case Sources &amp; Dossier</h2>
+            <p className="mt-0.5 text-xs text-slate-500">
+              every source feeding this case — the dossier is re-planned from them
+              on refresh
+            </p>
+          </div>
+          <button
+            className="btn-ghost"
+            onClick={refreshAndReplan}
+            disabled={sourcesBusy}
+          >
+            {sourcesBusy ? "Refreshing…" : "Refresh & re-plan"}
+          </button>
+        </div>
+
+        <div className="mt-3 grid gap-4 lg:grid-cols-2">
+          <div>
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+              Sources ({sources.length})
+            </h3>
+            <ul className="mt-2 space-y-1">
+              {sources.map((s) => (
+                <li key={s.id} className="flex items-center gap-2 text-sm">
+                  <span
+                    className={`rounded px-2 py-0.5 text-xs uppercase tracking-wide ${
+                      SOURCE_KIND_BADGE[s.kind] ?? "bg-slate-800 text-slate-400"
+                    }`}
+                  >
+                    {s.kind}
+                  </span>
+                  <span
+                    className="min-w-0 flex-1 truncate text-slate-300"
+                    title={s.label}
+                  >
+                    {s.label || `${s.id.slice(0, 8)}…`}
+                  </span>
+                  <span
+                    className={`rounded px-2 py-0.5 text-xs uppercase tracking-wide ${
+                      SOURCE_STATUS_CHIP[s.status] ?? "bg-slate-800 text-slate-400"
+                    }`}
+                    title={s.status === "failed" && s.error ? s.error : undefined}
+                  >
+                    {s.status}
+                  </span>
+                </li>
+              ))}
+              {sources.length === 0 && (
+                <li className="text-sm text-slate-500">
+                  no sources yet — create a case with video URLs (auto-discover
+                  on), or POST /projects/{id}/sources
+                </li>
+              )}
+            </ul>
+            {refreshNote && (
+              <p className="mt-2 text-xs text-emerald-400">{refreshNote}</p>
+            )}
+            <div className="mt-3 space-y-2 border-t border-slate-800 pt-3">
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                + attach more sources to this case
+              </p>
+              <div className="flex gap-2">
+                <select
+                  className="input w-28"
+                  value={addSourceKind}
+                  onChange={(e) => setAddSourceKind(e.target.value as "url" | "text")}
+                >
+                  <option value="url">URL</option>
+                  <option value="text">Notes</option>
+                </select>
+                <input
+                  className="input"
+                  placeholder={
+                    addSourceKind === "url"
+                      ? "https://court.example/case-doc (news, court page, direct .pdf)"
+                      : "label (e.g. sentencing update)"
+                  }
+                  value={addSourceKind === "url" ? addSourceUrl : addSourceLabel}
+                  onChange={(e) =>
+                    addSourceKind === "url"
+                      ? setAddSourceUrl(e.target.value)
+                      : setAddSourceLabel(e.target.value)
+                  }
+                />
+              </div>
+              {addSourceKind === "text" && (
+                <textarea
+                  className="input"
+                  rows={2}
+                  placeholder="paste notes — FOIA updates, sentencing, corrections"
+                  value={addSourceText}
+                  onChange={(e) => setAddSourceText(e.target.value)}
+                />
+              )}
+              <button
+                className="btn-ghost"
+                onClick={addSourceLater}
+                disabled={
+                  sourcesBusy ||
+                  (addSourceKind === "url" ? !addSourceUrl.trim() : !addSourceText.trim())
+                }
+              >
+                Attach source
+              </button>
+            </div>
+          </div>
+
+          <div>
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+              CaseDossier
+            </h3>
+            {dossier && !isEmptyDossier(dossier) ? (
+              <DossierView dossier={dossier} />
+            ) : (
+              <p className="mt-2 text-sm text-slate-500">
+                No dossier yet — add sources and refresh.
+              </p>
+            )}
+          </div>
+        </div>
       </section>
 
       <section className="card">

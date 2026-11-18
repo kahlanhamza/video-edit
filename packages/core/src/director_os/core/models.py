@@ -189,3 +189,66 @@ class Job(BaseModel):
     current_stage: JobStage = JobStage.ingest
     progress_pct: float = Field(default=0.0, ge=0.0, le=100.0)
     error_message: str | None = None
+
+
+# ----------------------------------------------------------------- multi-source case ingestion (M5)
+CaseSourceKind = Literal["source_page", "url", "pdf", "text"]
+
+
+class CaseSource(BaseModel):
+    """One attached case source (PDF, URL, pasted text, or the video's own page).
+
+    Extraction status is a lifecycle: `pending` (attached, not parsed) ->
+    `extracting` -> `ready` (extracted_text populated) | `failed` (error set).
+    `uri_or_storage_key` is the remote URL for url/source_page kinds, the local
+    storage key for uploaded files, and empty for pasted text.
+    """
+
+    id: str
+    project_id: str
+    kind: CaseSourceKind
+    label: str = ""
+    uri_or_storage_key: str = ""
+    text: str = ""  # pasted-text bodies ride inline (never re-fetched)
+    extracted_text: str = ""
+    status: Literal["pending", "extracting", "ready", "failed"] = "pending"
+    error: str | None = None
+    created_at: str = ""
+
+
+class DossierFact(BaseModel):
+    """One verified case fact, always attributed to the source it came from."""
+
+    fact: str
+    date: str | None = None
+    source_id: str
+    citation: str
+
+
+class DossierSourceRef(BaseModel):
+    source_id: str
+    kind: str
+    label: str
+    citation: str
+
+
+class CaseDossier(BaseModel):
+    """Synthesized case brief handed to the Stage 6 Director (PLAN §3.1.4).
+
+    Every claim is copied from an attached source with its citation — the
+    synthesizer is FORBIDDEN from inventing charges, verdicts, or outcomes.
+    Authority order when sources disagree: pasted text > official PDF >
+    newer news/court URL > video page summary.
+    """
+
+    subject_name: str | None = None
+    age: int | None = None
+    role_or_agency: str | None = None
+    incident_datetime: str | None = None
+    location: str | None = None
+    inciting_reason: str | None = None
+    key_facts: list[DossierFact] = Field(default_factory=list)
+    charges: list[str] = Field(default_factory=list)
+    test_results: list[str] = Field(default_factory=list)
+    verdict_outcome: str | None = None
+    sources: list[DossierSourceRef] = Field(default_factory=list)

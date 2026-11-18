@@ -51,6 +51,19 @@ def advance_job_task(job_id: str, project_id: str, source: str, database_url: st
     return advance_job(job_id, project_id, source, database_url)
 
 
+@celery_app.task(name="directoros.replan_job")
+def replan_job_task(project_id: str, source: str, database_url: str) -> dict:
+    """Re-run Stage 6+ after a CaseDossier refresh (new source attached).
+
+    Ingest + ASR short-circuit on the persisted domain rows — the video is
+    never re-downloaded and Gladia never re-runs; only planning, render,
+    subtitles and QA re-execute against the refreshed dossier.
+    """
+    from director_os.worker.pipeline import advance_job
+
+    return advance_job(None, project_id, source, database_url, force_replan=True)
+
+
 # ---------------------------------------------------------------------------
 # segment-parallel render fleet (M1 close-out: issue #9 parallel rendering)
 # ---------------------------------------------------------------------------

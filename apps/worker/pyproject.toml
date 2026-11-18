@@ -5,6 +5,7 @@ description = "DirectorOS Celery workers (render fleet; full media fleet in M2)"
 requires-python = ">=3.12"
 dependencies = [
     "director-os-core",
+    "director-os-agent-runtime",
     "director-os-otio-engine",
     "director-os-perception",
     "celery[redis]>=5.4",

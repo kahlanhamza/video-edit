@@ -8,12 +8,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from director_os.agent_runtime.agents import AgentRole, PlannerExecutor, ToolStep
 from director_os.agent_runtime.checkpoint import CheckpointStore
 from director_os.agent_runtime.editing_tools import DirectorToolbox, build_director_registry
-from director_os.agent_runtime.llm import LLMBackendError, build_backend
+from director_os.agent_runtime.llm import LLMBackendError, build_backend_chain
 from director_os.api.channels import ChannelPublisher, MultiChannelPublisher
 from director_os.api.events import DEFAULT_MAX_S, DEFAULT_POLL_S, job_progress_stream, require_job
 from director_os.api.youtube import (
@@ -25,6 +25,8 @@ from director_os.api.youtube import (
 from director_os.core.config import get_settings
 from director_os.core.db import (
     AgentToolLogRow,
+    CaseDossierRow,
+    CaseSourceRow,
     JobRow,
     MediaAssetRow,
     PerceptionIndexRow,
@@ -36,7 +38,7 @@ from director_os.core.db import (
 )
 from director_os.core.http import download
 from director_os.core.models import ProjectStatus
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -79,9 +81,21 @@ def session() -> Session:
     return _session_factory()
 
 
+class SourceIn(BaseModel):
+    """One attached case source at project creation."""
+
+    kind: Literal["url", "text", "source_page"]
+    label: str = Field(default="", max_length=300)
+    url: str = Field(default="", max_length=2048)
+    text: str = Field(default="", max_length=200_000)
+
+
 class ProjectCreate(BaseModel):
     title: str = Field(min_length=1, max_length=300)
     niche_skill: str = "bodycam_documentary"
+    video_urls: list[str] = Field(default_factory=list, max_length=8)
+    auto_discover: bool = True
+    sources: list[SourceIn] = Field(default_factory=list, max_length=32)
 
 
 class ProjectOut(BaseModel):
@@ -103,6 +117,58 @@ def health() -> JSONResponse:
     )
 
 
+def _add_source_rows(project_id: str, body: ProjectCreate) -> int:
+    """Persist creation-time sources + auto-discover source_page rows."""
+    s = session()
+    try:
+        existing_urls = {
+            u
+            for (u,) in s.execute(
+                select(CaseSourceRow.uri_or_storage_key).where(
+                    CaseSourceRow.project_id == project_id
+                )
+            )
+        }
+        added = 0
+
+        def _add(kind: str, label: str, uri: str = "", text: str = "") -> None:
+            nonlocal added
+            if uri and uri in existing_urls:
+                return
+            if uri:
+                existing_urls.add(uri)
+            s.add(
+                CaseSourceRow(
+                    project_id=project_id,
+                    kind=kind,
+                    label=label,
+                    uri_or_storage_key=uri,
+                    text=text,
+                    status="pending",
+                )
+            )
+            added += 1
+
+        for src in body.sources:
+            if src.kind == "text":
+                if src.text.strip():
+                    _add("text", src.label or "pasted notes", text=src.text)
+            elif src.url.strip():
+                _add(
+                    "url" if src.kind == "url" else "source_page",
+                    src.label or src.url[:120],
+                    uri=src.url.strip(),
+                )
+        if body.auto_discover:
+            for vurl in body.video_urls:
+                if vurl.strip():
+                    _add("source_page", f"video page: {vurl[:120]}", uri=vurl.strip())
+        s.commit()
+        return added
+    finally:
+        s.close()
+
+
 @app.post("/projects", status_code=201, response_model=ProjectOut)
 def create_project(body: ProjectCreate) -> ProjectOut:
     s = session()
@@ -111,7 +177,17 @@ def create_project(body: ProjectCreate) -> ProjectOut:
     )
     s.add(row)
     s.commit()
-    return ProjectOut(id=row.id, title=row.title, niche_skill=row.niche_skill, status=row.status)
+    pid = row.id
+    s.close()
+    _add_source_rows(pid, body)
+    s = session()
+    fresh = s.get(ProjectRow, pid)
+    assert fresh is not None
+    out = ProjectOut(
+        id=fresh.id, title=fresh.title, niche_skill=fresh.niche_skill, status=fresh.status
+    )
+    s.close()
+    return out
 
 
 @app.get("/projects", response_model=list[ProjectOut])
@@ -181,6 +257,230 @@ def timeline_state(project_id: str) -> TimelineStateOut:
     return TimelineStateOut(
         active_version=active, versions=[TimelineVersionOut(**v) for v in versions]
     )
+
+
+# ------------------------------------------------------------------ case sources (M5)
+class CaseSourceIn(BaseModel):
+    """Attach one more source to an existing case."""
+
+    kind: Literal["url", "text", "source_page"]
+    label: str = Field(default="", max_length=300)
+    url: str = Field(default="", max_length=2048)
+    text: str = Field(default="", max_length=200_000)
+
+
+class CaseSourceOut(BaseModel):
+    id: str
+    kind: str
+    label: str
+    status: str
+    error: str | None = None
+    created_at: str
+
+
+def _source_out(r: CaseSourceRow) -> CaseSourceOut:
+    return CaseSourceOut(
+        id=r.id,
+        kind=r.kind,
+        label=r.label or "",
+        status=r.status,
+        error=r.error,
+        created_at=r.created_at.isoformat() if r.created_at else "",
+    )
+
+
+@app.get("/projects/{project_id}/sources", response_model=list[CaseSourceOut])
+def list_sources(project_id: str) -> list[CaseSourceOut]:
+    s = session()
+    try:
+        if s.get(ProjectRow, project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        rows = s.execute(
+            select(CaseSourceRow)
+            .where(CaseSourceRow.project_id == project_id)
+            .order_by(CaseSourceRow.created_at)
+        ).scalars()
+        return [_source_out(r) for r in rows]
+    finally:
+        s.close()
+
+
+@app.post("/projects/{project_id}/sources", status_code=201, response_model=CaseSourceOut)
+def add_source(project_id: str, body: CaseSourceIn) -> CaseSourceOut:
+    """Attach a URL / source page / pasted text to an existing case."""
+    s = session()
+    try:
+        if s.get(ProjectRow, project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        if body.kind == "text":
+            if not body.text.strip():
+                raise HTTPException(status_code=422, detail="text must not be empty")
+            row = CaseSourceRow(
+                project_id=project_id,
+                kind="text",
+                label=body.label or "pasted notes",
+                text=body.text,
+                status="pending",
+            )
+        else:
+            if not body.url.strip():
+                raise HTTPException(status_code=422, detail=f"{body.kind} source requires url")
+            dup = s.execute(
+                select(CaseSourceRow)
+                .where(CaseSourceRow.project_id == project_id)
+                .where(CaseSourceRow.uri_or_storage_key == body.url.strip())
+            ).scalar_one_or_none()
+            if dup is not None:
+                return _source_out(dup)
+            row = CaseSourceRow(
+                project_id=project_id,
+                kind="url" if body.kind == "url" else "source_page",
+                label=body.label or body.url[:120],
+                uri_or_storage_key=body.url.strip(),
+                status="pending",
+            )
+        s.add(row)
+        s.commit()
+        return _source_out(row)
+    finally:
+        s.close()
+
+
+UPLOAD_EXTENSIONS = {".pdf": "pdf", ".txt": "text", ".md": "text"}
+
+
+@app.post("/projects/{project_id}/sources/upload", status_code=201, response_model=CaseSourceOut)
+async def upload_source(
+    project_id: str, file: UploadFile = File(...), label: str = ""
+) -> CaseSourceOut:
+    """Upload a .pdf / .txt / .md case source (stored under the project dir)."""
+    s = session()
+    try:
+        if s.get(ProjectRow, project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        name = Path(file.filename or "source").name
+        ext = Path(name).suffix.lower()
+        if ext not in UPLOAD_EXTENSIONS:
+            raise HTTPException(status_code=422, detail=f"unsupported file type {ext} (pdf/txt/md)")
+        kind = UPLOAD_EXTENSIONS[ext]
+        row = CaseSourceRow(project_id=project_id, kind=kind, label=label or name, status="pending")
+        s.add(row)
+        s.flush()
+        dest_dir = get_settings().output_dir / "pipeline" / project_id / "sources"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / f"{row.id[:8]}_{name}"
+        content = await file.read()
+        dest.write_bytes(content)
+        if kind == "text":
+            row.text = content.decode("utf-8", errors="ignore")[:200_000]
+        else:
+            row.uri_or_storage_key = str(dest)
+        s.commit()
+        return _source_out(row)
+    finally:
+        s.close()
+
+
+@app.get("/projects/{project_id}/dossier")
+def get_dossier(project_id: str) -> JSONResponse:
+    s = session()
+    try:
+        if s.get(ProjectRow, project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        row = s.get(CaseDossierRow, project_id)
+        if row is None or not row.dossier_json:
+            raise HTTPException(
+                status_code=404, detail="no dossier yet — attach sources and refresh"
+            )
+        return JSONResponse(row.dossier_json)
+    finally:
+        s.close()
+
+
+class RefreshResponse(BaseModel):
+    refreshed: int
+    dossier: dict[str, Any] | None = None
+    replan: str = ""
+
+
+@app.post("/projects/{project_id}/sources/refresh", response_model=RefreshResponse)
+def refresh_sources(project_id: str) -> RefreshResponse:
+    """Re-extract pending/failed sources, rebuild the dossier, re-run Stage 6+.
+
+    The video is never re-downloaded and Stage 3 ASR never re-runs — the
+    worker's replan task short-circuits on the persisted domain rows. Adding
+    a source only refreshes the CaseDossier and re-plans the documentary.
+    """
+    from director_os.worker.pipeline import PipelineDeps, make_deps, stage_dossier
+
+    s = session()
+    try:
+        if s.get(ProjectRow, project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+    finally:
+        s.close()
+
+    deps: PipelineDeps = make_deps(get_settings().database_url)
+    n_before = _count_ready_sources(project_id)
+    dossier = stage_dossier(project_id, deps)
+    n_after = _count_ready_sources(project_id)
+
+    replan_note = ""
+    if _has_ingested_asset(project_id):
+        replan_note = _dispatch_replan(project_id)
+    return RefreshResponse(
+        refreshed=max(0, n_after - n_before), dossier=dossier, replan=replan_note
+    )
+
+
+def _count_ready_sources(project_id: str) -> int:
+    s = session()
+    try:
+        return int(
+            s.execute(
+                select(func.count(CaseSourceRow.id)).where(
+                    CaseSourceRow.project_id == project_id,
+                    CaseSourceRow.status == "ready",
+                )
+            ).scalar_one()
+        )
+    finally:
+        s.close()
+
+
+def _has_ingested_asset(project_id: str) -> bool:
+    s = session()
+    try:
+        row = s.execute(
+            select(MediaAssetRow.id).where(MediaAssetRow.project_id == project_id).limit(1)
+        ).scalar_one_or_none()
+        return row is not None
+    finally:
+        s.close()
+
+
+def _dispatch_replan(project_id: str) -> str:
+    """Best-effort worker dispatch; never fails the refresh request."""
+    s = session()
+    try:
+        asset = s.execute(
+            select(MediaAssetRow)
+            .where(MediaAssetRow.project_id == project_id)
+            .order_by(MediaAssetRow.id)
+            .limit(1)
+        ).scalar_one()
+    finally:
+        s.close()
+    try:
+        from director_os.worker.tasks import replan_job_task
+
+        replan_job_task.delay(project_id, asset.source_url or "", get_settings().database_url)
+        return "replan task queued — the worker re-runs Stage 6+ (no re-ASR)"
+    except Exception as e:  # no broker in dev: the operator runs the worker
+        return (
+            "dossier refreshed; no worker broker reachable — start the worker and it "
+            f"will pick up the replan (detail: {e})"
+        )
 
 
 # ------------------------------------------------------------------ SSE progress
@@ -345,7 +645,7 @@ def agent_plan(project_id: str, body: AgentPlanRequest | None = None) -> AgentPl
     toolbox = DirectorToolbox(timeline, project_id)
     registry = build_director_registry(toolbox)
     try:
-        backend = build_backend(registry, body.niche)
+        backend = build_backend_chain(registry, body.niche)
     except LLMBackendError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
 
