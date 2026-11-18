@@ -157,8 +157,9 @@ def test_gemini_passthrough_full_json_schema():
 
 
 def test_gemini_replays_thought_signature_verbatim():
-    """Trap #1: on turn 2 the assistant turn is replayed byte-for-byte — the
-    opaque thoughtSignature stays inside its functionCall part."""
+    """Trap #1 + the protocol shape (Eustis round-2 400 regression): on turn 2
+    the USER state turn leads, the assistant turn is replayed byte-for-byte —
+    the opaque thoughtSignature stays inside its functionCall part."""
 
     bodies: list[dict] = []
 
@@ -171,7 +172,8 @@ def test_gemini_replays_thought_signature_verbatim():
     be.propose("state two", "director")
 
     contents = bodies[1]["contents"]
-    model_turn = contents[0]
+    assert contents[0]["role"] == "user"  # a bare model turn 400s on turn 2
+    model_turn = contents[1]
     assert model_turn["role"] == "model"
     # verbatim: every part, including the thought-summary text part
     assert model_turn["parts"][0] == {"text": "thinking"}
@@ -199,9 +201,10 @@ def test_gemini_record_results_appends_function_response():
     be.propose("state two", "director")
 
     contents = bodies[1]["contents"]
-    assert contents[0]["role"] == "model"
-    fr = contents[1]["parts"][0]["functionResponse"]
-    assert contents[1]["role"] == "user"
+    assert contents[0]["role"] == "user"  # the remembered state turn leads
+    assert contents[1]["role"] == "model"  # replayed functionCall turn
+    fr = contents[2]["parts"][0]["functionResponse"]
+    assert contents[2]["role"] == "user"
     assert fr["name"] == "timeline.split_clip"
     assert fr["response"] == {"result": "split ok"}
 
@@ -264,11 +267,12 @@ def test_planner_executor_feeds_results_to_gemini_backend(tmp_path):
     assert run.ok
     assert [s.tool for s in run.steps] == ["timeline.split_clip"]
     # executor.run is ONE propose; the recorded results are replayed on the
-    # NEXT propose: [replayed model turn, functionResponse turn, new user turn]
+    # NEXT propose: [user state, model turn, functionResponse turn, new user]
     be.propose("state two", "director")
     contents = bodies[1]["contents"]
-    assert contents[0]["role"] == "model"
-    fr = contents[1]["parts"][0]["functionResponse"]
+    assert contents[0]["role"] == "user"
+    assert contents[1]["role"] == "model"
+    fr = contents[2]["parts"][0]["functionResponse"]
     assert fr["name"] == "timeline.split_clip"
     assert fr["response"] == {"result": "split"}
     assert contents[-1]["role"] == "user"
