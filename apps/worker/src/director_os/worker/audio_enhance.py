@@ -42,6 +42,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+import numpy as np
 from director_os.audio_engine.enhance import (
     EnhancerResult,
     SpeechEnhancer,
@@ -50,6 +51,7 @@ from director_os.audio_engine.enhance import (
 from director_os.audio_engine.leveling import (
     DEFAULT_TARGET_DBFS,
     MAX_GAIN_DB,
+    decode_pcm_channels,
     decode_pcm_mono,
     measure_speech_levels,
     speech_gated_gain,
@@ -73,7 +75,17 @@ from director_os.audio_engine.vad import SileroVad, speech_gate_intervals
 # dBFS. Bumping the version is MANDATORY on any mix/tone change — the cache
 # key must not let a re-render silently reuse a master mixed with the old
 # sound.
-ENHANCE_CACHE_VERSION = "v3"
+ENHANCE_CACHE_VERSION = "v4"  # v4: muted-speech rescue (DFN3 post-mask can zero far-field dialogue)
+
+# --- speech-preservation rescue (ENHANCE_CACHE_VERSION v4) ---------------
+# A word span whose enhanced RMS dropped more than this below the precleaned
+# raw is treated as DESTROYED by the neural post-filter and gets the preclean
+# audio spliced back. 20 dB is far above the enhancer's normal broadband
+# deviation on speech it keeps (measured median ~1-3 dB).
+RESCUE_DROP_DB = 20.0
+RESCUE_PAD_S = 0.15  # extend each rescued span so word tails survive
+RESCUE_FADE_S = 0.08  # cosine ramps at the splice edges (no clicks)
+RESCUE_MERGE_GAP_S = 0.3  # contiguous rescued words play as one span
 DURATION_DRIFT_TOLERANCE_S = 0.05
 
 
@@ -217,6 +229,7 @@ class _PassResult:
     atten_lim_db: float | None
     enhancer_input: str
     gain_db: float
+    rescued_spans: int = 0
 
 
 def _extract_raw_48k(src: Path, dst: Path, ss: float | None = None, t: float | None = None) -> None:
@@ -267,6 +280,120 @@ def _extract_stem_window(stem: Path, dst: Path, ss: float, t: float) -> None:
         ],
         what="demucs stem window extract",
     )
+
+
+def _write_pcm_wav(path: Path, pcm: np.ndarray, sr: int, ch: int) -> None:
+    """Write interleaved f32 PCM back as 48 kHz stereo s16 WAV (ffmpeg pipe)."""
+    r = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "f32le",
+            "-ar",
+            str(sr),
+            "-ac",
+            str(ch),
+            "-i",
+            "pipe:0",
+            "-c:a",
+            "pcm_s16le",
+            str(path),
+        ],
+        input=pcm.tobytes(),
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        raise AudioEnhanceError(
+            f"rescue write failed ({path}): {r.stderr[-300:].decode(errors='replace')}"
+        )
+
+
+def _rescue_muted_speech(enhanced: Path, preclean: Path, transcript: dict, log, tag: str) -> int:
+    """Splice precleaned raw back over word spans the neural post-filter muted.
+
+    DeepFilterNet3's post-mask can ZERO quiet far-field speech — measured
+    13/239 words destroyed on the Eustis 0-180s window (the officer sits
+    ~3 m off-mic at ~-20 dBFS raw; the model scores those frames as noise
+    and gates them to digital silence). The enhancer may never destroy
+    dialogue: any WORD span whose enhanced RMS dropped >RESCUE_DROP_DB below
+    the precleaned raw gets the preclean audio spliced back with cosine
+    ramps. Deterministic, pass-local clock, BEFORE the duck gate — so the
+    gain refinement and the SNR receipts measure RESCUED speech, not ghosts.
+    """
+    word_spans = [
+        (float(w["start_s"]), float(w["end_s"]))
+        for w in (transcript.get("words") or [])
+        if float(w.get("end_s", 0)) > float(w.get("start_s", 0))
+    ]
+    if not word_spans:
+        return 0  # stub-ASR runs carry no word truth — nothing to rescue
+
+    enh_pcm, ch = decode_pcm_channels(enhanced, SAMPLE_RATE)
+    pre_pcm, ch_pre = decode_pcm_channels(preclean, SAMPLE_RATE)
+    if ch_pre != ch:
+        raise AudioEnhanceError(f"rescue channel mismatch: enhanced {ch}ch vs preclean {ch_pre}ch")
+    n = min(len(enh_pcm), len(pre_pcm))
+    enh_pcm, pre_pcm = enh_pcm[:n], pre_pcm[:n]
+    sr = SAMPLE_RATE
+
+    def _rms_db(seg: np.ndarray) -> float:
+        if seg.size < sr // 20 * ch:
+            return -120.0
+        return float(20 * np.log10(np.sqrt(np.mean(seg**2)) + 1e-12))
+
+    muted: list[list[float]] = []
+    for s, e in word_spans:
+        i0 = int(s * sr) * ch
+        i1 = min(int(e * sr) * ch, n)
+        i0 -= i0 % ch
+        i1 -= i1 % ch
+        if i1 - i0 < sr // 20 * ch:
+            continue
+        drop = _rms_db(pre_pcm[i0:i1]) - _rms_db(enh_pcm[i0:i1])
+        if drop > RESCUE_DROP_DB:
+            muted.append([max(0.0, s - RESCUE_PAD_S), e + RESCUE_PAD_S])
+    if not muted:
+        return 0
+
+    # merge adjacent muted words so a rescued sentence plays contiguously
+    merged: list[list[float]] = []
+    for s, e in muted:
+        if merged and s <= merged[-1][1] + RESCUE_MERGE_GAP_S:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+
+    fade = int(RESCUE_FADE_S * sr) * ch
+    ramp = np.sin(np.linspace(0.0, np.pi / 2.0, max(1, fade))) ** 2
+    out = enh_pcm.copy()
+    spliced = 0
+    for s, e in merged:
+        i0 = int(s * sr) * ch
+        i1 = min(int(e * sr) * ch, n)
+        i0 -= i0 % ch
+        i1 -= i1 % ch
+        seg = pre_pcm[i0:i1].copy()
+        if seg.size < 3 * fade:
+            continue
+        seg[:fade] *= ramp
+        seg[-fade:] *= ramp[::-1]
+        out[i0:i1] = seg
+        spliced += 1
+    if not spliced:
+        return 0
+
+    tmp = enhanced.with_suffix(".rescued.wav")
+    _write_pcm_wav(tmp, out, sr, ch)
+    tmp.replace(enhanced)
+    log(
+        f"  [audio] {tag}muted-speech rescue: {spliced} span(s) spliced from preclean "
+        f"({len(muted)} destroyed word span(s) detected)"
+    )
+    return spliced
 
 
 def _enhance_pass(
@@ -356,6 +483,10 @@ def _enhance_pass(
         )
     log(f"  [audio] {tag}enhancer_engine={result.engine} neural={result.neural}")
 
+    # 4b) speech-preservation rescue: the neural post-filter must never
+    # destroy dialogue — splice precleaned raw back over muted word spans
+    rescued_spans = _rescue_muted_speech(enhanced, preclean, transcript, log, tag)
+
     # 5) gate truth: ASR words + Silero VAD (pass-local clock)
     gate, gate_source = resolve_speech_gate(transcript, preclean, log)
     log(f"  [audio] {tag}gate={gate_source}: {len(gate)} span(s)")
@@ -442,6 +573,7 @@ def _enhance_pass(
         atten_lim_db=result.atten_lim_db,
         enhancer_input=enhancer_input,
         gain_db=gain_db,
+        rescued_spans=rescued_spans,
     )
 
 
@@ -596,6 +728,7 @@ def _pass_from_receipt(data: dict) -> _PassResult:
         atten_lim_db=data["atten_lim_db"],
         enhancer_input=str(data["enhancer_input"]),
         gain_db=float(data["gain_db"]),
+        rescued_spans=int(data.get("rescued_spans") or 0),
     )
 
 
