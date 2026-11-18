@@ -72,7 +72,11 @@ def ceiling_limit_pcm(
         return pcm
     frames = pcm.reshape(-1, channels)
     peak = np.max(np.abs(frames), axis=1)
-    cap = ceiling_linear / np.maximum(peak, 1e-9)
+    # NEVER above 1.0: content already under the ceiling must pass untouched.
+    # (Without this clamp a silent frame's cap explodes to ceiling/1e-9 and
+    # the exp(-h) gain AMPLIFIES silence into clipping — caught by the run
+    # where the refine loop walked gain to -32 dB while peaks hit +10 dBFS.)
+    cap = np.minimum(1.0, ceiling_linear / np.maximum(peak, 1e-9))
     la = max(1, int(attack_ms * sr / 1000))
     if la > 1 and cap.size > la:
         # required suppression for the NEXT attack window (look-ahead min)

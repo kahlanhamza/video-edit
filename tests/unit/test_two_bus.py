@@ -216,3 +216,25 @@ def test_ceiling_limit_pcm_sample_exact_and_smooth():
     # mono-compatible: identical channels stay identical
     frames = out.reshape(-1, 2)
     assert np.array_equal(frames[:, 0], frames[:, 1])
+
+
+def test_ceiling_limit_pcm_passthrough_below_ceiling():
+    """Regression (v5 run): silent/quiet frames must NOT be amplified.
+
+    The first ceiling revision dropped the min(1, ...) clamp: a silent
+    frame's cap exploded and exp(-h) amplified silence into clipping while
+    the gain refinement walked to -32 dB. Below-ceiling content is a no-op.
+    """
+    import numpy as np
+
+    from director_os.audio_engine.leveling import ceiling_limit_pcm
+
+    sr = 48000
+    rng = np.random.default_rng(3)
+    quiet = (rng.standard_normal(int(0.5 * sr)) * 10 ** (-30 / 20)).astype(np.float32)
+    pcm = np.repeat(quiet[:, None], 2, axis=1).reshape(-1)
+
+    ceiling = 10 ** (-2.5 / 20.0)
+    out = ceiling_limit_pcm(pcm.copy(), sr, ceiling, channels=2)
+    assert np.max(np.abs(out)) <= ceiling + 1e-6
+    assert np.allclose(out, pcm, atol=1e-7)  # untouched, sample for sample

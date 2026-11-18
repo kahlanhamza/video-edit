@@ -265,3 +265,33 @@ def test_direct_non_capacity_error_does_not_touch_fleet(modal_creds, monkeypatch
         backend.propose("state", "director")
     assert fake.calls == []
     assert backend._egress_active == "direct"
+
+
+def test_multi_turn_history_always_starts_with_user(modal_creds):
+    """Regression (Eustis autodrive round-2 400): without remembering the user
+    turn, the replayed contents START with the bare model functionCall turn —
+    Gemini rejects 'function call turn comes immediately after a user turn'."""
+    seen_role_shapes: list[list[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen_role_shapes.append([c["role"] for c in body["contents"]])
+        return httpx.Response(200, text=json.dumps(_gemini_ok_response()))
+
+    backend = GeminiRestBackend(
+        "k",
+        "gemini-3.8-flash",
+        _registry(),
+        transport=httpx.MockTransport(handler),
+        fallback_models=[],
+    )
+    steps = backend.propose("state 1", "director")
+    backend.record_results(steps, ["ok"])
+    backend.propose("state 2", "director")
+
+    assert seen_role_shapes[0] == ["user"]
+    # round 2 replays: user -> model(functionCall) -> user(fr) -> user(state)
+    assert seen_role_shapes[1][0] == "user"
+    assert seen_role_shapes[1][1] == "model"
+    assert seen_role_shapes[1][2] == "user"
+    assert seen_role_shapes[1][-1] == "user"

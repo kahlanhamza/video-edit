@@ -170,6 +170,9 @@ class GeminiRestBackend:
         self._history.append(entry)
         if len(self._history) > self.HISTORY_MAX_ENTRIES:
             del self._history[: len(self._history) - self.HISTORY_MAX_ENTRIES]
+            # the trim must never open the conversation with a bare model turn
+            while self._history and self._history[0].get("role") != "user":
+                del self._history[0]
 
     def _generate(self, payload: dict[str, Any], model_path: str = "") -> dict[str, Any]:
         """Send one generateContent with unified GEO + CAPACITY routing.
@@ -301,6 +304,13 @@ class GeminiRestBackend:
         # on the first functionCall part and must not be re-serialized through
         # the normalized ToolStep. Normalized copies live on ToolStep.provider_meta
         # for callers that need them.
+        #
+        # Protocol shape: the USER turn is remembered too. Without it, round
+        # 2's contents START with the bare model(functionCall) turn — Gemini
+        # 400s with "function call turn comes immediately after a user turn
+        # or after a function response turn" (caught live by the Eustis
+        # autodrive). History becomes user -> model -> user(fr) -> user -> ...
+        self._remember(user_turn)
         if parts:
             self._remember({"role": "model", "parts": parts})
         steps: list[ToolStep] = []
