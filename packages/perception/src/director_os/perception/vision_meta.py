@@ -174,9 +174,11 @@ class MetaVisionClient:
             return
         total = self.ledger.total_usd()
         if total >= self.budget_usd:
+            # SpendRecorder does not promise a `path`; JsonlSpendRecorder has one.
+            ledger_ref = getattr(self.ledger, "path", "spend-ledger")
             raise VisionBudgetExceededError(
                 f"Meta vision budget exhausted: ${total:.4f} >= cap "
-                f"${self.budget_usd:.2f} (ledger: {self.ledger.path})"
+                f"${self.budget_usd:.2f} (ledger: {ledger_ref})"
             )
 
     # ------------------------------------------------------------- analyze
