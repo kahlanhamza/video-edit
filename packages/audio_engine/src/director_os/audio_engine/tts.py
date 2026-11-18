@@ -218,6 +218,101 @@ def build_tts_backend() -> TtsBackend:
     return EdgeTtsBackend()
 
 
+def tts_cache_key(
+    text: str,
+    voice: str,
+    provider: str,
+    trim_pauses: bool = True,
+    model_id: str = "",
+) -> str:
+    """Content-addressed TTS identity: provider | voice | model | text | trim.
+
+    The SAME law as the segment cache: an unchanged script never re-synthesizes
+    (and never re-bills); a one-word edit changes exactly one key.
+    """
+    import hashlib
+    import json as _json
+
+    payload = _json.dumps(
+        [provider, voice, model_id, " ".join(text.split()), trim_pauses], sort_keys=True
+    )
+    return hashlib.sha256(("dos-tts-v1|" + payload).encode()).hexdigest()[:40]
+
+
+def generate_tts_cached(
+    out_dir: str | Path,
+    text: str,
+    voice: str = DEFAULT_VOICE,
+    backend: TtsBackend | None = None,
+    trim_pauses: bool = True,
+) -> tuple[TtsResult, bool]:
+    """`generate_tts` behind a content-addressed clip cache.
+
+    Clip + sidecar land in `out_dir/{key}.mp3` + `out_dir/{key}.json`. A hit
+    returns the cached stem WITHOUT touching the provider (re-renders of an
+    unchanged voiceover are free and byte-stable); a miss synthesizes, then
+    persists atomically. Returns (result, cache_hit).
+    """
+    import json as _json
+    import os as _os
+
+    text = text.strip()
+    if not text:
+        raise TtsError("refusing to synthesize empty narration text")
+    backend = backend or build_tts_backend()
+    provider = str(getattr(backend, "provider", "unknown"))
+    model_id = str(getattr(backend, "model_id", ""))
+    key = tts_cache_key(text, voice, provider, trim_pauses, model_id)
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    clip = out / f"{key}.mp3"
+    sidecar = out / f"{key}.json"
+
+    if clip.exists() and clip.stat().st_size > 0 and sidecar.exists():
+        try:
+            data = _json.loads(sidecar.read_text())
+            result = TtsResult(
+                path=clip,
+                duration_s=float(data["duration_s"]),
+                voice=str(data.get("voice", voice)),
+                text_chars=int(data.get("text_chars", len(text))),
+                provider=str(data.get("provider", provider)),
+                words=tuple(
+                    WordStamp(
+                        word=str(w["word"]), start_s=float(w["start_s"]), end_s=float(w["end_s"])
+                    )
+                    for w in data.get("words", [])
+                ),
+            )
+            return result, True
+        except (ValueError, KeyError, TypeError):
+            pass  # corrupt sidecar: re-synthesize and overwrite below
+
+    result = generate_tts(text, clip, voice=voice, backend=backend, trim_pauses=trim_pauses)
+    tmp = sidecar.with_suffix(".tmp.json")
+    tmp.write_text(
+        _json.dumps(
+            {
+                "text": text,
+                "voice": result.voice,
+                "provider": result.provider,
+                "model_id": model_id,
+                "duration_s": result.duration_s,
+                "text_chars": result.text_chars,
+                "words": [
+                    {"word": w.word, "start_s": w.start_s, "end_s": w.end_s} for w in result.words
+                ],
+                "cache_key": key,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    _os.replace(tmp, sidecar)
+    return result, False
+
+
 def generate_tts(
     text: str,
     out_path: str | Path,

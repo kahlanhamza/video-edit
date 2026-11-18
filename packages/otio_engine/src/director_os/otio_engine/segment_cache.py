@@ -84,6 +84,17 @@ class SegmentRenderSpec(BaseModel):
     # part of the cache key, so a re-enhance re-renders exactly these segments.
     enhanced_audio_path: str | None = None
     enhanced_audio_digest: str | None = None
+    # --- per-clip baked redaction source (tracked blur baked BEFORE the DAG):
+    # the segment cuts from a pre-blurred clip file; `source_digest` (derived
+    # from the plan digest + clip range, not a file read) rides the cache key
+    # so a re-swept plan re-renders exactly the affected clips. The source
+    # FILE PATH itself lives on SegmentRender (never hashed).
+    source_digest: str | None = None
+    # --- narrator voiceover stem: pre-synthesized TTS clip (content-addressed
+    # by script) mapped onto the narration segment. Path excluded from the
+    # hash; the content digest rides the key so an edited script re-renders.
+    narration_audio_path: str | None = None
+    narration_audio_digest: str | None = None
 
 
 def segment_hash(spec: SegmentRenderSpec) -> str:
@@ -93,6 +104,7 @@ def segment_hash(spec: SegmentRenderSpec) -> str:
             "cards": {"__all__": {"png_path"}},
             "spotlight_png_path": True,
             "enhanced_audio_path": True,  # machine-local path; content digest rides in the key
+            "narration_audio_path": True,  # machine-local path; content digest rides in the key
         },
     )
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -107,6 +119,11 @@ def segment_hash(spec: SegmentRenderSpec) -> str:
     if spec.enhanced_audio_path:
         digest = spec.enhanced_audio_digest or _file_digest(spec.enhanced_audio_path)
         h = hashlib.sha256(("enh|" + h + "|" + digest).encode()).hexdigest()
+    if spec.source_digest:
+        h = hashlib.sha256(("src|" + h + "|" + spec.source_digest).encode()).hexdigest()
+    if spec.narration_audio_path:
+        digest = spec.narration_audio_digest or _file_digest(spec.narration_audio_path)
+        h = hashlib.sha256(("narr|" + h + "|" + digest).encode()).hexdigest()
     return h[:40]
 
 

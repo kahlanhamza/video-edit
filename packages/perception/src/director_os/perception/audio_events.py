@@ -41,12 +41,18 @@ SAMPLE_RATE = 16000
 # AudioSet class indices (from yamnet_class_map.csv, pinned by the fetch script).
 # Groups are OUR canonical event names -> the AudioSet ontology rows that vote
 # for them. A group fires when ANY member class crosses the threshold.
+# `music` is the Content-ID guardrail (Stage 4->5): car radios / store PA /
+# background songs get the flagged ranges routed through Demucs vocal
+# separation BEFORE MossFormer2, so copyrighted material never reaches the
+# 2-bus master (indices: 24 Singing, 132 Music, 133 Musical instrument,
+# 519 Radio).
 EVENT_GROUPS: dict[str, tuple[int, ...]] = {
     "siren": (316, 317, 318, 319, 390, 391),  # emergency vehicle + sirens + civil defense
     "gunshot": (421,),  # Gunshot, gunfire
     "shout": (6, 10, 11),  # Shout / Children shouting / Screaming
     "glass": (435,),  # Glass
     "alarm": (382, 304),  # Alarm / Car alarm
+    "music": (24, 132, 133, 519),  # Singing / Music / Musical instrument / Radio
 }
 
 

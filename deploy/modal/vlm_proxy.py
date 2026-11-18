@@ -27,21 +27,30 @@ vlm_image = modal.Image.debian_slim(python_version="3.12").pip_install("requests
 vlm_secret = modal.Secret.from_local_environ(["VISION_API_KEY"])
 
 
-@app.function(image=vlm_image, secrets=[vlm_secret], timeout=120)
-def vlm_call(model: str, payload_json: str, api_version: str = "v1beta") -> dict:
+@app.function(image=vlm_image, secrets=[vlm_secret], timeout=180)
+def vlm_call(
+    model: str, payload_json: str, api_version: str = "v1beta", method: str = "post"
+) -> dict:
     import requests
 
-    r = requests.post(
-        f"https://generativelanguage.googleapis.com/{api_version}/models/{model}:generateContent",
-        headers={"x-goog-api-key": os.environ["VISION_API_KEY"]},
-        data=payload_json,
-        timeout=90,
-    )
+    url = f"https://generativelanguage.googleapis.com/{api_version}"
+    if method == "get":
+        # listing: url is .../v1beta/models (model param unused for list-all)
+        r = requests.get(
+            f"{url}/models", headers={"x-goog-api-key": os.environ["VISION_API_KEY"]}, timeout=150
+        )
+    else:
+        r = requests.post(
+            f"{url}/models/{model}:generateContent",
+            headers={"x-goog-api-key": os.environ["VISION_API_KEY"]},
+            data=payload_json,
+            timeout=150,
+        )
     return {"status": r.status_code, "body": r.text[:100_000]}
 
 
 @app.local_entrypoint()
-def main(model: str = "gemini-3.5-flash-lite"):
+def main(model: str = "gemini-3.5-flash-lite", method: str = "post"):
     import json
 
     out = vlm_call.remote(
@@ -49,5 +58,6 @@ def main(model: str = "gemini-3.5-flash-lite"):
         payload_json=json.dumps(
             {"contents": [{"role": "user", "parts": [{"text": "Reply with the single word: ok"}]}]}
         ),
+        method=method,
     )
     print(json.dumps(out, indent=2)[:600])

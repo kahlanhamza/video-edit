@@ -117,6 +117,9 @@ def compile_timeline(
     global_blur_regions: list[BlurRegion] | None = None,
     asset_geometry: Mapping[str, tuple[int, int]] | None = None,
     enhanced_audio: Mapping[str, str | Path] | None = None,
+    clip_sources: Mapping[str, str | Path] | None = None,
+    clip_source_digests: Mapping[str, str] | None = None,
+    narration_audio: Mapping[str, str | Path] | None = None,
 ) -> RenderDAG:
     """Compile the master track into renderable segments.
 
@@ -124,6 +127,17 @@ def compile_timeline(
     audio-enhance pre-pass. Raw clips authored with `audio_mode="isolate_2bus"`
     REQUIRE their entry (fail loudly — a missing master WAV must never
     silently downgrade a broadcast mix back to noisy raw audio).
+
+    `clip_sources` overrides the source file PER CLIP, keyed
+    "asset_id@start+dur" (e.g. "a1@12.000+8.000") — this is how a tracked
+    redaction plan is baked per KEPT clip (Pass 3) instead of over the whole
+    raw file: cut-out footage is never re-encoded just to have its blur
+    thrown away. `clip_source_digests` carries the derived source digest
+    (plan digest + range) that rides the segment cache key.
+
+    `narration_audio` maps a NarratorClipMeta script_text -> the persisted
+    TTS clip (stage_narration, content-addressed) so the voiceover rides the
+    render without re-synthesizing at render time.
     """
     video = video or VideoRenderSpec()
     audio = audio or AudioRenderSpec()
@@ -148,7 +162,8 @@ def compile_timeline(
         start_s = item.source_range.start_time.to_seconds() if item.source_range else 0.0
 
         if isinstance(meta, RawClipMeta):
-            src = assets.get(meta.asset_id)
+            clip_key = f"{meta.asset_id}@{start_s:.3f}+{dur:.3f}"
+            src = (clip_sources or {}).get(clip_key) or assets.get(meta.asset_id)
             if src is None:
                 raise TimelineCompileError(f"unknown asset_id '{meta.asset_id}' in master track")
             zoom_keyframes: list[ZoomKeyframe] = list(meta.zoom_keyframes)
@@ -207,12 +222,19 @@ def compile_timeline(
                 spotlight_png_path=str(spotlight_png) if spotlight_png else None,
                 enhanced_audio_path=enhanced_path,
                 enhanced_audio_digest=enhanced_digest,
+                source_digest=(clip_source_digests or {}).get(clip_key),
                 codec_profile=f"{video.codec}-{video.pix_fmt}-{video.fps}fps-{audio.sample_rate}hz",
             )
         elif isinstance(meta, NarratorClipMeta):
             src = assets.get(meta.broll_asset_id) if meta.broll_asset_id else None
             if meta.broll_asset_id and src is None:
                 raise TimelineCompileError(f"unknown broll asset_id '{meta.broll_asset_id}'")
+            narr_path: str | None = None
+            narr_digest: str | None = None
+            narr_src = (narration_audio or {}).get(meta.script_text)
+            if narr_src is not None:
+                narr_path = str(Path(narr_src).resolve())
+                narr_digest = _file_digest_sha256(Path(narr_src))[:24]
             spec = SegmentRenderSpec(
                 kind="narration",
                 asset_id=meta.broll_asset_id or "",
@@ -222,6 +244,8 @@ def compile_timeline(
                 audio=audio,
                 audio_filters=[],
                 narration_text=meta.script_text,
+                narration_audio_path=narr_path,
+                narration_audio_digest=narr_digest,
                 codec_profile=f"{video.codec}-{video.pix_fmt}-{video.fps}fps-{audio.sample_rate}hz",
             )
         else:  # pragma: no cover — master track must be raw/narration only

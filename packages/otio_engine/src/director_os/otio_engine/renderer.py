@@ -75,14 +75,24 @@ def build_segment_cmd(
     #      silent 48 kHz stereo bed so the stream map never goes missing.
     #      2-bus mode: the audio is the pre-mixed master WAV (separate input,
     #      sliced on the same window), not the raw source stream.
+    #      narration mode: the audio is the pre-synthesized TTS clip
+    #      (stage_narration, content-addressed) when one was persisted.
     two_bus = bool(spec.enhanced_audio_path) and spec.kind == "raw"
-    silence_needed = (spec.kind == "narration") or (not src_has_audio and not two_bus)
+    narration_audio = bool(spec.narration_audio_path) and spec.kind == "narration"
+    silence_needed = (spec.kind == "narration" and not narration_audio) or (
+        not src_has_audio and not two_bus and spec.kind == "raw"
+    )
     if two_bus:
         # video+overlay inputs, then the enhanced audio input (same window)
         enhanced_idx = n_inputs
         cmd += exact_slice_args(spec.source_start_s, spec.source_start_s + dur)
         cmd += ["-i", str(spec.enhanced_audio_path)]
         audio_input_idx = enhanced_idx
+    elif narration_audio:
+        # voiceover stem rides from 0 — narration segments are authored to the
+        # TTS clip's timeline (the persisted clip IS the source of truth)
+        audio_input_idx = n_inputs
+        cmd += ["-i", str(spec.narration_audio_path)]
     elif silence_needed:
         audio_input_idx = n_inputs
         cmd += [

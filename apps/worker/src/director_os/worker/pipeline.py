@@ -4,11 +4,20 @@ Each stage persists its product in a DOMAIN table before advancing the job
 row, so a worker that dies mid-pipeline resumes without redoing paid work:
 
 - ingest     -> `media_assets` (probe facts)          — idempotent per project+source
+- redaction  -> `perception_index.redaction_tracks_json` (sweep plan, keep opt-outs)
 - perception -> `perception_index` (ASR transcript)   — idempotent per asset: the
                crash-resume guarantee "never re-run ASR/TTS" comes from here
+- proofread  -> `transcript_json["proofread"]` (jargon + Officer/Suspect roles)
+- vision     -> `shots_json` (frame quality, YAMNet events incl. Music, VLM
+               index + Frames-on-Demand QA, AXON OCR) — every product optional
 - planning   -> `timeline_versions` + `projects.active_otio_version_id`
+- narration  -> content-addressed TTS clips on disk (re-renders never re-bill)
+- audio_prep -> 2-bus masters, LAZY per KEPT window (content-addressed; the
+               cut-out footage never runs through the neural enhancer)
 - render     -> `segment_cache` (content-addressed)   — misses only, ever
+- subtitles  -> subtitles.{json,ass,srt} (proofread words, 2-row karaoke)
 - qa         -> `audit_technical` report; failure parks the job in `qa_failed`
+- ship_pack  -> output/pipeline/<project>/ship_pack/ (Stage 10 creator bundle)
 
 The ASR callable is injected (`deps.transcribe`): Gladia in production, a stub
 in tests. Nothing here talks to the network.
@@ -16,6 +25,7 @@ in tests. Nothing here talks to the network.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from collections.abc import Callable
@@ -184,6 +194,101 @@ def stage_perception(asset_id: str, source: Path, project_id: str, deps: Pipelin
     return payload
 
 
+def stage_proofread(asset_id: str, transcript: dict, project_id: str, deps: PipelineDeps) -> dict:
+    """Police-jargon proofread + Officer/Suspect role tagging — persisted, idempotent.
+
+    Product lives in `perception_index.transcript_json["proofread"]` (the same
+    durability contract as ASR): jargon corrections ("ten four" -> "10-4",
+    "DL" -> "driver's license") re-timed via difflib alignment, diarization
+    labels mapped to documentary roles. Downstream consumers (subtitles,
+    narration, Director planning) read the tagged words; crash-resume never
+    re-derives the pass.
+    """
+    with deps.sessions() as s:
+        row = s.get(PerceptionIndexRow, asset_id)
+        existing = (row.transcript_json or {}).get("proofread") if row else None
+        if existing and existing.get("words"):
+            deps.log(f"  [proofread] {len(existing['words'])} word(s) already persisted — skip")
+            return existing
+
+    from director_os.subtitles.proofread import prepare_transcript
+
+    proof = prepare_transcript(transcript)
+    with deps.sessions() as s:
+        row = s.get(PerceptionIndexRow, asset_id)
+        if row is None:
+            row = PerceptionIndexRow(asset_id=asset_id)
+            s.add(row)
+        row.transcript_json = {**(row.transcript_json or {}), "proofread": proof}
+        s.commit()
+    roles = proof.get("speaker_roles") or {}
+    deps.log(
+        f"  [proofread] {len(proof['words'])} word(s), {len(proof['corrections'])} jargon "
+        f"fix(es), roles: {roles if roles else '(no diarization)'}"
+    )
+    return proof
+
+
+def stage_narration(timeline, project_id: str, deps: PipelineDeps) -> list[dict]:
+    """Persist narrator TTS clips BEFORE render — re-renders never regenerate.
+
+    Walks NarratorClipMeta clips on the master track; every script is
+    content-addressed (`tts_cache_key`: provider|voice|text) into
+    output/pipeline/<project>/narration/{key}.mp3 + .json. An unchanged
+    voiceover is a cache hit (never re-synthesized, never re-billed); an
+    edited script changes exactly one key. The compiled narration segments
+    ride the persisted clip (compile_timeline `narration_audio=`), so the
+    voiceover in the shipped master IS the cached clip.
+    """
+    from director_os.audio_engine.tts import generate_tts_cached
+    from director_os.otio_engine.contract import NarratorClipMeta, parse_clip_meta
+    from director_os.otio_engine.timeline import MASTER_TRACK, is_gap, track_by_name
+
+    master = track_by_name(timeline, MASTER_TRACK)
+    clips: list[dict] = []
+    if master is not None:
+        for item in master:
+            if is_gap(item):
+                continue
+            try:
+                meta = parse_clip_meta(item)
+            except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(meta, NarratorClipMeta):
+                continue
+            out_dir = deps.settings.output_dir / "pipeline" / project_id / "narration"
+            result, cache_hit = generate_tts_cached(out_dir, meta.script_text, voice=meta.voice_id)
+            clips.append(
+                {
+                    "item": getattr(item, "name", "") or "",
+                    "script_chars": len(meta.script_text),
+                    "clip": str(result.path),
+                    "duration_s": round(result.duration_s, 3),
+                    "provider": result.provider,
+                    "voice": meta.voice_id,
+                    "cache_hit": cache_hit,
+                }
+            )
+            deps.log(
+                f"  [narration] clip {'cache hit' if cache_hit else 'synthesized'} "
+                f"({result.duration_s:.1f}s, {result.provider}) -> {result.path.name}"
+            )
+    if not clips:
+        deps.log("  [narration] no narrator clips on the timeline — nothing to synthesize")
+        return clips
+
+    manifest = deps.settings.output_dir / "pipeline" / project_id / "narration" / "clips.json"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_json_write(manifest, {"clips": clips})
+    return clips
+
+
+def _atomic_json_write(path: Path, payload: dict) -> None:
+    tmp = path.with_suffix(".tmp.json")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    tmp.replace(path)
+
+
 def stage_redaction(
     asset_id: str, source: Path, project_id: str, deps: PipelineDeps, max_regions: int = 8
 ) -> list:
@@ -216,7 +321,7 @@ def stage_redaction(
     if backend == "tracked":
         try:
             tracked_payload = _tracked_redaction_payload(
-                source, project_id, deps, frame_w, frame_h, max_regions
+                source, project_id, deps, frame_w, frame_h, max_regions, asset_id=asset_id
             )
             regions = tracked_payload["regions"]
             source_tag = tracked_payload["source"]
@@ -282,6 +387,35 @@ def stage_redaction(
     return payload_json["regions"]
 
 
+def _resolve_keep_track_ids(deps: PipelineDeps, asset_id: str) -> tuple[set[str], str]:
+    """Per-track redaction opt-out (Stage 2/9 contract).
+
+    Sources (union):
+    - env `REDACT_KEEP_TRACKS` — comma-separated track ids ("person_1")
+    - persisted `redaction_tracks_json["keep_track_ids"]` (Director Studio
+      per-track toggles ride the same field)
+
+    (the keep_primary POLICY is applied by the caller, which has the live
+    detections)
+
+    PLATES ARE NEVER KEEPABLE: `plate_*` ids are stripped from the keep set —
+    a license plate is PII even when its owner is the subject of the video.
+    Returns (keep_ids, policy_tag).
+    """
+    keep: set[str] = set()
+    for tok in (os.getenv("REDACT_KEEP_TRACKS") or "").split(","):
+        tok = tok.strip()
+        if tok:
+            keep.add(tok)
+    policy = (os.getenv("REDACT_TRACK_POLICY") or "").strip().lower() or "all"
+    with deps.sessions() as s:
+        row = s.get(PerceptionIndexRow, asset_id)
+    if row is not None:
+        keep |= set((row.redaction_tracks_json or {}).get("keep_track_ids") or [])
+    keep = {k for k in keep if not k.startswith("plate_")}
+    return keep, policy
+
+
 def _tracked_redaction_payload(
     source: Path,
     project_id: str,
@@ -289,6 +423,7 @@ def _tracked_redaction_payload(
     frame_w: int,
     frame_h: int,
     max_regions: int,
+    asset_id: str = "",
 ) -> dict[str, Any]:
     """Pass 1+2 of the 3-pass pipeline — the plan the render stage bakes in.
 
@@ -296,9 +431,13 @@ def _tracked_redaction_payload(
     for the render bake, and static padded regions (studio canvas). The plan
     digest rides in the payload so a re-sweep invalidates the baked source
     naturally (content-addressed, like the segment cache).
+
+    Per-track opt-out: `keep_track_ids` (Studio/env) + `track_policy` are
+    honored BEFORE Pass 2 — kept tracks never enter the trajectory plan, so
+    the bake, the static regions and the zero-leak audit all agree on what is
+    blurred. Plates are exempt from keeping (PII law).
     """
     import hashlib
-    import json as _json
 
     from director_os.vision_fx.compute.local_onnx import LocalOnnxCpuBackend
     from director_os.vision_fx.compute.tracker import (
@@ -314,6 +453,8 @@ def _tracked_redaction_payload(
     if not caps.get("yolo_model"):
         raise RuntimeError("yolov8n-face model not present (run scripts/fetch_yolov8n_face.py)")
 
+    keep_ids, policy = _resolve_keep_track_ids(deps, asset_id)
+
     out_dir = deps.settings.output_dir / "pipeline" / project_id
     out_dir.mkdir(parents=True, exist_ok=True)
     cfr_path = normalize_cfr(source, out_dir / "source_cfr.mp4")
@@ -327,13 +468,35 @@ def _tracked_redaction_payload(
         # plates ride the same 3-pass law (issue #12): same sweep, same GMC
         # tracker, same Pass-2 repair. Absent model -> faces-only, never a blocker.
         plate_tracks = backend.detect_plates(cfr_path)
+
+    # keep-primary heuristic BEFORE the merge (id collision handling intact):
+    # the primary subject = the face track with the most sampled detections
+    # (the person the camera follows — suspect or officer)
+    if policy == "keep_primary" and tracks:
+        primary = max(tracks, key=lambda t: len(t.hits))
+        if not primary.track_id.startswith("plate_"):
+            keep_ids.add(primary.track_id)
+            deps.log(f"  [redaction] keep_primary policy: {primary.track_id} stays visible")
+
+    if keep_ids:
+        tracks = [t for t in tracks if t.track_id not in keep_ids]
+        deps.log(
+            f"  [redaction] per-track opt-out: {len(keep_ids)} track(s) kept visible "
+            f"({sorted(keep_ids)}); plates always blurred"
+        )
+
     try:
         merged = merge_redaction_tracks(tracks, plate_tracks)
     except EmptySweepError as e:
         # A sweep that sees NOTHING is a broken sweep, not an empty scene:
         # shipping it bakes zero redaction while the audit passes vacuously
         # (0 detections = 0 leaks). Fail the stage loud — privacy is not soft.
-        raise RuntimeError(str(e)) from e
+        # EXCEPT when the operator deliberately kept every detected identity.
+        if not keep_ids:
+            raise RuntimeError(str(e)) from e
+        deps.log("  [redaction] all identities deliberately kept visible (opt-out policy)")
+        merged = []
+
     plan = repair_trajectories(merged, fps=30, frame_w=frame_w, frame_h=frame_h, n_frames=n_frames)
     from director_os.vision_fx.redact_track import assert_zero_leaks
 
@@ -341,7 +504,7 @@ def _tracked_redaction_payload(
 
     regions = tracks_to_regions(merged, frame_w=frame_w, frame_h=frame_h)[:max_regions]
     plan_json = plan.model_dump(mode="json")
-    digest = hashlib.sha256(_json.dumps(plan_json, sort_keys=True).encode()).hexdigest()[:8]
+    digest = hashlib.sha256(json.dumps(plan_json, sort_keys=True).encode()).hexdigest()[:8]
     deps.log(
         f"  [redaction] tracked plan: {len(plan.trajectories)} track(s) "
         f"({len(tracks)} face + {len(plate_tracks)} plate), "
@@ -352,6 +515,8 @@ def _tracked_redaction_payload(
         "per_frame": plan_json,
         "plan_digest": digest,
         "source": "tracked_local_gmc_3pass",
+        "keep_track_ids": sorted(keep_ids),
+        "track_policy": policy,
         "stats": {
             "tracks": len(tracks),
             "plate_tracks": len(plate_tracks),
@@ -369,13 +534,11 @@ def _tracked_redacted_source(
     asset_id: str,
     out_dir: Path,
 ) -> Path | None:
-    """Pass 3 — bake the per-frame plan into a redacted source (once, cached).
+    """Pass 3 (whole-source variant) — bake the plan into ONE redacted file.
 
-    When the persisted plan exists (REDACT_MODE=tracked) the render DAG cuts
-    its segments from THIS file instead of the raw source, so every segment —
-    cached or fresh — inherits zero-leak redaction. Content-addressed by the
-    plan digest: a changed plan is a different file, a stale artifact never
-    gets reused.
+    LEGACY fallback kept for full-source renders (REDACT_BAKE=full). The
+    default path is per-clip baking (`_tracked_redacted_clip`): only KEPT
+    clips get re-encoded, cut-out footage never pays the blur tax.
     """
     with deps.sessions() as s:
         row = s.get(PerceptionIndexRow, asset_id)
@@ -384,7 +547,6 @@ def _tracked_redacted_source(
     if not per_frame or deps.redact_backend != "tracked":
         return None
     from director_os.vision_fx.redact_track import (
-        normalize_cfr,
         render_tracked_redaction,
     )
     from director_os.vision_fx.trajectory import PerFrameRedaction
@@ -395,7 +557,7 @@ def _tracked_redacted_source(
     if dst.exists() and dst.stat().st_size > 0:
         deps.log(f"  [render] baked redacted source reuse ({dst.name})")
         return dst
-    cfr_path = normalize_cfr(source, out_dir / "source_cfr.mp4")
+    cfr_path = _cfr_source(source, out_dir)
     deps.log(f"  [render] baking tracked redaction source ({digest})...")
     render_tracked_redaction(
         cfr_path,
@@ -405,6 +567,199 @@ def _tracked_redacted_source(
         n_frames_expected=plan.n_frames,
     )
     return dst
+
+
+def _cfr_source(source: Path, out_dir: Path) -> Path:
+    """CFR-normalized source, cached (a re-run never re-transcodes the raw)."""
+    from director_os.vision_fx.redact_track import normalize_cfr
+
+    dst = out_dir / "source_cfr.mp4"
+    if not (dst.exists() and dst.stat().st_size > 0):
+        normalize_cfr(source, dst)
+    else:
+        from director_os.vision_fx.redact_track import probe_cfr
+
+        exact, _fps, n = probe_cfr(dst)
+        if not exact or n <= 0:
+            normalize_cfr(source, dst)
+    return dst
+
+
+def _clip_plan(plan, start_s: float, dur_s: float):
+    """Per-clip PerFrameRedaction: boxes of [start, start+dur) re-indexed to clip-local frames."""
+    from director_os.vision_fx.trajectory import (
+        PerFrameRedaction,
+        RedactionTrajectory,
+        TrackedBox,
+    )
+
+    fps = float(plan.fps)
+    f0 = int(round(start_s * fps))
+    f1 = int(round((start_s + dur_s) * fps))
+    trajectories: list[RedactionTrajectory] = []
+    for tr in plan.trajectories:
+        boxes = [
+            TrackedBox(
+                frame_idx=b.frame_idx - f0,
+                t_s=round(b.frame_idx / fps - start_s, 3),
+                x=b.x,
+                y=b.y,
+                w=b.w,
+                h=b.h,
+                bridged=b.bridged,
+                lead=b.lead,
+            )
+            for b in tr.boxes
+            if f0 <= b.frame_idx < f1
+        ]
+        if boxes:
+            trajectories.append(RedactionTrajectory(track_id=tr.track_id, boxes=boxes))
+    return PerFrameRedaction(
+        fps=plan.fps,
+        n_frames=max(1, f1 - f0),
+        frame_w=plan.frame_w,
+        frame_h=plan.frame_h,
+        trajectories=trajectories,
+    )
+
+
+def _tracked_redacted_clip(
+    deps: PipelineDeps,
+    source: Path,
+    out_dir: Path,
+    plan,
+    plan_digest: str,
+    start_s: float,
+    dur_s: float,
+) -> Path | None:
+    """Pass 3 PER KEPT CLIP — blur baked into a clip-local file, cache-addressed.
+
+    The expensive property: a 60-180 min FOIA packet where Stage 6 keeps 15%
+    pays blur-bake for 15%, never 100%. Cache name carries the plan digest +
+    the exact clip range, so a re-swept plan or a moved cut invalidates only
+    the affected clips.
+    """
+    from director_os.core.ffmpeg_args import exact_slice_args
+    from director_os.vision_fx.redact_track import render_tracked_redaction, video_n_frames
+
+    clip_plan = _clip_plan(plan, start_s, dur_s)
+    dst = (
+        out_dir
+        / f"redacted_clip_{plan_digest}_{int(start_s * 1000):07d}_{int(dur_s * 1000):06d}.mp4"
+    )
+    if dst.exists() and dst.stat().st_size > 0:
+        return dst
+    cfr_path = _cfr_source(source, out_dir)
+    # exact clip extraction off the CFR source (re-encode: stream copy would
+    # cut on keyframes and break the frame-index contract)
+    clip_src = out_dir / f"_clip_{int(start_s * 1000):07d}_{int(dur_s * 1000):06d}.mp4"
+    _run_ffmpeg(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            *exact_slice_args(start_s, start_s + dur_s),
+            "-i",
+            str(cfr_path),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "16",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "copy",
+            str(clip_src),
+        ],
+        what="kept-clip extraction",
+    )
+    n = video_n_frames(clip_src)
+    if not n:
+        clip_src.unlink(missing_ok=True)
+        raise RuntimeError(f"clip extraction frame count unknown at {start_s:.2f}s")
+    render_tracked_redaction(
+        clip_src,
+        clip_plan,
+        dst,
+        mode="gauss",
+        n_frames_expected=min(n, clip_plan.n_frames),
+    )
+    clip_src.unlink(missing_ok=True)
+    return dst
+
+
+def _run_ffmpeg(cmd: list[str], what: str) -> None:
+    import subprocess as _sp
+
+    r = _sp.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"{what} failed: {r.stderr[-400:]}")
+
+
+def _baked_clip_sources(
+    deps: PipelineDeps,
+    project_id: str,
+    source: Path,
+    asset_id: str,
+    timeline,
+    out_dir: Path,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Per-clip baked sources + digests for every KEPT raw clip (Pass 3, lazy).
+
+    Returns ({clip_key: path}, {clip_key: source_digest}) for compile_timeline.
+    A bake failure degrades that clip to the raw source — loudly.
+    """
+    from director_os.otio_engine.contract import RawClipMeta, parse_clip_meta
+    from director_os.otio_engine.timeline import (
+        MASTER_TRACK,
+        is_gap,
+        item_duration_s,
+        track_by_name,
+    )
+    from director_os.vision_fx.trajectory import PerFrameRedaction
+
+    with deps.sessions() as s:
+        row = s.get(PerceptionIndexRow, asset_id)
+        payload = (row.redaction_tracks_json or {}) if row else {}
+    per_frame = payload.get("per_frame")
+    if not per_frame or deps.redact_backend != "tracked":
+        return {}, {}
+    plan = PerFrameRedaction.model_validate(per_frame)
+    digest = str(payload.get("plan_digest") or "unpinned")
+
+    master = track_by_name(timeline, MASTER_TRACK)
+    if master is None:
+        return {}, {}
+    sources: dict[str, str] = {}
+    digests: dict[str, str] = {}
+    for item in master:
+        dur = item_duration_s(item)
+        if dur <= 0 or is_gap(item):
+            continue
+        try:
+            meta = parse_clip_meta(item)
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(meta, RawClipMeta) or meta.asset_id != asset_id:
+            continue
+        start_s = item.source_range.start_time.to_seconds() if item.source_range else 0.0
+        clip_key = f"{asset_id}@{start_s:.3f}+{dur:.3f}"
+        try:
+            baked = _tracked_redacted_clip(deps, source, out_dir, plan, digest, start_s, dur)
+        except Exception as e:  # noqa: BLE001 — one bad clip never kills the render
+            deps.log(f"  [render] clip bake failed at {start_s:.2f}s ({e}) — raw fallback")
+            continue
+        sources[clip_key] = str(baked)
+        digests[clip_key] = f"{digest}@{start_s:.3f}+{dur:.3f}"
+    if sources:
+        deps.log(
+            f"  [render] baked {len(sources)} kept clip(s) with tracked redaction (digest {digest})"
+        )
+    return sources, digests
 
 
 def stage_vision_enrichment(asset_id: str, source: Path, deps: PipelineDeps) -> None:
@@ -485,6 +840,49 @@ def stage_vision_enrichment(asset_id: str, source: Path, deps: PipelineDeps) -> 
             )
         except Exception as e:  # noqa: BLE001
             deps.log(f"  [vision] contact-sheet indexing skipped: {e}")
+
+    # Tier 2 — Frames-on-Demand QA: the FLAGSHIP model verifies the risky
+    # moments the lite index flagged (full-res frames around the timestamp,
+    # overlay/zoom safety check). Capped so the spend stays bounded; every
+    # failure is soft — the pipeline never depends on the tier-2 pass.
+    if deps.settings.vision_api_key and "fod_qa" not in shots:
+        try:
+            from director_os.perception.vision import SceneInsight
+            from director_os.perception.vision_index import (
+                frames_on_demand,
+                make_vision_clients,
+                qa_placement,
+                suggest_fod_timestamps,
+            )
+
+            tl = shots.get("visual_timeline") or {}
+            insights = [SceneInsight.model_validate(i) for i in tl.get("insights", [])]
+            max_fod = int(os.getenv("VISION_FOD_MAX", "3"))
+            picks = suggest_fod_timestamps(insights)[:max_fod]
+            if picks:
+                _, qa_adapter = make_vision_clients(deps.settings.vision_api_key)
+                fod_dir = deps.settings.output_dir / "pipeline" / asset_id / "fod"
+                runs: list[dict[str, Any]] = []
+                for t in picks:
+                    frames = frames_on_demand(str(source), t, out_dir=fod_dir)
+                    found = qa_placement(
+                        qa_adapter, frames, "overlay/zoom placement safety check", t
+                    )
+                    runs.append({"t_s": t, "insights": [i.model_dump(mode="json") for i in found]})
+                shots["fod_qa"] = {
+                    "model": qa_adapter._client.model  # type: ignore[attr-defined]
+                    if hasattr(qa_adapter._client, "model")
+                    else "fake",
+                    "runs": runs,
+                }
+                deps.log(
+                    f"  [vision] frames-on-demand QA: {len(runs)} run(s) at "
+                    f"{[r['t_s'] for r in runs]}"
+                )
+            else:
+                deps.log("  [vision] frames-on-demand: no risky moments picked")
+        except Exception as e:  # noqa: BLE001
+            deps.log(f"  [vision] frames-on-demand QA skipped: {e}")
 
     # Overlay OCR runs on EVERY asset: the LOCAL free PaddleOCR lane first
     # (cost law — CPU, $0, no key), Gemini only as the fallback when paddleocr
@@ -658,6 +1056,8 @@ def _timeline_from_json(otio_json: dict):
 def stage_subtitles(timeline, transcript: dict, project_id: str, deps: PipelineDeps) -> Path:
     """Build the karaoke .ass sidecar from the transcript (deterministic, free).
 
+    Word source: the PROOFREAD product when present (jargon-corrected,
+    Officer/Suspect role-tagged — stage_proofread), else the raw ASR words.
     No paid API and a pure function of (timeline rate, transcript), so crash-
     resume is satisfied by recomputation — the stage never blocks recovery.
     Output lands next to the timeline: output/pipeline/<project>/subtitles.{json,ass,srt}.
@@ -666,12 +1066,26 @@ def stage_subtitles(timeline, transcript: dict, project_id: str, deps: PipelineD
     from director_os.subtitles.ass_builder import CaptionBeat, WordTiming
     from director_os.subtitles.store import save_cues
 
-    words = [w for w in transcript.get("words", []) if w.get("text")]
-    sub_dir = deps.settings.output_dir / "pipeline" / project_id
+    # proofread first (tagged roles drive the 2-row speaker colors); raw words
+    # keep the stage usable before/without the proofread pass
+    proof = (transcript or {}).get("proofread") or {}
+    words_src = [w for w in proof.get("words", []) if w.get("text")] or [
+        w for w in transcript.get("words", []) if w.get("text")
+    ]
+    # the proofread shape uses "text" (transcript contract); normalize raw too
+    words = []
+    for w in words_src:
+        item = dict(w)
+        if not item.get("text") and item.get("word"):
+            item["text"] = item["word"]
+        words.append(item)
     if not words:
         deps.log("  [subtitles] transcript empty — skipping ass build")
+        sub_dir = deps.settings.output_dir / "pipeline" / project_id
         save_cues(sub_dir, [])
         return sub_dir / "subtitles.ass"
+
+    sub_dir = deps.settings.output_dir / "pipeline" / project_id
 
     beats: list[CaptionBeat] = []
     MAX_WORDS, MAX_S = 6, 3.5
@@ -760,14 +1174,18 @@ def stage_render(
     asset_id: str,
     deps: PipelineDeps,
     enhanced_audio: dict[str, Path] | None = None,
+    narration_audio: dict[str, Path] | None = None,
 ) -> tuple[RenderReport, Path]:
     """Compile + segment-cached render (content-addressed idempotency).
 
-    REDACT_MODE=tracked + a persisted per-frame plan -> segments are cut from
-    the baked redacted source (Pass 3), so the privacy redaction is frame-
-    exact regardless of segment cache hits; the static blur regions still
-    ride the filtergraph for studio-drawn boxes. `enhanced_audio` feeds the
-    2-bus speech-isolation masters (audio_mode=isolate_2bus).
+    REDACT_MODE=tracked + a persisted per-frame plan -> each KEPT clip is cut
+    from its own baked redacted file (Pass 3 per-clip, content-addressed by
+    plan digest + range) so cut-out footage never pays the blur tax; a clip
+    bake failure degrades that clip to the raw source, loudly. Static blur
+    regions still ride the filtergraph for studio-drawn boxes.
+    `enhanced_audio` feeds the 2-bus speech-isolation masters
+    (audio_mode=isolate_2bus); `narration_audio` feeds the persisted TTS
+    voiceover clips (stage_narration) onto the narration segments.
     """
     out_dir = deps.settings.output_dir / "pipeline" / project_id
     save_otio(timeline, out_dir / "timeline.otio")
@@ -779,11 +1197,21 @@ def stage_render(
         if asset and asset.width > 0 and asset.height > 0
         else None
     )
+    clip_sources: dict[str, str] = {}
+    clip_digests: dict[str, str] = {}
     baked_source: Path | None = None
-    try:
-        baked_source = _tracked_redacted_source(deps, project_id, source, asset_id, out_dir)
-    except Exception as e:  # a bake failure degrades to static regions, loudly
-        deps.log(f"  [render] tracked redaction bake failed ({e}) — using raw source")
+    if os.getenv("REDACT_BAKE", "").strip().lower() != "full":
+        try:
+            clip_sources, clip_digests = _baked_clip_sources(
+                deps, project_id, source, asset_id, timeline, out_dir
+            )
+        except Exception as e:  # a bake failure degrades to raw + static regions, loudly
+            deps.log(f"  [render] per-clip tracked bake failed ({e}) — raw source fallback")
+    if not clip_sources:
+        try:
+            baked_source = _tracked_redacted_source(deps, project_id, source, asset_id, out_dir)
+        except Exception as e:  # a bake failure degrades to static regions, loudly
+            deps.log(f"  [render] tracked redaction bake failed ({e}) — using raw source")
     dag = compile_timeline(
         timeline,
         assets={asset_id: str(baked_source or source)},
@@ -795,6 +1223,9 @@ def stage_render(
         global_blur_regions=_project_redaction_regions(deps.sessions, asset_id),
         asset_geometry=geometry,
         enhanced_audio=enhanced_audio or None,
+        clip_sources=clip_sources or None,
+        clip_source_digests=clip_digests or None,
+        narration_audio=narration_audio or None,
     )
     deps.log(f"  [render] {len(dag.segments)} segment(s), {dag.total_dur_s:.1f}s master")
     report = render_dag(dag, cache, log=deps.log, max_workers=deps.max_workers)
@@ -848,6 +1279,39 @@ def stage_qa(
     return audit
 
 
+def kept_windows_from_timeline(timeline, asset_id: str) -> list[tuple[float, float]]:
+    """Master-track raw clips of one asset -> merged keep ranges (source time).
+
+    This is the lazy-processing contract: everything the Director kept is
+    enhanced + baked; everything cut is never touched again.
+    """
+    from director_os.otio_engine.contract import RawClipMeta, parse_clip_meta
+    from director_os.otio_engine.timeline import (
+        MASTER_TRACK,
+        is_gap,
+        item_duration_s,
+        track_by_name,
+    )
+
+    master = track_by_name(timeline, MASTER_TRACK)
+    if master is None:
+        return []
+    windows: list[tuple[float, float]] = []
+    for item in master:
+        dur = item_duration_s(item)
+        if dur <= 0 or is_gap(item):
+            continue
+        try:
+            meta = parse_clip_meta(item)
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(meta, RawClipMeta) or meta.asset_id != asset_id:
+            continue
+        start_s = item.source_range.start_time.to_seconds() if item.source_range else 0.0
+        windows.append((start_s, start_s + dur))
+    return windows
+
+
 # --------------------------------------------------------------------- runner
 def run_pipeline(
     source: Path | str,
@@ -891,19 +1355,79 @@ def run_pipeline(
             _update_job(deps.sessions(), job_id, JobStage.redaction, 15.0)
             stage_redaction(asset_id, source, project_id, deps)
 
-        _update_job(deps.sessions(), job_id, JobStage.perception, 25.0)
+        _update_job(deps.sessions(), job_id, JobStage.perception, 22.0)
         transcript = stage_perception(asset_id, source, project_id, deps)
+
+        _update_job(deps.sessions(), job_id, JobStage.proofread, 26.0)
+        try:
+            proof = stage_proofread(asset_id, transcript, project_id, deps)
+            transcript = {**transcript, "proofread": proof}
+        except PipelineError:
+            raise
+        except Exception as e:  # noqa: BLE001 — captions survive on raw words
+            deps.log(f"  [proofread] skipped ({e}) — subtitles fall back to raw ASR")
 
         if deps.vision_enrich:
             stage_vision_enrichment(asset_id, source, deps)
 
-        # 2-bus speech isolation runs BEFORE planning so the compiled clips
-        # (audio_mode=isolate_2bus) always find their master WAV at render time
+        _update_job(deps.sessions(), job_id, JobStage.planning, 40.0)
+        timeline, version = stage_planning(asset_id, transcript, project_id, deps)
+
+        _update_job(deps.sessions(), job_id, JobStage.narration, 46.0)
+        narration_audio: dict[str, Path] | None = None
+        try:
+            narration_clips = stage_narration(timeline, project_id, deps)
+        except Exception as e:  # noqa: BLE001 — a TTS outage must not kill the cut
+            deps.log(f"  [narration] skipped ({e}) — narration segments render silent")
+            narration_clips = []
+        if narration_clips:
+            from director_os.otio_engine.contract import NarratorClipMeta, parse_clip_meta
+            from director_os.otio_engine.timeline import MASTER_TRACK, is_gap, track_by_name
+
+            master = track_by_name(timeline, MASTER_TRACK)
+            narration_audio = {}
+            if master is not None:
+                for item in master:
+                    if is_gap(item):
+                        continue
+                    try:
+                        meta = parse_clip_meta(item)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if not isinstance(meta, NarratorClipMeta):
+                        continue
+                    match = next(
+                        (
+                            c
+                            for c in narration_clips
+                            if c.get("item") == (getattr(item, "name", "") or "")
+                        ),
+                        None,
+                    )
+                    if match and Path(match["clip"]).exists():
+                        narration_audio[meta.script_text] = Path(match["clip"])
+
+        # Stage 4 -> 5 seam: YAMNet music spans route the Demucs vocals stem
+        # into the enhancer (Content-ID guardrail) BEFORE any heavy processing
+        music_spans: list[tuple[float, float]] = []
+        if deps.audio_mode == "isolate_2bus":
+            with deps.sessions() as s:
+                prow = s.get(PerceptionIndexRow, asset_id)
+            shots = (prow.shots_json or {}) if prow else {}
+            from director_os.worker.music_guard import resolve_music_routing
+
+            music_spans, _resolver_active = resolve_music_routing(asset_id, shots, deps)
+
+        # LAZY heavy processing: 2-bus enhancement runs AFTER planning, per
+        # KEPT window — the cut-out 85% of a long FOIA packet is never sent
+        # through MossFormer2. Compiled clips (audio_mode=isolate_2bus) find
+        # their master WAV at render time, exactly as before.
         enhance_info = None
         if deps.audio_mode == "isolate_2bus":
-            _update_job(deps.sessions(), job_id, JobStage.audio_prep, 38.0)
+            _update_job(deps.sessions(), job_id, JobStage.audio_prep, 52.0)
             from director_os.worker.audio_enhance import stage_audio_enhance
 
+            kept = kept_windows_from_timeline(timeline, asset_id)
             enhance_info = stage_audio_enhance(
                 asset_id,
                 source,
@@ -911,10 +1435,9 @@ def run_pipeline(
                 project_id,
                 deps,
                 enhancer=deps.speech_enhancer,
+                kept_windows=kept or None,
+                music_flagged_spans=music_spans,
             )
-
-        _update_job(deps.sessions(), job_id, JobStage.planning, 45.0)
-        timeline, version = stage_planning(asset_id, transcript, project_id, deps)
 
         _update_job(deps.sessions(), job_id, JobStage.render, 60.0)
         report, otio_path = stage_render(
@@ -924,6 +1447,7 @@ def run_pipeline(
             asset_id,
             deps,
             enhanced_audio=enhance_info.enhanced_audio_map() if enhance_info else None,
+            narration_audio=narration_audio if narration_clips else None,
         )
 
         _update_job(deps.sessions(), job_id, JobStage.subtitles, 85.0)
@@ -942,6 +1466,39 @@ def run_pipeline(
         )
         if not audit.ok:
             raise PipelineError(f"QA failed: {[c.detail for c in audit.failures]}")
+
+        # Stage 10 — Creator Ship Pack (YouTube upload is disabled; this folder
+        # is what the human ships). Soft-fail: a pack glitch never unpublishes
+        # a QA-passed master. The JOB stays parked at human_gate — the pack is
+        # a sub-product of the gate, not a stage beyond it.
+        _update_job(deps.sessions(), job_id, JobStage.ship_pack, 97.0)
+        try:
+            from director_os.worker.ship_pack import build_ship_pack
+
+            with deps.sessions() as s:
+                prow = s.get(PerceptionIndexRow, asset_id)
+            shots = (prow.shots_json or {}) if prow else {}
+            ocr = ((prow.redaction_tracks_json or {}).get("timestamp_ocr") or {}) if prow else {}
+            card_sub = f"CASE FILE — {ocr.get('iso')}" if ocr.get("iso") else None
+            pack = build_ship_pack(
+                project_id,
+                deps,
+                timeline,
+                report.final_path,
+                transcript=transcript,
+                insights=(shots.get("visual_timeline") or {}).get("insights", []),
+                card_subtitle=card_sub,
+                enhance_info=enhance_info,
+                duration_s=report.total_dur_s,
+            )
+            deps.log(
+                f"  [ship-pack] {pack.pack_dir} — chapters {len(pack.chapters)}, "
+                f"thumbnails {len(pack.seo.get('keywords', []))} kw, "
+                f"clean ends: {pack.verification.get('clean_first_last_frames')}"
+            )
+        except Exception as e:  # noqa: BLE001 — pack failure is never a QA failure
+            deps.log(f"  [ship-pack] skipped ({e})")
+        _update_job(deps.sessions(), job_id, JobStage.human_gate, 100.0)
     except Exception as e:
         # soft-failure persistence: the job row records WHERE it died, so the
         # operator (or the retry task) resumes instead of guessing. A HARD kill
