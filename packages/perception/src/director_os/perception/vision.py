@@ -13,6 +13,7 @@ open weights) is a constructor argument, not a rewrite:
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -36,6 +37,42 @@ INSIGHT_INSTRUCTION = (
     '[{"timestamp_s": float, "kind": "observation|risk|'
     'redaction_candidate|event", "description": str, '
     '"confidence": float 0..1}]. Question: '
+)
+
+# Stage-4 capacity routing (config is data): the Gemini primary walks
+# VISION_FALLBACK_MODELS; when the tier exhausts, the openai-compat
+# OpenRouter tier takes over. Chain order: LIVE :free ids first (verified
+# 2026-11-19 against /models + a tool-call probe), then the originally
+# requested ids (skipped cheaply when the catalog no longer serves them).
+# NEVER use the bogus "openrouter/free" id — it is not a real model.
+DEFAULT_OPENROUTER_VISION_MODELS: tuple[str, ...] = (
+    "google/gemma-4-31b-it:free",
+    "nvidia/nemotron-3.5-super-vl:free",
+    "google/gemma-4-31b:free",
+    "qwen/qwen3.8-27b:free",
+)
+OPENROUTER_VISION_MODELS: tuple[str, ...] = DEFAULT_OPENROUTER_VISION_MODELS
+VISION_CAPACITY_STATUSES = frozenset({429, 500, 503})
+# model ids the catalog no longer serves (rotation) — skip candidate, not stage
+_VISION_MODEL_DEAD_MARKERS = (
+    "no endpoints found",
+    "not a valid model",
+    "does not exist",
+    "no longer supported",
+    "model_not_found",
+)
+_CAPACITY_ERROR_MARKERS = (
+    "429",
+    "rate limit",
+    "too many requests",
+    "quota",
+    "capacity",
+    "503",
+    "500",
+    "401",
+    "403",
+    "unauthorized",
+    "forbidden",
 )
 
 
@@ -114,6 +151,7 @@ class GeminiVisionClient:
         base_url: str = "https://generativelanguage.googleapis.com",
         transport: httpx.BaseTransport | None = None,
         modal_egress: bool = True,
+        fallback_models: list[str] | None = None,
     ):
         if not api_key:
             raise VisionError("GeminiVisionClient requires VISION_API_KEY")
@@ -128,6 +166,11 @@ class GeminiVisionClient:
         # Modal fleet's `vlm_call` (US/EU egress) and the decision sticks.
         self.modal_egress = modal_egress
         self._egress_active: str = "direct"
+        self._fallbacks: list[str] = (
+            [m for m in fallback_models if m != model]
+            if fallback_models is not None
+            else _env_model_list(os.getenv("VISION_FALLBACK_MODELS", "gemini-3.1-flash-lite"))
+        )
 
     def analyze(self, question: str, frames: Sequence[FrameRef]) -> list[SceneInsight]:
         import base64
@@ -145,28 +188,55 @@ class GeminiVisionClient:
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048},
         }
-        response: dict[str, Any] = self._post(body, _json)
+        response: dict[str, Any] = self._generate(body, _json)
         return self._parse(response, frames)
 
-    def _post(self, body: dict[str, Any], _json: Any) -> dict[str, Any]:
-        import httpx
+    def _generate(self, body: dict[str, Any], _json: Any) -> dict[str, Any]:
+        """Walk [model, *fallbacks] with unified GEO + CAPACITY routing.
 
-        if self._egress_active == "modal":
-            return self._post_via_modal(body, _json)
-        with httpx.Client(transport=self._transport, timeout=90.0) as client:
-            r = client.post(
-                f"{self.base_url}/v1beta/models/{self.model}:generateContent",
-                headers={"x-goog-api-key": self.api_key},
-                json=body,
-            )
-        if r.status_code != 200:
-            if self.modal_egress and "location is not supported" in r.text:
-                self._egress_active = "modal"
-                return self._post_via_modal(body, _json)
-            raise VisionError(f"vision provider {r.status_code}: {r.text[:200]}")
-        return r.json()
+        Per candidate: direct endpoint first (geo-block switches egress to the
+        fleet, STICKY); 429/500/503 move to the next candidate; anything else
+        raises. Via the fleet, transient statuses back off x3 inside
+        `_post_via_modal`, then the chain continues.
+        """
+        import httpx as _httpx
 
-    def _post_via_modal(self, body: dict[str, Any], _json: Any) -> dict[str, Any]:
+        models = [self.model, *self._fallbacks]
+        last_status, last_body = 0, ""
+        for candidate in models:
+            self.model = candidate
+            if self._egress_active == "direct":
+                try:
+                    with _httpx.Client(transport=self._transport, timeout=90.0) as client:
+                        r = client.post(
+                            f"{self.base_url}/v1beta/models/{candidate}:generateContent",
+                            headers={"x-goog-api-key": self.api_key},
+                            json=body,
+                        )
+                except _httpx.HTTPError as e:
+                    raise VisionError(f"vision request failed: {e}") from e
+                if r.status_code == 200:
+                    return r.json()
+                last_status, last_body = r.status_code, r.text
+                if self.modal_egress and "location is not supported" in r.text:
+                    self._egress_active = "modal"  # sticky; same candidate rides the fleet
+                elif r.status_code in VISION_CAPACITY_STATUSES:
+                    continue  # capacity on this model — try the next candidate
+                else:
+                    raise VisionError(f"vision provider {r.status_code}: {r.text[:200]}")
+            status, out_body = self._post_via_modal(body, _json)
+            if status == 200:
+                return _json.loads(out_body)
+            last_status, last_body = status, out_body
+            if status not in VISION_CAPACITY_STATUSES:
+                break  # hard error through the fleet — do not burn the chain
+        raise VisionError(
+            f"vision capacity exhausted across {len(models)} model(s) via "
+            f"{self._egress_active} egress: {last_status} {last_body[:200]}"
+        )
+
+    def _post_via_modal(self, body: dict[str, Any], _json: Any) -> tuple[int, str]:
+        """One candidate through the fleet proxy; transient statuses back off x3."""
         import time as _time
 
         from director_os.core.config import get_settings
@@ -181,16 +251,16 @@ class GeminiVisionClient:
 
         fn = modal.Function.from_name("directoros-vlm", "vlm_call")
         payload = _json.dumps(body)
-        last_status, last_body = None, ""
+        status, out_body = 0, ""
         for attempt in range(3):  # 503/429 demand spikes are transient — back off and retry
             out = fn.remote(model=self.model, payload_json=payload)
-            last_status, last_body = int(out.get("status", 0)), str(out.get("body", ""))
-            if last_status == 200:
-                return _json.loads(last_body)
-            if last_status not in (429, 500, 503):
+            status, out_body = int(out.get("status", 0)), str(out.get("body", ""))
+            if status == 200:
+                return status, out_body
+            if status not in (429, 500, 503):
                 break
             _time.sleep(4.0 * (attempt + 1))
-        raise VisionError(f"vision provider via modal egress {last_status}: {last_body[:200]}")
+        return status, out_body
 
     def _parse(self, data: dict[str, Any], frames: Sequence[FrameRef]) -> list[SceneInsight]:
         import json as _json
@@ -229,6 +299,168 @@ class GeminiVisionClient:
             ]
 
 
+def _env_model_list(raw: str) -> list[str]:
+    return [m.strip() for m in raw.split(",") if m.strip()]
+
+
+def parse_insights_text(text: str, frames: Sequence[FrameRef]) -> list[SceneInsight]:
+    """Shared JSON-array decoder for every text-answering vision provider.
+
+    Malformed output degrades to one low-confidence observation instead of
+    failing the pipeline (same contract as the original Gemini parser).
+    """
+    import json as _json
+
+    text = text.strip()
+    try:
+        if text.startswith("```"):
+            text = text.strip("`").removeprefix("json").strip()
+        raw = _json.loads(text)
+        fallback_ts = frames[0].timestamp_s if frames else 0.0
+        return [
+            SceneInsight(
+                timestamp_s=float(i.get("timestamp_s", fallback_ts)),
+                kind=str(i.get("kind", "observation")),
+                description=str(i.get("description", ""))[:500],
+                confidence=float(i.get("confidence", 0.5)),
+            )
+            for i in raw
+        ]
+    except (ValueError, TypeError, KeyError):
+        return [
+            SceneInsight(
+                timestamp_s=frames[0].timestamp_s if frames else 0.0,
+                kind="observation",
+                description=text[:500] or "(empty vision response)",
+                confidence=0.3,
+            )
+        ]
+
+
+class OpenRouterVisionClient:
+    """OpenAI-compat multimodal fallback tier (stage 4, OPENROUTER_*).
+
+    Frames ride as ``image_url`` data URIs; the pinned model chain is
+    ``google/gemma-4-31b:free`` -> ``qwen/qwen3.8-27b:free`` — never the bogus
+    "openrouter/free" id. A 429/500/503 on one model walks to the next;
+    exhaustion raises a capacity-marked VisionError so callers can react.
+    """
+
+    provider = "openrouter"
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str = "https://openrouter.ai/api/v1",
+        models: list[str] | None = None,
+        transport: httpx.BaseTransport | None = None,
+    ):
+        if not api_key:
+            raise VisionError("OpenRouterVisionClient requires OPENROUTER_API_KEY")
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        chain = list(
+            models
+            if models is not None
+            else _env_model_list(os.getenv("OPENROUTER_VISION_MODELS", ""))
+            or list(DEFAULT_OPENROUTER_VISION_MODELS)
+        )
+        self.model = chain[0]
+        self._models = [m for m in chain if m]
+        self._transport = transport
+        self.last_usage: dict[str, int] | None = None
+
+    def analyze(self, question: str, frames: Sequence[FrameRef]) -> list[SceneInsight]:
+        import base64
+
+        import httpx
+
+        content: list[dict[str, Any]] = [{"type": "text", "text": INSIGHT_INSTRUCTION + question}]
+        for f in frames:
+            mime = "image/png" if f.image_path.suffix.lower() == ".png" else "image/jpeg"
+            data = base64.b64encode(f.image_path.read_bytes()).decode()
+            content.append({"type": "text", "text": f"frame at {f.timestamp_s}s:"})
+            content.append(
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}
+            )
+        messages = [{"role": "user", "content": content}]
+        last_status, last_body = 0, ""
+        for candidate in self._models:
+            self.model = candidate
+            try:
+                with httpx.Client(transport=self._transport, timeout=90.0) as client:
+                    r = client.post(
+                        f"{self.base_url}/chat/completions",
+                        headers={"Authorization": f"Bearer {self.api_key}"},
+                        json={"model": candidate, "messages": messages, "temperature": 0.2},
+                    )
+            except httpx.HTTPError as e:
+                raise VisionError(f"openrouter vision request failed: {e}") from e
+            last_status, last_body = r.status_code, r.text
+            if r.status_code == 200:
+                data = r.json()
+                usage = data.get("usage", {})
+                self.last_usage = {
+                    "tokens_in": int(usage.get("prompt_tokens", 0)),
+                    "tokens_out": int(usage.get("completion_tokens", 0)),
+                }
+                text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                return parse_insights_text(text, frames)
+            if r.status_code == 404 or (
+                r.status_code == 400
+                and any(m in r.text.lower() for m in _VISION_MODEL_DEAD_MARKERS)
+            ):
+                continue  # rotated-out model id — next candidate
+            if r.status_code not in VISION_CAPACITY_STATUSES:
+                break  # hard error — not a capacity problem
+        raise VisionError(
+            f"openrouter vision capacity exhausted across {len(self._models)} model(s): "
+            f"{last_status} {last_body[:200]}"
+        )
+
+
+class FailoverVisionClient:
+    """Ordered vision tiers behind one VisionClient port (stage-4 routing law).
+
+    Primary Gemini (model chain inside the tier) -> OpenRouter (:free). A tier
+    that raises a CAPACITY error hands over to the next; anything else
+    re-raises — failover is for capacity, not for bugs.
+    """
+
+    provider = "failover"
+
+    def __init__(self, clients: list[VisionClient]):
+        if not clients:
+            raise VisionError("FailoverVisionClient requires at least one client")
+        self._clients = list(clients)
+        self.active = self._clients[0]
+        self.last_usage: dict[str, int] | None = None
+
+    def analyze(self, question: str, frames: Sequence[FrameRef]) -> list[SceneInsight]:
+        failures: list[str] = []
+        for client in self._clients:
+            try:
+                insights = client.analyze(question, frames)
+            except VisionError as e:
+                msg = str(e).lower()
+                if any(marker in msg for marker in _CAPACITY_ERROR_MARKERS):
+                    failures.append(f"{getattr(client, 'provider', '?')}: {e}")
+                    continue
+                raise  # contract bug — failover would only mask it
+            self.active = client
+            self.last_usage = getattr(client, "last_usage", None)
+            return insights
+        raise VisionError(
+            "all vision tiers exhausted ("
+            + " | ".join(failures)
+            + " | tiers: "
+            + ",".join(
+                f"{getattr(c, 'provider', '?')}:{getattr(c, 'model', '')}" for c in self._clients
+            )
+            + ")"
+        )
+
+
 def build_vision_client() -> VisionClient:
     """Provider selection law (M4 VLM).
 
@@ -238,6 +470,8 @@ def build_vision_client() -> VisionClient:
       Model API key (``LLM_API_KEY``), spend-guarded against the same ledger
     - unset (auto): ``VISION_API_KEY`` wins; else a Meta key on an
       ``api.meta.ai`` base URL wins; else fake
+    - When OPENROUTER creds exist, a ``:free`` fallback tier rides behind the
+      Gemini primary via ``FailoverVisionClient`` (capacity-only failover).
     """
     from urllib.parse import urlparse
 
@@ -247,19 +481,34 @@ def build_vision_client() -> VisionClient:
     provider = (settings.vision_provider or "").strip().lower()
     if provider == "fake":
         return FakeVisionClient()
-    if provider == "gemini":
-        return (
-            GeminiVisionClient(settings.vision_api_key)
-            if settings.vision_api_key
-            else FakeVisionClient()
-        )
     if provider == "meta":
         return _meta_vision_client(settings)
-    if settings.vision_api_key:
-        return GeminiVisionClient(settings.vision_api_key)
-    if settings.llm_api_key and urlparse(settings.llm_base_url).hostname == "api.meta.ai":
+    primary: VisionClient | None = None
+    if provider == "gemini" or settings.vision_api_key:
+        if settings.vision_api_key:
+            primary = GeminiVisionClient(
+                settings.vision_api_key,
+                model=settings.vision_model or "gemini-3.5-flash-lite",
+                fallback_models=_env_model_list(settings.vision_fallback_models) or None,
+            )
+    elif settings.llm_api_key and urlparse(settings.llm_base_url).hostname == "api.meta.ai":
         return _meta_vision_client(settings)
-    return FakeVisionClient()
+    if primary is None:
+        return FakeVisionClient()
+    fallback = _openrouter_vision_fallback(settings)
+    if fallback is None:
+        return primary
+    return FailoverVisionClient([primary, fallback])
+
+
+def _openrouter_vision_fallback(settings: Any) -> OpenRouterVisionClient | None:
+    """OpenRouter :free tier when OPENROUTER creds exist (stage-4 fallback law)."""
+    if not (settings.openrouter_api_key and settings.openrouter_base_url):
+        return None
+    return OpenRouterVisionClient(
+        settings.openrouter_api_key,
+        base_url=settings.openrouter_base_url,
+    )
 
 
 def _meta_vision_client(settings: Any) -> MetaVisionClient:

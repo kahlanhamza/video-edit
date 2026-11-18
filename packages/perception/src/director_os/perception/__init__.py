@@ -43,14 +43,18 @@ from director_os.perception.timestamp_ocr import (  # noqa: F401
     read_bodycam_timestamp,
 )
 from director_os.perception.vision import (  # noqa: F401
+    OPENROUTER_VISION_MODELS,
+    FailoverVisionClient,
     FakeVisionClient,
     FrameRef,
     GeminiVisionClient,
+    OpenRouterVisionClient,
     SceneInsight,
     VisionAdapter,
     VisionClient,
     VisionError,
     build_vision_client,
+    parse_insights_text,
 )
 from director_os.perception.vision_index import (  # noqa: F401
     ContactSheet,

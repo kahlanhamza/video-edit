@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -60,6 +61,42 @@ MAX_STEPS_PER_PROPOSAL = 12
 # flash tier burns its free-tier quota fast; the flash-lite tiers serve.
 DEFAULT_FALLBACK_MODELS = (
     "gemini-3.7-flash,gemini-3.5-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite"
+)
+# Groq free-tier TPM ceiling: keep the composed prompt inside ~6k chars so a
+# Director proposal never trips the 8k tokens-per-minute window (SKILL: wire facts).
+GROQ_PROMPT_CHAR_BUDGET = 6000
+# HTTP statuses that mean "this model/tier is out of capacity right now" —
+# walk the chain instead of failing the stage.
+CAPACITY_STATUSES = frozenset({429, 500, 503})
+# Strings an openai-compat gateway returns when the MODEL NAME itself is dead
+# (decommissioned / typo / not provisioned / rotated out of the catalog) — skip
+# the candidate, not the stage. 404 on /chat/completions = same meaning.
+_MODEL_NOT_FOUND_MARKERS = (
+    "model_not_found",
+    "does not exist",
+    "decommissioned",
+    "no longer supported",
+    "not a valid model",
+    "unknown model",
+    "invalid model",
+    "no endpoints found",
+)
+# Signatures a tier raises when it is UNAVAILABLE (cross-tier failover may
+# proceed): capacity 429/500/503, dead key 401/403, tier exhaustion. A 400
+# contract error carries no marker and re-raises — failover is for
+# availability, never for masking bugs.
+_CAPACITY_ERROR_MARKERS = (
+    "429",
+    "rate limit",
+    "too many requests",
+    "quota",
+    "capacity exhausted",
+    "503",
+    "500",
+    "401",
+    "403",
+    "unauthorized",
+    "forbidden",
 )
 
 
@@ -143,7 +180,9 @@ class GeminiRestBackend:
             if fallback_models is not None
             else [
                 m
-                for m in _env_model_list(os.getenv("LLM_FALLBACK_MODELS", DEFAULT_FALLBACK_MODELS))
+                for m in _env_model_list(
+                    os.getenv("GEMINI_FALLBACK_MODELS", DEFAULT_FALLBACK_MODELS)
+                )
                 if m != model
             ]
         )
@@ -339,7 +378,18 @@ class GeminiRestBackend:
 
 
 class OpenAICompatBackend:
-    """OpenAI-compatible /chat/completions backend (LLM_BASE_URL route)."""
+    """OpenAI-compatible /chat/completions backend (LLM_BASE_URL route).
+
+    Capacity routing: on 429 the backend HONORS the ``Retry-After`` header
+    (capped by ``retry_after_max_s``) and retries the same model once before
+    downgrading to the next candidate in ``LLM_FALLBACK_MODELS``; a dead model
+    name (400 model_not_found family) skips straight to the next candidate.
+    Only when every candidate is exhausted does the tier raise — the
+    ``FailoverBackend`` then hands over to the next provider tier.
+
+    ``prompt_char_budget`` (Groq: 6000) clamps the state summary so a proposal
+    fits inside Groq's ~8k TPM window.
+    """
 
     provider = "openai_compat"
 
@@ -351,6 +401,9 @@ class OpenAICompatBackend:
         niche: str = "bodycam_documentary",
         base_url: str = "https://api.openai.com/v1",
         transport: httpx.BaseTransport | None = None,
+        fallback_models: list[str] | None = None,
+        prompt_char_budget: int = 0,
+        retry_after_max_s: float = 20.0,
     ):
         self.api_key = api_key
         self._transport = transport
@@ -360,8 +413,37 @@ class OpenAICompatBackend:
         self.base_url = base_url.rstrip("/")
         self.last_usage: dict[str, int] | None = None
         self.last_system_prompt = ""
+        self.prompt_char_budget = prompt_char_budget
+        self.retry_after_max_s = retry_after_max_s
+        self._fallbacks: list[str] = (
+            [m for m in fallback_models if m != model]
+            if fallback_models is not None
+            else _env_model_list(os.getenv("LLM_FALLBACK_MODELS", ""))
+        )
+
+    def _sanitize_schemas(self) -> list[dict[str, Any]]:
+        """OpenAI-compat tool schemas with DOT-FREE names.
+
+        Wire fact (OpenRouter/Nvidia NIM, 2026-11-19): function names may only
+        contain a-z A-Z 0-9 _ - — the namespaced `timeline.trim_clip` style is
+        rejected with 400 before the model even runs. We mangle '.' -> '__' on
+        the way out and un-mangle on the way in, so the registry keeps its
+        canonical dotted names while every gateway accepts the request.
+        """
+        out: list[dict[str, Any]] = []
+        for schema in self.registry.openai_schemas():
+            fn = dict(schema.get("function", {}))
+            if fn.get("name"):
+                fn["name"] = str(fn["name"]).replace(".", "__")
+            out.append({**schema, "function": fn})
+        return out
 
     def _payload(self, state_summary: str, role: AgentRole) -> dict[str, Any]:
+        if self.prompt_char_budget and len(state_summary) > self.prompt_char_budget:
+            state_summary = (
+                state_summary[: self.prompt_char_budget]
+                + "\n…(state summary clamped to the provider TPM budget)"
+            )
         self.last_system_prompt = compose_agent_prompt(
             agent=f"{role}_agent",
             role=role,
@@ -381,7 +463,7 @@ class OpenAICompatBackend:
                     f"{MAX_STEPS_PER_PROPOSAL}) via tool_calls.",
                 },
             ],
-            "tools": self.registry.openai_schemas(),
+            "tools": self._sanitize_schemas(),
             "tool_choice": "auto",
             "temperature": 0.4,
         }
@@ -397,25 +479,73 @@ class OpenAICompatBackend:
             "tokens_out": int(usage.get("completion_tokens", 0)),
         }
 
-    def propose(self, state_summary: str, role: AgentRole) -> list[ToolStep]:
-        payload = self._payload(state_summary, role)
-        extras = self._extra_payload()
-        payload.update(extras)
-        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+    def _model_not_found(self, r: httpx.Response) -> bool:
+        if r.status_code == 404:
+            return True  # unknown model id on a well-formed request
+        return r.status_code == 400 and any(m in r.text.lower() for m in _MODEL_NOT_FOUND_MARKERS)
+
+    def _post_candidate(self, payload: dict[str, Any], headers: dict[str, str]) -> httpx.Response:
         try:
             with httpx.Client(transport=self._transport, timeout=PROPOSE_TIMEOUT_S) as client:
                 r = client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
-                if r.status_code == 400 and extras:
+                if r.status_code == 400 and self._extra_payload():
                     # a provider rejected an optional extra (e.g. a reasoning-effort
                     # naming variant): retry once with the vanilla payload
-                    vanilla = {k: v for k, v in payload.items() if k not in extras}
                     r = client.post(
-                        f"{self.base_url}/chat/completions", headers=headers, json=vanilla
+                        f"{self.base_url}/chat/completions",
+                        headers=headers,
+                        json=self._vanilla_payload(payload),
                     )
         except httpx.HTTPError as e:
             raise LLMBackendError(f"openai-compat request failed: {e}") from e
-        if r.status_code != 200:
+        return r
+
+    def _vanilla_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        extras = self._extra_payload()
+        return {k: v for k, v in payload.items() if k not in extras}
+
+    def propose(self, state_summary: str, role: AgentRole) -> list[ToolStep]:
+        """Walk [model, *fallbacks]; honor 429 Retry-After, skip dead models."""
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        candidates = [self.model, *self._fallbacks]
+        last_status, last_body = 0, ""
+        for candidate in candidates:
+            self.model = candidate
+            payload = self._payload(state_summary, role)
+            payload.update(self._extra_payload())
+            r = self._post_candidate(payload, headers)
+            if r.status_code == 200:
+                return self._absorb_proposal(r)
+            last_status, last_body = r.status_code, r.text
+            if r.status_code == 429:
+                # honor the provider's window: sleep Retry-After (capped), retry
+                # the same model once, then downgrade to the next candidate
+                delay = self._retry_after_s(r)
+                time.sleep(delay)
+                r = self._post_candidate(payload, headers)
+                if r.status_code == 200:
+                    return self._absorb_proposal(r)
+                last_status, last_body = r.status_code, r.text
+                if r.status_code in CAPACITY_STATUSES:
+                    continue
+            elif self._model_not_found(r):
+                continue  # dead/rotated model name — next candidate
+            elif r.status_code in CAPACITY_STATUSES:
+                continue  # transient provider outage — next candidate
             raise LLMBackendError(f"openai-compat {r.status_code}: {r.text[:300]}")
+        raise LLMBackendError(
+            f"openai-compat capacity exhausted across {len(candidates)} model(s): "
+            f"{last_status} {last_body[:200]}"
+        )
+
+    def _retry_after_s(self, r: httpx.Response) -> float:
+        raw = r.headers.get("retry-after", "1")
+        try:
+            return max(0.0, min(float(raw), self.retry_after_max_s))
+        except ValueError:
+            return 1.0
+
+    def _absorb_proposal(self, r: httpx.Response) -> list[ToolStep]:
         data = r.json()
         self._absorb_usage(data.get("usage", {}))
         msg = data.get("choices", [{}])[0].get("message", {})
@@ -423,7 +553,8 @@ class OpenAICompatBackend:
         known = self.registry.names()
         for call in msg.get("tool_calls") or []:
             fn = call.get("function", {})
-            name = fn.get("name", "")
+            # un-mangle the wire name back to the canonical dotted form
+            name = str(fn.get("name", "")).replace("__", ".")
             if name not in known:
                 continue
             try:
@@ -450,7 +581,7 @@ def build_backend(
     llm_base_url: str = "",
     llm_model: str = "",
     llm_provider: str = "",
-) -> GeminiRestBackend | OpenAICompatBackend:
+) -> Any:
     """Env-driven provider choice (ADR: config is data).
 
     LLM_BASE_URL non-blank -> OpenAI-compatible gateway (Meta-flavoured when
@@ -475,10 +606,141 @@ def build_backend(
     if base_url:
         if provider == "meta" or "api.meta.ai" in base_url:
             return _meta_backend(api_key, model, registry, niche, base_url)
-        return OpenAICompatBackend(api_key, model, registry, niche, base_url=base_url)
+        return OpenAICompatBackend(
+            api_key,
+            model,
+            registry,
+            niche,
+            base_url=base_url,
+            fallback_models=_env_model_list(s.llm_fallback_models) or None,
+            prompt_char_budget=_groq_prompt_budget(base_url),
+        )
     if provider == "meta":
         return _meta_backend(api_key, model, registry, niche, META_DEFAULT_BASE)
     return GeminiRestBackend(api_key, model, registry, niche)
+
+
+def _groq_prompt_budget(base_url: str) -> int:
+    """Clamp budget only on Groq (8k TPM free tier); override via LLM_PROMPT_CHAR_BUDGET."""
+    override = os.getenv("LLM_PROMPT_CHAR_BUDGET", "")
+    if override:
+        return max(0, int(override))
+    return GROQ_PROMPT_CHAR_BUDGET if "groq.com" in base_url else 0
+
+
+class FailoverBackend:
+    """Ordered provider tiers behind one LLMBackend port (stage-6 routing law).
+
+    propose() walks the tiers: Groq (openai-compat, model chain inside the
+    tier) -> OpenRouter (:free) -> native Gemini. A tier that raises a
+    CAPACITY error hands over to the next tier; a contract error (400 shape,
+    auth) re-raises immediately — failover is for capacity, not for bugs.
+    """
+
+    provider = "failover"
+
+    def __init__(self, backends: list[Any]):
+        if not backends:
+            raise LLMBackendError("FailoverBackend requires at least one backend")
+        self._backends = list(backends)
+        self.active = self._backends[0]
+        self.last_usage: dict[str, int] | None = None
+
+    @property
+    def tier_names(self) -> list[str]:
+        return [f"{getattr(b, 'provider', '?')}:{getattr(b, 'model', '')}" for b in self._backends]
+
+    def propose(self, state_summary: str, role: AgentRole) -> list[ToolStep]:
+        failures: list[str] = []
+        for backend in self._backends:
+            try:
+                steps = backend.propose(state_summary, role)
+            except LLMBackendError as e:
+                msg = str(e).lower()
+                if any(marker in msg for marker in _CAPACITY_ERROR_MARKERS):
+                    failures.append(f"{getattr(backend, 'provider', '?')}: {e}")
+                    continue
+                raise  # contract/auth bug — failover would only mask it
+            self.active = backend
+            self.last_usage = getattr(backend, "last_usage", None)
+            return steps
+        raise LLMBackendError(
+            "all LLM tiers exhausted ("
+            + " | ".join(failures)
+            + " | tiers: "
+            + ",".join(self.tier_names)
+            + ")"
+        )
+
+    def record_results(self, steps: list[ToolStep], results: list[str]) -> None:
+        record = getattr(self.active, "record_results", None)
+        if callable(record):
+            record(steps, results)
+
+
+def build_backend_chain(
+    registry: ToolRegistry,
+    niche: str = "bodycam_documentary",
+    **overrides: Any,
+) -> Any:
+    """Stage-6 routing chain from env (config is data):
+
+    1. ``LLM_*``        — primary: Groq openai-compat (model chain via
+       ``LLM_FALLBACK_MODELS``), Meta, or native Gemini when the URL is blank.
+    2. ``OPENROUTER_*`` — secondary openai-compat tier (``OPENROUTER_MODEL``).
+    3. native Gemini    — last resort on the AI Studio key (the VISION key
+       hosts the shared ``AQ.`` credential), chain ``GEMINI_FALLBACK_MODELS``.
+
+    Single configured tier -> that backend bare (zero overhead); several ->
+    ``FailoverBackend``. Raises only when NOTHING is configured.
+    """
+    from director_os.core.config import get_settings
+
+    s = get_settings()
+    tiers: list[Any] = []
+    if s.llm_api_key or overrides.get("llm_api_key"):
+        tiers.append(build_backend(registry, niche, **overrides))
+    if s.openrouter_api_key and s.openrouter_base_url:
+        already = any(
+            getattr(t, "base_url", "").rstrip("/") == s.openrouter_base_url.rstrip("/")
+            and getattr(t, "model", "") == s.openrouter_model
+            for t in tiers
+        )
+        if not already:
+            tiers.append(
+                OpenAICompatBackend(
+                    s.openrouter_api_key,
+                    s.openrouter_model or "nvidia/nemotron-3-ultra:free",
+                    registry,
+                    niche,
+                    base_url=s.openrouter_base_url,
+                    # the tier IS the fallback: its own chain rides
+                    # OPENROUTER_FALLBACK_MODELS (catalog-rotation proof)
+                    fallback_models=_env_model_list(s.openrouter_fallback_models) or None,
+                )
+            )
+    # The last-resort Gemini tier only makes sense on a REAL AI Studio key —
+    # a Groq `gsk_`/OpenRouter `sk-or-` key would just 401 there.
+    gemini_key = s.vision_api_key or (
+        s.llm_api_key if s.llm_api_key.startswith(("AQ.", "AIza")) else ""
+    )
+    if gemini_key and not any(isinstance(t, GeminiRestBackend) for t in tiers):
+        model = s.vision_model or "gemini-3.5-flash-lite"
+        tiers.append(
+            GeminiRestBackend(
+                gemini_key,
+                model,
+                registry,
+                niche,
+                fallback_models=_env_model_list(s.gemini_fallback_models) or None,
+            )
+        )
+    if not tiers:
+        raise LLMBackendError(
+            "LLM not configured: set LLM_API_KEY (optionally OPENROUTER_API_KEY / "
+            "VISION_API_KEY for the fallback tiers)"
+        )
+    return FailoverBackend(tiers) if len(tiers) > 1 else tiers[0]
 
 
 def _meta_backend(

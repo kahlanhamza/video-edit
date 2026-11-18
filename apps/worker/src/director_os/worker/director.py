@@ -39,7 +39,7 @@ from director_os.agent_runtime.editing_tools import (
     DirectorToolbox,
     build_director_registry,
 )
-from director_os.agent_runtime.llm import LLMBackendError, build_backend
+from director_os.agent_runtime.llm import LLMBackendError, build_backend_chain
 from director_os.core.db import PerceptionIndexRow, ProjectRow
 from director_os.otio_engine.contract import parse_clip_meta
 from director_os.otio_engine.timeline import (
@@ -342,7 +342,7 @@ def stage_director(
     toolbox = DirectorToolbox(timeline, project_id, resolution=(deps.video.w, deps.video.h))
     registry = build_director_registry(toolbox)
     try:
-        backend = build_backend(registry)
+        backend = build_backend_chain(registry)
     except LLMBackendError as e:
         deps.log(f"  [director] LLM not available ({e}) — deterministic v1 cut rides on")
         return timeline, base_version, {"skipped": str(e)}

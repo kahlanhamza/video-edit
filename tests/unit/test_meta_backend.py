@@ -132,7 +132,9 @@ def test_meta_backend_parses_tool_calls_cached_tokens_and_ledger(tmp_path):
 
     assert seen["auth"] == "Bearer LLM_k"
     assert "/chat/completions" in seen["url"]
-    assert seen["body"]["tools"][0]["function"]["name"] == "timeline.split_clip"
+    # openai-compat wire law: tool names are sanitized ('.' -> '__') on the way
+    # out (Nvidia NIM rejects dots) and un-mangled back on the way in.
+    assert seen["body"]["tools"][0]["function"]["name"] == "timeline__split_clip"
     assert seen["body"]["reasoning_effort"] == "minimal"
     assert [s.tool for s in steps] == ["timeline.split_clip"]
     assert be.last_usage == {"tokens_in": 1200, "tokens_out": 88}

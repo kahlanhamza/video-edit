@@ -71,12 +71,31 @@ def qa_model() -> str:
 
 
 def make_vision_clients(api_key: str) -> tuple[VisionAdapter, VisionAdapter]:
-    """(index_adapter, qa_adapter) — lite tier + flagship tier; blank key -> fakes."""
+    """(index_adapter, qa_adapter) — lite tier + flagship tier; blank key -> fakes.
+
+    When OPENROUTER creds exist each tier rides a `FailoverVisionClient`:
+    Gemini primary (own model chain via VISION_FALLBACK_MODELS) -> OpenRouter
+    :free models (`google/gemma-4-31b:free` -> `qwen/qwen3.8-27b:free`).
+    """
     if not api_key:
         return VisionAdapter(FakeVisionClient()), VisionAdapter(FakeVisionClient())
+    from director_os.core.config import get_settings
+    from director_os.perception.vision import FailoverVisionClient, OpenRouterVisionClient
+
+    settings = get_settings()
+    fallback: OpenRouterVisionClient | None = None
+    if settings.openrouter_api_key and settings.openrouter_base_url:
+        fallback = OpenRouterVisionClient(
+            settings.openrouter_api_key,
+            base_url=settings.openrouter_base_url,
+        )
+    index = GeminiVisionClient(api_key, model=index_model())
+    qa = GeminiVisionClient(api_key, model=qa_model())
+    if fallback is None:
+        return VisionAdapter(index), VisionAdapter(qa)
     return (
-        VisionAdapter(GeminiVisionClient(api_key, model=index_model())),
-        VisionAdapter(GeminiVisionClient(api_key, model=qa_model())),
+        VisionAdapter(FailoverVisionClient([index, fallback])),
+        VisionAdapter(FailoverVisionClient([qa, fallback])),
     )
 
 

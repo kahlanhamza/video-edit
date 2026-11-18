@@ -45,9 +45,19 @@ class Settings:
     llm_budget_usd: float
     llm_spend_ledger: str
     llm_allow_training_on_content: bool
+    # --- capacity routing (comma-separated model chains per backend)
+    llm_fallback_models: str
+    gemini_fallback_models: str
+    # --- OpenRouter secondary tier (openai-compat; :free models)
+    openrouter_api_key: str
+    openrouter_base_url: str
+    openrouter_model: str
+    openrouter_fallback_models: str
     # --- vision LLM (M4)
     vision_api_key: str
     vision_provider: str
+    vision_model: str
+    vision_fallback_models: str
     # --- compute backend (M4: local ONNX default / Kaggle free GPU / Modal optional)
     compute_backend: str
     kaggle_username: str
@@ -92,8 +102,16 @@ def _load() -> Settings:
         llm_allow_training_on_content=(
             os.getenv("LLM_ALLOW_TRAINING_ON_CONTENT", "").lower() in {"1", "true", "yes"}
         ),
+        llm_fallback_models=os.getenv("LLM_FALLBACK_MODELS", ""),
+        gemini_fallback_models=os.getenv("GEMINI_FALLBACK_MODELS", ""),
+        openrouter_api_key=os.getenv("OPENROUTER_API_KEY", ""),
+        openrouter_base_url=os.getenv("OPENROUTER_BASE_URL", ""),
+        openrouter_model=os.getenv("OPENROUTER_MODEL", ""),
+        openrouter_fallback_models=os.getenv("OPENROUTER_FALLBACK_MODELS", ""),
         vision_api_key=os.getenv("VISION_API_KEY", ""),
         vision_provider=os.getenv("VISION_PROVIDER", ""),
+        vision_model=os.getenv("VISION_MODEL", "gemini-3.5-flash-lite"),
+        vision_fallback_models=os.getenv("VISION_FALLBACK_MODELS", "gemini-3.1-flash-lite"),
         compute_backend=os.getenv("COMPUTE_BACKEND", "local").strip().lower(),
         kaggle_username=os.getenv("KAGGLE_USERNAME", ""),
         kaggle_key=os.getenv("KAGGLE_KEY", ""),

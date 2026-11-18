@@ -200,14 +200,14 @@ def test_stage_director_scripted_edits_persist_and_move_pointer(env):
         ),
     ]
     scripted = ScriptedBackend(steps)
-    original_build = director_mod.build_backend
-    director_mod.build_backend = lambda registry: scripted  # type: ignore[assignment]
+    original_build = director_mod.build_backend_chain
+    director_mod.build_backend_chain = lambda registry: scripted  # type: ignore[assignment]
     try:
         timeline, version, report = stage_director(
             timeline, "a1", {"duration_s": 25.0}, PROJECT, deps
         )
     finally:
-        director_mod.build_backend = original_build
+        director_mod.build_backend_chain = original_build
 
     assert report["skipped"] is None
     assert report["rounds"] == 1
@@ -251,7 +251,7 @@ def test_stage_director_no_provider_passthrough(env, monkeypatch):
     def _raise(registry):
         raise LLMBackendError("LLM not configured: set LLM_API_KEY")
 
-    monkeypatch.setattr(director_mod, "build_backend", _raise)
+    monkeypatch.setattr(director_mod, "build_backend_chain", _raise)
     timeline, version, report = stage_director(timeline, "a1", {}, PROJECT, deps)
     assert "LLM not configured" in report["skipped"]
     assert version == base_version
@@ -266,7 +266,7 @@ def test_stage_director_zero_proposal_locks_cut(env, monkeypatch):
             self.propose_calls += 1
             return []
 
-    monkeypatch.setattr(director_mod, "build_backend", lambda registry: DoneBackend([]))
+    monkeypatch.setattr(director_mod, "build_backend_chain", lambda registry: DoneBackend([]))
     timeline, version, report = stage_director(timeline, "a1", {}, PROJECT, deps)
     assert report["rounds"] == 1
     assert report["steps_ok"] == 0
@@ -277,7 +277,9 @@ def test_stage_director_zero_proposal_locks_cut(env, monkeypatch):
 def test_stage_director_bad_step_rolls_back(env, monkeypatch):
     deps, sessions, _store, timeline, base_version = env
     steps = [ToolStep(tool="timeline.remove_clip", args={"item_index": 999})]
-    monkeypatch.setattr(director_mod, "build_backend", lambda registry: ScriptedBackend(steps))
+    monkeypatch.setattr(
+        director_mod, "build_backend_chain", lambda registry: ScriptedBackend(steps)
+    )
     timeline, version, report = stage_director(timeline, "a1", {}, PROJECT, deps)
     assert report["steps_failed"] == 1
     assert report["steps_ok"] == 0
@@ -300,7 +302,7 @@ def test_stage_director_round_cap(env, monkeypatch):
                 )
             ]
 
-    monkeypatch.setattr(director_mod, "build_backend", lambda registry: LoopBackend([]))
+    monkeypatch.setattr(director_mod, "build_backend_chain", lambda registry: LoopBackend([]))
     timeline, version, report = stage_director(timeline, "a1", {}, PROJECT, deps)
     assert report["rounds"] == 3
     assert calls["n"] == 3
