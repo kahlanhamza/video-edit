@@ -14,9 +14,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from director_os.audio_engine.two_bus import (
-    BUS2_LIMITER_LINEAR,
     DUCK_LINEAR,
-    ENCODE_HEADROOM_LIMITER_LINEAR,
     SAMPLE_RATE,
     TwoBusMixError,
     apply_gate_inplace,
@@ -94,25 +92,25 @@ def test_bus2_chain_band_and_bed_level():
     chain = bus2_chain(volume=0.06)
     assert "highpass=f=150" in chain and "lowpass=f=4000" in chain
     assert "volume=0.06" in chain  # -24 dB bed (opt-in via AUDIO_BUS2_VOLUME)
-    assert f"limit={BUS2_LIMITER_LINEAR:g}" in chain  # soft-limit (alimiter floor)
+    # no in-graph limiter: the joint numpy master ceiling catches Bus-2
+    assert "alimiter" not in chain
 
 
-def test_master_chain_gain_limiter_and_48k_stereo():
+def test_master_chain_gain_and_48k_stereo_numpy_ceiling():
     chain = master_chain(9.0)
     assert "volume=+9dB" in chain
-    assert "limit=0.8414" in chain  # -1.5 dBTP
-    assert "level=disabled" in chain  # auto-level would re-boost to 0 dBFS
     assert "aresample=48000" in chain
     assert "channel_layouts=stereo" in chain
+    # the ceiling is the numpy pass in run_two_bus_mix, not an in-graph alimiter
+    assert "alimiter" not in chain
 
 
-def test_segment_fade_chain_is_20ms_with_encode_headroom():
+def test_segment_fade_chain_is_20ms_fades_only():
     chain = segment_fade_chain(6.0)
     assert "afade=t=in:st=0:d=0.0200" in chain
     assert "afade=t=out:st=5.9800:d=0.0200" in chain
-    # pre-codec headroom limiter: the shipped mp4 must decode under -1.0 dBTP
-    assert f"limit={ENCODE_HEADROOM_LIMITER_LINEAR:g}" in chain
-    assert "level=disabled" in chain
+    # no in-graph limiter (ffmpeg 7.1 alimiter mangles the program)
+    assert "alimiter" not in chain
     # never fades more than half the segment
     assert "d=0.0050" in segment_fade_chain(0.01)
 
@@ -196,3 +194,25 @@ def test_two_bus_mix_drops_noise_floor_and_keeps_speech(noisy_scene, tmp_path: P
 
     info = probe(out)
     assert info.sample_rate == 48_000 and info.channels == 2
+
+
+def test_ceiling_limit_pcm_sample_exact_and_smooth():
+    """The alimiter replacement: |out| <= ceiling, content preserved."""
+    import numpy as np
+    from director_os.audio_engine.leveling import ceiling_limit_pcm
+
+    sr = 48000
+    t = np.arange(int(1.0 * sr)) / sr
+    tone = (0.95 * np.sin(2 * np.pi * 220.0 * t)).astype(np.float32)
+    pcm = np.repeat(tone[:, None], 2, axis=1).reshape(-1)  # interleaved stereo
+
+    ceiling = 10 ** (-2.5 / 20.0)
+    out = ceiling_limit_pcm(pcm.copy(), sr, ceiling, channels=2)
+
+    assert np.max(np.abs(out)) <= ceiling + 1e-6  # sample-exact ceiling
+    # release-smoothed limiting keeps the tone recognizable (corr ~1)
+    c = float(np.dot(out, pcm) / (np.linalg.norm(out) * np.linalg.norm(pcm) + 1e-12))
+    assert c > 0.9  # alimiter measured 0.063 on the real chain — this must not
+    # mono-compatible: identical channels stay identical
+    frames = out.reshape(-1, 2)
+    assert np.array_equal(frames[:, 0], frames[:, 1])

@@ -9,8 +9,9 @@ from director_os.audio_engine.leveling import (
     DEFAULT_TARGET_DBFS,
     LIMITER_LINEAR,
     MAX_GAIN_DB,
+    ceiling_limit_pcm,
     check_speech_window,
-    decode_pcm_mono,
+    decode_pcm_channels,
     leveled_chain_for,
     measure_speech_levels,
     merge_intervals,
@@ -88,47 +89,45 @@ def test_gain_clamped_against_hiss_inflation():
     assert speech_gated_gain(0.0) == DEFAULT_TARGET_DBFS  # modest cut stays unclamped
 
 
-def test_chain_has_limiter_after_gain():
+def test_chain_has_gain_then_ceiling_contract():
+    """The ceiling is the numpy pass (`ceiling_limit_pcm`), not an in-graph filter.
+
+    ffmpeg 7.1's alimiter mangles the program (corr 0.063 vs its own input) —
+    the chain is gain-only; `run_two_bus_mix` bricks the ceiling after the mix.
+    """
     chain = speech_gated_chain(9.0)
-    vol, lim = chain.split(",")
-    assert vol.startswith("volume=+9")
-    assert lim.startswith("alimiter=")
-    assert f"limit={LIMITER_LINEAR:g}" in lim
+    assert chain == "volume=+9dB"
+    assert "alimiter" not in chain  # the broken filter must not ride any graph
 
 
 def test_leveled_chain_for_one_call(bodycam_mix: tuple[Path, list[tuple[float, float]]]):
     wav, intervals = bodycam_mix
     chain, levels = leveled_chain_for(wav, intervals)
-    assert "alimiter" in chain
+    assert chain.startswith("volume=")
+    assert "alimiter" not in chain
     assert levels["gain_db"] == pytest.approx(levels["gain_db"], abs=0.1)
     assert abs(levels["gain_db"] - (DEFAULT_TARGET_DBFS - levels["speech_rms_dbfs"])) < 0.3
 
 
 def test_limiter_prevents_clipping(tmp_path: Path):
-    """Hot dialogue + full gain -> alimiter holds the ceiling at -1.5 dBTP."""
+    """Hot dialogue + full gain -> numpy ceiling holds the -1.5 dBTP law."""
     hot = _tone(1.0, 0.95)  # near-full-scale dialogue
     wav = _write_wav(tmp_path / "hot.wav", hot)
     # no intervals: measurement returns file RMS; gain clamps to -12 dB
     chain, levels = leveled_chain_for(wav, [(0.0, 1.0)], target_dbfs=-9.0)
-    out = tmp_path / "limited.wav"
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        str(wav),
-        "-af",
-        chain,
-        "-ar",
-        str(SR),
-        str(out),
-    ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    assert r.returncode == 0, r.stderr
-    pcm = decode_pcm_mono(out)
-    assert peak_dbfs(pcm) <= -1.4, "limiter failed: output pokes through -1.5 dBTP"
+    # the chain is gain-only; the ceiling rides ceiling_limit_pcm (the same
+    # post-pass run_two_bus_mix applies)
+    pcm, ch = decode_pcm_channels(wav, SR)
+    boosted = _apply_volume_and_ceiling(pcm, ch, chain, LIMITER_LINEAR)
+    assert peak_dbfs(boosted) <= -1.4, "ceiling failed: output pokes through -1.5 dBTP"
+
+
+def _apply_volume_and_ceiling(pcm, ch, chain, ceiling):
+    import re
+
+    m = re.match(r"volume=([+-][\d.]+)dB", chain)
+    gain = 10 ** (float(m.group(1)) / 20.0)
+    return ceiling_limit_pcm(pcm * gain, SR, ceiling, channels=ch)
 
 
 def test_audit_speech_window_check(bodycam_mix: tuple[Path, list[tuple[float, float]]]):

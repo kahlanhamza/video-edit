@@ -4,10 +4,14 @@ The problem with plain `loudnorm`: it integrates EVERYTHING — sirens, door
 slams, cruiser A/C — so a loud siren 10 s away drags dialogue gain down and
 officers end up whispered. This module measures RMS/peaks STRICTLY on ASR
 spoken-word intervals (officer / suspect / narrator), applies one gain so
-speech lands in the target window, and bricks the ceiling at -1.5 dBTP with
-an `alimiter` look-ahead so the added gain never clips.
+speech lands in the target window, and bricks the ceiling with a deterministic
+numpy look-ahead limiter (`ceiling_limit_pcm`).
 
-Pure ffmpeg + numpy: one PCM decode, exact per-interval math, no heavy SDK.
+CEILING LAW (2026-11-18): ffmpeg 7.1's `alimiter` MANGLES the program in this
+environment — measured correlation 0.063 against its own input on the Eustis
+chain (fades-only control: 0.999), on every argument variant. The ceiling
+moved to `ceiling_limit_pcm`: pure numpy, sample-exact (|out| <= ceiling by
+construction), release-smoothed so crest reduction rides instead of pumping.
 """
 
 from __future__ import annotations
@@ -43,6 +47,46 @@ LIMITER_LINEAR = 0.8414
 
 class LevelingError(RuntimeError):
     pass
+
+
+def ceiling_limit_pcm(
+    pcm: np.ndarray,
+    sr: int,
+    ceiling_linear: float,
+    channels: int = 2,
+    attack_ms: float = 5.0,
+    release_ms: float = 120.0,
+) -> np.ndarray:
+    """Deterministic look-ahead ceiling limiter (the alimiter replacement).
+
+    - Sample-exact by construction: the gain at frame i is capped by the
+      smallest requirement over [i, i+attack] (LOOKAHEAD), so the gain is
+      already down when a peak arrives — |out| never exceeds the ceiling.
+    - Joint L/R decision: the frame peak is max(|L|, |R|), so identical gain
+      rides both channels and the stereo image never wobbles.
+    - Release smoothing: the gain falls instantly to any requirement but
+      recovers at most exponentially (`release_ms`), vectorized as a running
+      minimum in log-gain domain — crest reduction rides instead of pumping.
+    """
+    if pcm.size == 0:
+        return pcm
+    frames = pcm.reshape(-1, channels)
+    peak = np.max(np.abs(frames), axis=1)
+    cap = ceiling_linear / np.maximum(peak, 1e-9)
+    la = max(1, int(attack_ms * sr / 1000))
+    if la > 1 and cap.size > la:
+        # required suppression for the NEXT attack window (look-ahead min)
+        cap = np.lib.stride_tricks.sliding_window_view(
+            np.concatenate([cap, np.full(la - 1, cap[-1])]), la
+        ).min(axis=1)
+    # log-gain domain: h >= 0; attack = instant rise of h, release = h may
+    # decay at most `a` per sample. h_smooth[i] = min_{j<=i}(h[j] + (i-j)*a).
+    h = -np.log(np.maximum(cap, 1e-9))
+    a = 1000.0 / (release_ms * sr)
+    idx = np.arange(h.size, dtype=np.float64)
+    h_smooth = np.minimum.accumulate(h - idx * a) + idx * a
+    gain = np.exp(-h_smooth)
+    return (frames * gain[:, None]).reshape(pcm.shape)
 
 
 def decode_pcm_channels(path: str | Path, sr: int = 48000) -> tuple[np.ndarray, int]:
@@ -178,17 +222,15 @@ def speech_gated_gain(
 
 
 def speech_gated_chain(gain_db: float, limit_linear: float = LIMITER_LINEAR) -> str:
-    """FFmpeg fragment: the one gain, then the -1.5 dBTP look-ahead brickwall.
+    """FFmpeg fragment: the one gain. Gain-only — see `ceiling_limit_pcm`.
 
-    `alimiter` runs AFTER the gain so the boosted dialogue can never poke
-    through the ceiling — the limiter is the guarantee, not an afterthought.
-    `level=disabled` is mandatory: alimiter's auto-level would normalize the
-    output back UP to 0 dBFS, silently destroying the calibrated ceiling.
+    ffmpeg 7.1's alimiter MANGLES the program in this environment (measured
+    correlation 0.063 against its own input; fades-only control 0.999), so
+    no in-graph limiter may ride any chain. The brickwall is the
+    deterministic numpy ceiling (`ceiling_limit_pcm`) applied by
+    `run_two_bus_mix` after the mix — sample-exact |out| <= ceiling.
     """
-    return (
-        f"volume={gain_db:+g}dB,"
-        f"alimiter=level_in=1:level_out=1:level=disabled:limit={limit_linear:g}:attack=5:release=50"
-    )
+    return f"volume={gain_db:+g}dB"
 
 
 def leveled_chain_for(

@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -55,6 +56,16 @@ BUS2_LOWPASS_HZ = 4000
 BUS2_VOLUME_ENV = "AUDIO_BUS2_VOLUME"
 BUS2_VOLUME_DEFAULT = 0.0
 BUS2_LIMITER_LINEAR = 0.0625
+MASTER_LIMITER_LINEAR = 0.8414  # -1.5 dBTP (creative ceiling, historical)
+# The SHIPPED ceiling: -2.5 dBFS via the numpy limiter. Rationale: AAC
+# reconstruction overshoot measured +1.1 dB (master -1.5 -> shipped -0.42),
+# so the master must sit at -2.5 for the shipped file to decode <= -1.0 dBTP
+# (QA zero_clipping gate). Speech RMS still reaches the -12..-6 window: the
+# release-smoothed gain riding reduces crest to ~10.5 dB (inside the
+# natural-dynamics floor 9.5) at MAX_GAIN_DB.
+MASTER_CEILING_DBFS = -2.5
+MASTER_CEILING_LINEAR = 0.7499
+ENCODE_HEADROOM_LIMITER_LINEAR = 0.7079  # -3.0 dBFS (historical, pre-numpy)
 # Timbre restoration law (measured, Nov 2026 — scripts/measure_tilt.py on the
 # real MossFormer2_SE_48K Kaggle harvest): neural extractors preserve low-mid
 # most and shave the top end hardest — presence 2-5 kHz lands -19.9 dB and air
@@ -118,34 +129,32 @@ def bus2_volume() -> float:
 
 
 def bus2_chain(volume: float | None = None) -> str:
-    """Bus-2 tamed ambience: 150 Hz-4 kHz band, bed level, soft-limited."""
+    """Bus-2 tamed ambience: 150 Hz-4 kHz band, bed level.
+
+    No in-graph limiter: ffmpeg 7.1's alimiter mangles the program (see
+    leveling.ceiling_limit_pcm) — the joint master ceiling catches Bus-2.
+    """
     vol = bus2_volume() if volume is None else volume
     return ",".join(
         [
             f"highpass=f={BUS2_HIGHPASS_HZ}",
             f"lowpass=f={BUS2_LOWPASS_HZ}",
             f"volume={vol:g}",
-            (
-                f"alimiter=level_in=1:level_out=1:level=disabled:"
-                f"limit={BUS2_LIMITER_LINEAR:g}:attack=5:release=80"
-            ),
         ]
     )
 
 
 def master_chain(gain_db: float) -> str:
-    """Master bus: speech-gated gain -> -1.5 dBTP brickwall -> 48 kHz stereo lock.
+    """Master bus: speech-gated gain -> 48 kHz stereo lock.
 
-    `level=disabled` is the law: alimiter's auto-level would normalize the
-    output back UP to 0 dBFS, silently destroying the calibrated ceiling.
+    The ceiling is NOT an in-graph alimiter: ffmpeg 7.1's alimiter mangles
+    the program in this environment (measured corr 0.063 vs its own input).
+    `run_two_bus_mix` applies the deterministic numpy ceiling
+    (`leveling.ceiling_limit_pcm`) after the mix instead.
     """
     return ",".join(
         [
             f"volume={gain_db:+g}dB",
-            (
-                f"alimiter=level_in=1:level_out=1:level=disabled:"
-                f"limit={MASTER_LIMITER_LINEAR:g}:attack=5:release=50"
-            ),
             f"aresample={SAMPLE_RATE}",
             "aformat=sample_fmts=fltp:channel_layouts=stereo",
         ]
@@ -153,11 +162,11 @@ def master_chain(gain_db: float) -> str:
 
 
 def segment_fade_chain(dur_s: float, fade_s: float = SEGMENT_FADE_S) -> str:
-    """20 ms anti-click micro-fades + pre-codec headroom limiter (per segment).
+    """20 ms anti-click micro-fades at the concat seams (per segment).
 
-    The fades kill clicks at the concat seams; the encode-headroom limiter
-    (-2.1 dBFS, level=disabled) absorbs the AAC reconstruction overshoot so
-    the SHIPPED mp4 decodes under the -1.0 dBTP clipping QA gate.
+    No in-graph headroom limiter: the shipped-file ceiling is guaranteed by
+    the master's numpy ceiling (`run_two_bus_mix`), which leaves enough
+    headroom for the AAC reconstruction overshoot.
     """
     fade_s = min(fade_s, max(0.0, dur_s / 2.0))
     tail_start = max(0.0, dur_s - fade_s)
@@ -165,10 +174,6 @@ def segment_fade_chain(dur_s: float, fade_s: float = SEGMENT_FADE_S) -> str:
         [
             f"afade=t=in:st=0:d={fade_s:.4f}",
             f"afade=t=out:st={tail_start:.4f}:d={fade_s:.4f}",
-            (
-                f"alimiter=level_in=1:level_out=1:level=disabled:"
-                f"limit={ENCODE_HEADROOM_LIMITER_LINEAR:g}:attack=5:release=50"
-            ),
         ]
     )
 
@@ -246,6 +251,19 @@ def run_two_bus_mix(
         raise TwoBusMixError(
             f"2-bus mix failed ({out_path}): {r.stderr[-400:].decode(errors='replace')}"
         )
+    # THE ceiling law: ffmpeg 7.1's alimiter mangles the program (corr 0.063
+    # against its own input), so the brickwall is a deterministic numpy pass:
+    # |master| <= MASTER_CEILING_LINEAR, release-smoothed, stereo-image safe.
+    from director_os.audio_engine.leveling import ceiling_limit_pcm, decode_pcm_channels
+
+    pcm, ch = decode_pcm_channels(out_path, SAMPLE_RATE)
+    limited = ceiling_limit_pcm(pcm, SAMPLE_RATE, MASTER_CEILING_LINEAR, channels=ch)
+    s16 = (np.clip(limited, -1.0, 1.0) * 32767.0).astype("<i2")
+    with wave.open(str(out_path), "wb") as w:
+        w.setnchannels(ch)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes(s16.tobytes())
     return out_path
 
 
