@@ -171,15 +171,51 @@ class GeminiRestBackend:
         if len(self._history) > self.HISTORY_MAX_ENTRIES:
             del self._history[: len(self._history) - self.HISTORY_MAX_ENTRIES]
 
-    def _post_via_modal(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Retry the generateContent call through the Modal fleet (US/EU egress).
+    def _generate(self, payload: dict[str, Any], model_path: str = "") -> dict[str, Any]:
+        """Send one generateContent with unified GEO + CAPACITY routing.
 
-        Same sticky fallback the vision client uses (`perception.vision`):
-        the deployed `directoros-vlm.vlm_call` function POSTs the identical
-        Gemini payload from a supported region, so thoughtSignatures and the
-        whole wire contract survive untouched. Transient fleet-side statuses
-        (429/500/503) back off and retry; anything else is a hard error.
+        Walk the model chain (primary + fallbacks); per model: try the direct
+        endpoint first (geo-block switches egress to the fleet, STICKY), and
+        on key-level capacity errors (429/500/503) move to the next model.
+        Once the fleet is the active egress, every remaining model goes
+        through it. The model switch is sticky — a quota window does not
+        un-downgrade mid-conversation.
         """
+        models = [self.model, *self._fallbacks]
+        last_status, last_body = 0, ""
+        for candidate in models:
+            self.model = candidate
+            url = f"{self.base_url}/v1beta/models/{candidate}:generateContent"
+            if self._egress_active == "direct":
+                try:
+                    with httpx.Client(
+                        transport=self._transport, timeout=PROPOSE_TIMEOUT_S
+                    ) as client:
+                        r = self._post(client, url, payload)
+                except httpx.HTTPError as e:
+                    raise LLMBackendError(f"gemini request failed: {e}") from e
+                if r.status_code == 200:
+                    return r.json()
+                last_status, last_body = r.status_code, r.text
+                if self.modal_egress and "location is not supported" in r.text:
+                    self._egress_active = "modal"  # sticky; same model rides the fleet
+                elif r.status_code not in (429, 500, 503):
+                    raise LLMBackendError(f"gemini {r.status_code}: {r.text[:300]}")
+                else:
+                    continue  # capacity on this model — try the next candidate
+            out = self._fleet_call(json.dumps(payload))
+            if out["status"] == 200:
+                return json.loads(out["body"])
+            last_status, last_body = out["status"], out["body"]
+            if last_status not in (429, 500, 503):
+                raise LLMBackendError(f"gemini via modal egress {last_status}: {last_body[:300]}")
+        raise LLMBackendError(
+            f"gemini capacity exhausted across {len(models)} model(s) "
+            f"via {self._egress_active} egress: {last_status} {last_body[:200]}"
+        )
+
+    def _fleet_call(self, body: str) -> dict[str, Any]:
+        """One model through the fleet proxy; transient statuses back off x3."""
         import time as _time
 
         from director_os.core.config import get_settings
@@ -191,29 +227,18 @@ class GeminiRestBackend:
                 "not configured for fleet egress"
             )
         fn = _modal_vlm_fn()
-        body = json.dumps(payload)
-        while True:
-            last_status, last_body = 0, ""
-            for attempt in range(3):
-                try:
-                    out = fn.remote(model=self.model, payload_json=body)
-                except Exception as e:  # noqa: BLE001 — fleet-side timeout/transport = retryable
-                    last_status, last_body = 503, f"fleet transport error: {e}"
-                else:
-                    last_status = int(out.get("status", 0))
-                    last_body = str(out.get("body", ""))
-                if last_status == 200:
-                    return json.loads(last_body)
-                if last_status not in (429, 500, 503):
-                    break
-                _time.sleep(4.0 * (attempt + 1))
-            if last_status in (429, 503) and self._fallbacks:
-                # capacity spike on the headliner — sticky downgrade, same convo
-                self.model = self._fallbacks.pop(0)
-                continue
-            raise LLMBackendError(
-                f"gemini via modal egress {last_status}: {last_body[:300]}"
-            )
+        status, out_body = 0, ""
+        for attempt in range(3):
+            try:
+                out = fn.remote(model=self.model, payload_json=body)
+            except Exception as e:  # noqa: BLE001 — fleet-side timeout/transport = retryable
+                status, out_body = 503, f"fleet transport error: {e}"
+            else:
+                status, out_body = int(out.get("status", 0)), str(out.get("body", ""))
+            if status not in (429, 500, 503):
+                return {"status": status, "body": out_body}
+            _time.sleep(4.0 * (attempt + 1))
+        return {"status": status, "body": out_body}
 
     def reset_history(self) -> None:
         """Drop replayed turns (new conversation on the next propose)."""
@@ -265,23 +290,7 @@ class GeminiRestBackend:
             "tools": [{"functionDeclarations": _declarations(self.registry)}],
             "generationConfig": {"temperature": 0.4, "maxOutputTokens": 2048},
         }
-        url = f"{self.base_url}/v1beta/models/{self.model}:generateContent"
-        if self._egress_active == "modal":
-            data = self._post_via_modal(payload)
-        else:
-            try:
-                with httpx.Client(transport=self._transport, timeout=PROPOSE_TIMEOUT_S) as client:
-                    r = self._post(client, url, payload)
-            except httpx.HTTPError as e:
-                raise LLMBackendError(f"gemini request failed: {e}") from e
-            if r.status_code != 200:
-                if self.modal_egress and "location is not supported" in r.text:
-                    self._egress_active = "modal"
-                    data = self._post_via_modal(payload)
-                else:
-                    raise LLMBackendError(f"gemini {r.status_code}: {r.text[:300]}")
-            else:
-                data = r.json()
+        data = self._generate(payload)
         usage = data.get("usageMetadata", {})
         self.last_usage = {
             "tokens_in": int(usage.get("promptTokenCount", 0)),

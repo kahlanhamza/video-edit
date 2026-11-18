@@ -1383,9 +1383,12 @@ def run_pipeline(
             _update_job(deps.sessions(), job_id, JobStage.planning, 42.0)
             from director_os.worker.director import stage_director
 
-            timeline, version, _director_report = stage_director(
-                timeline, asset_id, transcript, project_id, deps
-            )
+            try:
+                timeline, version, _director_report = stage_director(
+                    timeline, asset_id, transcript, project_id, deps
+                )
+            except Exception as e:  # noqa: BLE001 — the LLM is a director, not a dependency
+                deps.log(f"  [director] stage failed ({e}) — deterministic v1 cut rides on")
 
         _update_job(deps.sessions(), job_id, JobStage.narration, 46.0)
         narration_audio: dict[str, Path] | None = None

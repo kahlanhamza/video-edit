@@ -364,7 +364,16 @@ def stage_director(
     }
     for rnd in range(1, max_rounds + 1):
         report["rounds"] = rnd
-        run = executor.run(backend, timeline)
+        try:
+            run = executor.run(backend, timeline)
+        except LLMBackendError as e:
+            # provider outage mid-autodrive: the accepted edits so far stay
+            # durable (checkpointed per step); the v1/interim cut rides on
+            deps.log(
+                f"  [director] provider unavailable in round {rnd} ({e}) — persisted cut rides on"
+            )
+            report["skipped"] = f"provider outage in round {rnd}"
+            break
         report["steps_ok"] += sum(1 for st in run.steps if st.ok)
         report["steps_failed"] += sum(1 for st in run.steps if not st.ok)
         usage = getattr(backend, "last_usage", None)

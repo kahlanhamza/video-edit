@@ -159,34 +159,51 @@ def test_hard_fleet_error_raises(modal_creds, monkeypatch):
         backend.propose("state", "director")
 
 
-def test_direct_non_geo_error_does_not_touch_fleet(modal_creds, monkeypatch):
+def test_direct_quota_429_downgrades_without_fleet(modal_creds, monkeypatch):
+    """The exact e2e failure: direct 429 quota-exceeded walks the chain direct."""
+    seen_models: list[str] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, text="boom")
+        model = request.url.path.split("/models/")[1].split(":")[0]
+        seen_models.append(model)
+        if model in ("gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash"):
+            return httpx.Response(
+                429,
+                text=json.dumps({"error": {"message": "You exceeded your current quota"}}),
+            )
+        return httpx.Response(200, text=json.dumps(_gemini_ok_response()))
 
     fake = _FakeModalFn([])
     monkeypatch.setattr(llm_mod, "_modal_vlm_fn", lambda: fake)
     backend = GeminiRestBackend(
-        "k", "gemini-3.8-flash", _registry(), transport=httpx.MockTransport(handler)
+        "k",
+        "gemini-3.8-flash",
+        _registry(),
+        transport=httpx.MockTransport(handler),
+        fallback_models=["gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"],
     )
-    with pytest.raises(LLMBackendError, match="gemini 500"):
-        backend.propose("state", "director")
-    assert fake.calls == []
-    assert backend._egress_active == "direct"
+    steps = backend.propose("state", "director")
+    assert len(steps) == 1
+    assert backend.model == "gemini-3.5-flash-lite"  # sticky downgrade
+    assert seen_models == [
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+    ]
+    assert fake.calls == []  # fleet never needed — geo was fine, quota was not
 
 
-def test_capacity_503_downgrades_model_stickily(modal_creds, monkeypatch):
+def test_capacity_503_downgrades_through_fleet_stickily(modal_creds, monkeypatch):
+    """Geo-switched egress + fleet-side capacity: chain walks via the fleet."""
     monkeypatch.setattr("time.sleep", lambda _s: None)
 
     def handler(request: httpx.Request) -> httpx.Response:
         return GEO_400
 
     fake = _FakeModalFn(
-        [
-            {"status": 503, "body": "high demand on 3.8"},
-            {"status": 503, "body": "high demand on 3.8"},
-            {"status": 503, "body": "high demand on 3.8"},
-            {"status": 200, "body": json.dumps(_gemini_ok_response())},
-        ]
+        [{"status": 503, "body": "high demand"} for _ in range(6)]
+        + [{"status": 200, "body": json.dumps(_gemini_ok_response())}]
     )
     monkeypatch.setattr(llm_mod, "_modal_vlm_fn", lambda: fake)
     backend = GeminiRestBackend(
@@ -198,19 +215,22 @@ def test_capacity_503_downgrades_model_stickily(modal_creds, monkeypatch):
     )
     steps = backend.propose("state", "director")
     assert len(steps) == 1
-    assert backend.model == "gemini-3.7-flash"  # sticky: subsequent calls ride 3.7
-    assert fake.calls[0]["model"] == "gemini-3.8-flash"
-    assert all(c["model"] == "gemini-3.8-flash" for c in fake.calls[:3])  # retry window
-    assert fake.calls[3]["model"] == "gemini-3.7-flash"  # then the downgrade
+    assert backend.model == "gemini-3.5-flash"  # 3rd candidate after fleet 503s
+    assert backend._egress_active == "modal"
+    # 3 transient fleet 503s on 3.8, then walk: 3.7 (x3), 3.5 -> 200 on 1st try
+    assert [c["model"] for c in fake.calls[:6]] == ["gemini-3.8-flash"] * 3 + [
+        "gemini-3.7-flash"
+    ] * 3
+    assert fake.calls[6]["model"] == "gemini-3.5-flash"
 
 
-def test_all_models_hot_raises_with_last_status(modal_creds, monkeypatch):
+def test_all_models_hot_raises_capacity_exhausted(modal_creds, monkeypatch):
     monkeypatch.setattr("time.sleep", lambda _s: None)
 
     def handler(request: httpx.Request) -> httpx.Response:
         return GEO_400
 
-    fake = _FakeModalFn([{"status": 503, "body": "hot"} for _ in range(9)])
+    fake = _FakeModalFn([{"status": 503, "body": "hot"} for _ in range(12)])
     monkeypatch.setattr(llm_mod, "_modal_vlm_fn", lambda: fake)
     backend = GeminiRestBackend(
         "k",
@@ -219,6 +239,29 @@ def test_all_models_hot_raises_with_last_status(modal_creds, monkeypatch):
         transport=httpx.MockTransport(handler),
         fallback_models=["gemini-3.7-flash", "gemini-3.5-flash"],
     )
-    with pytest.raises(LLMBackendError, match="via modal egress 503"):
+    with pytest.raises(LLMBackendError, match="capacity exhausted across 3 model"):
         backend.propose("state", "director")
     assert [c["model"] for c in fake.calls][-1] == "gemini-3.5-flash"
+
+
+def test_direct_non_capacity_error_does_not_touch_fleet(modal_creds, monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return (
+            httpx.Response(500, text="boom")
+            if request.url.path.endswith("3.8-flash:generateContent")
+            else httpx.Response(500, text="boom")
+        )
+
+    fake = _FakeModalFn([])
+    monkeypatch.setattr(llm_mod, "_modal_vlm_fn", lambda: fake)
+    backend = GeminiRestBackend(
+        "k",
+        "gemini-3.8-flash",
+        _registry(),
+        transport=httpx.MockTransport(handler),
+        fallback_models=["gemini-3.7-flash"],
+    )
+    with pytest.raises(LLMBackendError, match="capacity exhausted"):
+        backend.propose("state", "director")
+    assert fake.calls == []
+    assert backend._egress_active == "direct"
