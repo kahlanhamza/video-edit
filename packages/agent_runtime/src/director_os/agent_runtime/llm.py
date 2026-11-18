@@ -667,19 +667,21 @@ class OpenAICompatBackend:
             }
             r = self._post_candidate(payload, headers)
             if r.status_code == 200:
-                data = r.json()
-                self._absorb_usage(data.get("usage", {}))
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                return str(content)
+                text = self._extract_completion(r)
+                if text.strip():
+                    return text
+                last_status, last_body = 200, "(empty content)"
+                continue  # reasoning-only output — try the next candidate
             last_status, last_body = r.status_code, r.text
             if r.status_code == 429:
                 time.sleep(self._retry_after_s(r))
                 r = self._post_candidate(payload, headers)
                 if r.status_code == 200:
-                    data = r.json()
-                    self._absorb_usage(data.get("usage", {}))
-                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    return str(content)
+                    text = self._extract_completion(r)
+                    if text.strip():
+                        return text
+                    last_status, last_body = 200, "(empty content)"
+                    continue
                 last_status, last_body = r.status_code, r.text
                 if r.status_code in CAPACITY_STATUSES:
                     continue
@@ -690,6 +692,21 @@ class OpenAICompatBackend:
             f"openai-compat capacity exhausted across {len(candidates)} model(s): "
             f"{last_status} {last_body[:200]}"
         )
+
+    def _extract_completion(self, r: httpx.Response) -> str:
+        """content first; reasoning-only models (nemotron/gpt-oss family) fall
+        back to the reasoning field so a 200 never yields an empty string."""
+        data = r.json()
+        self._absorb_usage(data.get("usage", {}))
+        msg = data.get("choices", [{}])[0].get("message", {})
+        content = str(msg.get("content") or "").strip()
+        if content:
+            return content
+        for key in ("reasoning", "reasoning_content"):
+            alt = str(msg.get(key) or "").strip()
+            if alt:
+                return alt
+        return ""
 
 
 def build_backend(

@@ -344,6 +344,11 @@ def main() -> int:
     p.add_argument("--render", default="1280x720")
     p.add_argument("--budget-s", type=int, default=int(os.getenv("RUN_BUDGET_S", "500")))
     p.add_argument("--max-face-regions", type=int, default=6)
+    p.add_argument(
+        "--force-replan",
+        action="store_true",
+        help="re-run Stage 6+ (fresh Director session) without re-ingest or re-ASR",
+    )
     args = p.parse_args()
 
     settings = get_settings()
@@ -385,7 +390,8 @@ def main() -> int:
             s.add(project)
             s.commit()
             pid = project.id
-        # the video's own page rides as a source_page case source (auto-discover)
+        # the video's own page rides as a source_page case source (auto-discover);
+        # the FILENAME itself is a public-record fact sheet (title/date/location)
         with deps.sessions() as s:
             s.add(
                 CaseSourceRow(
@@ -393,6 +399,20 @@ def main() -> int:
                     kind="source_page",
                     label="Wikimedia Commons file page",
                     uri_or_storage_key=SOURCE_PAGE,
+                    status="pending",
+                )
+            )
+            s.add(
+                CaseSourceRow(
+                    project_id=pid,
+                    kind="text",
+                    label="source title facts",
+                    text=(
+                        "Public-record video title: 'Bodycam: Drunk Cop Arrested While On "
+                        "Duty. Eustis, FL. July 04, 2022.' Published on Wikimedia Commons "
+                        "(public domain). The footage shows an on-duty police officer in "
+                        "Eustis, Florida being investigated and arrested on July 4, 2022."
+                    ),
                     status="pending",
                 )
             )
@@ -417,7 +437,7 @@ def main() -> int:
     )
 
     try:
-        result = run_pipeline(src, pid, deps)
+        result = run_pipeline(src, pid, deps, force_replan=args.force_replan)
     except BudgetExhausted as e:
         print(f"[budget] {e} — re-run this script with --project-id {pid}", flush=True)
         return EXIT_BUDGET
