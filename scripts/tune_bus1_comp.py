@@ -73,8 +73,20 @@ def main() -> int:
         )
         out = WORK / f"sweep_{name}.wav"
         r = subprocess.run(
-            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(ENHANCED),
-             "-af", af, "-c:a", "pcm_s16le", str(out)],
+            [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(ENHANCED),
+                "-af",
+                af,
+                "-c:a",
+                "pcm_s16le",
+                str(out),
+            ],
             capture_output=True,
         )
         if r.returncode != 0:

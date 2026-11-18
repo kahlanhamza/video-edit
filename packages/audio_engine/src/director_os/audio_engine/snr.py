@@ -232,9 +232,7 @@ def natural_dynamics_gate(
     slammed broadcast chain would land 3-4 dB and fail.
     """
     ok = crest_db >= min_crest_db
-    detail = (
-        f"speech crest {crest_db:.1f} dB (gate >= {min_crest_db:g} dB)"
-    )
+    detail = f"speech crest {crest_db:.1f} dB (gate >= {min_crest_db:g} dB)"
     if not ok:
         detail += " | VOICE CRUSHED: dynamics collapsed — soften the master gain/limiter work"
     return ok, detail

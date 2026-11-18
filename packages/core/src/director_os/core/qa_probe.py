@@ -449,9 +449,7 @@ def _audio_verification_checks(
                 AuditCheck(
                     name="natural_dynamics",
                     ok=ok,
-                    detail=(
-                        f"voice dynamics on word spans: crest {crest:.1f} dB | " + ddetail
-                    ),
+                    detail=(f"voice dynamics on word spans: crest {crest:.1f} dB | " + ddetail),
                 )
             )
         except Exception as e:  # noqa: BLE001

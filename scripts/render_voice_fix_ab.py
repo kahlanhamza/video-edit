@@ -87,6 +87,8 @@ WORK = ROOT / "output" / "voice_fix"
 OUT = Path("/home/z/my-project/download/voice_fix_ab")
 EVIDENCE = Path("/home/z/my-project/download/m4_evidence_voice_fix.json")
 KERNEL_EVIDENCE = Path("/home/z/my-project/download/m4_evidence_se48k_gpu.json")
+STEREO_48K = f"aresample={SAMPLE_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo"
+S16_48K = f"aresample={SAMPLE_RATE},aformat=sample_fmts=s16:channel_layouts=stereo"
 
 
 def _run(cmd: list[str], what: str) -> None:
@@ -98,8 +100,18 @@ def _run(cmd: list[str], what: str) -> None:
 def _ffmpeg_af(src: Path, af: str, out: Path) -> None:
     _run(
         [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(src), "-af", af, "-c:a", "pcm_s16le", str(out),
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(src),
+            "-af",
+            af,
+            "-c:a",
+            "pcm_s16le",
+            str(out),
         ],
         what=f"ffmpeg {out.name}",
     )
@@ -108,11 +120,26 @@ def _ffmpeg_af(src: Path, af: str, out: Path) -> None:
 def _slice(src: Path, st: float, dur: float, out: Path, stereo: bool) -> Path:
     _run(
         [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-ss", f"{st:.6f}", "-t", f"{dur:.6f}", "-i", str(src),
-            "-map", "0:a:0", "-ar", str(SAMPLE_RATE),
-            "-ac", "2" if stereo else "1",
-            "-c:a", "pcm_s16le", str(out),
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{st:.6f}",
+            "-t",
+            f"{dur:.6f}",
+            "-i",
+            str(src),
+            "-map",
+            "0:a:0",
+            "-ar",
+            str(SAMPLE_RATE),
+            "-ac",
+            "2" if stereo else "1",
+            "-c:a",
+            "pcm_s16le",
+            str(out),
         ],
         what=f"slice {out.name}",
     )
@@ -121,8 +148,20 @@ def _slice(src: Path, st: float, dur: float, out: Path, stereo: bool) -> Path:
 
 def _mp3(src: Path, out: Path) -> Path:
     _run(
-        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(src),
-         "-c:a", "libmp3lame", "-b:a", "192k", str(out)],
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(src),
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "192k",
+            str(out),
+        ],
         what=f"mp3 {out.name}",
     )
     return out
@@ -131,14 +170,41 @@ def _mp3(src: Path, out: Path) -> Path:
 def _mux(video: Path, audio: Path, st: float, dur: float, out: Path) -> Path:
     _run(
         [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-ss", f"{st:.6f}", "-t", f"{dur:.6f}", "-i", str(video),
-            "-i", str(audio),
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k", "-ar", str(SAMPLE_RATE), "-ac", "2",
-            "-shortest", str(out),
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{st:.6f}",
+            "-t",
+            f"{dur:.6f}",
+            "-i",
+            str(video),
+            "-i",
+            str(audio),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "28",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            str(SAMPLE_RATE),
+            "-ac",
+            "2",
+            "-shortest",
+            str(out),
         ],
         what=f"mux {out.name}",
     )
@@ -164,21 +230,21 @@ def _gate_truth(preclean: Path) -> tuple[list[tuple[float, float]], str]:
 
 
 def build_chain(gate: list[tuple[float, float]]) -> tuple[float, float]:
-    """Production steps 1-7b -> master_2bus.wav + before_deep_48k.wav; returns (gain_db, b_gain_db)."""
+    """Production steps 1-7b -> master_2bus.wav + before_deep_48k.wav."""
     raw_ref = WORK / "raw_48k.wav"
     preclean = WORK / "preclean.wav"
     enhanced = WORK / "enhanced.wav"
 
     # 1) raw 48 kHz stereo reference (also the Bus-2 ambience source)
-    _ffmpeg_af(RAW_IN, f"aresample={SAMPLE_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo", raw_ref)
+    _ffmpeg_af(RAW_IN, STEREO_48K, raw_ref)
     # 2) pre-ML rumble filter
-    _ffmpeg_af(raw_ref, f"highpass=f={RUMBLE_HIGHPASS_HZ}:poles=2,aresample={SAMPLE_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo", preclean)
+    _ffmpeg_af(raw_ref, f"highpass=f={RUMBLE_HIGHPASS_HZ}:poles=2,{STEREO_48K}", preclean)
     # 3) the harvested neural Bus-1 extraction (already ran on Kaggle T4)
-    _ffmpeg_af(ENHANCED_IN, f"aresample={SAMPLE_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo", enhanced)
+    _ffmpeg_af(ENHANCED_IN, STEREO_48K, enhanced)
 
     # 5) Bus-1 tone chain (THE VOICE FIX: mud cut -> clarity -> presence -> air)
     bus1_tone = WORK / "bus1_tone.wav"
-    _ffmpeg_af(enhanced, f"{bus1_tone_chain()},aresample={SAMPLE_RATE},aformat=sample_fmts=s16:channel_layouts=stereo", bus1_tone)
+    _ffmpeg_af(enhanced, f"{bus1_tone_chain()},{S16_48K}", bus1_tone)
 
     # 5b) the speech-gated duck on Bus-1
     total_samples = decode_pcm_mono(str(bus1_tone)).size
@@ -220,7 +286,8 @@ def build_chain(gate: list[tuple[float, float]]) -> tuple[float, float]:
     b_levels = measure_speech_levels(str(enhanced), gate)
     b_gain = speech_gated_gain(b_levels["speech_rms_dbfs"], DEFAULT_TARGET_DBFS, MAX_GAIN_DB)
     deep = WORK / "before_deep_48k.wav"
-    _ffmpeg_af(enhanced, f"volume={b_gain:+g}dB,alimiter=level_in=1:level_out=1:level=disabled:limit=0.8414:attack=5:release=50", deep)
+    limiter = "alimiter=level_in=1:level_out=1:level=disabled:limit=0.8414:attack=5:release=50"
+    _ffmpeg_af(enhanced, f"volume={b_gain:+g}dB,{limiter}", deep)
 
     (WORK / "master_gain.json").write_text(json.dumps({"gain_db": gain_db, "b_gain_db": b_gain}))
     return gain_db, b_gain
@@ -235,14 +302,15 @@ def main() -> None:
 
     preclean = WORK / "preclean.wav"
     if mode == "evidence":
-        missing = [p for p in (preclean, WORK / "master_2bus.wav", WORK / "before_deep_48k.wav") if not p.exists()]
+        need = (preclean, WORK / "master_2bus.wav", WORK / "before_deep_48k.wav")
+        missing = [p for p in need if not p.exists()]
         if missing:
             raise SystemExit(f"evidence mode needs {missing} — run 'full' first")
     else:
         # production step 2 (preclean) is also the gate-truth source
         tmp_ref = WORK / "raw_48k.wav"
-        _ffmpeg_af(RAW_IN, f"aresample={SAMPLE_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo", tmp_ref)
-        _ffmpeg_af(tmp_ref, f"highpass=f={RUMBLE_HIGHPASS_HZ}:poles=2,aresample={SAMPLE_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo", preclean)
+        _ffmpeg_af(RAW_IN, STEREO_48K, tmp_ref)
+        _ffmpeg_af(tmp_ref, f"highpass=f={RUMBLE_HIGHPASS_HZ}:poles=2,{STEREO_48K}", preclean)
 
     gate, gate_source = _gate_truth(preclean)
     speech_s = sum(e - s for s, e in gate)
@@ -268,8 +336,8 @@ def main() -> None:
     enhanced = WORK / "enhanced.wav"
     if mode == "evidence":
         # rebuild the two auxiliary decodes evidence-mode measurements need
-        _ffmpeg_af(RAW_IN, f"aresample={SAMPLE_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo", raw_ref)
-        _ffmpeg_af(ENHANCED_IN, f"aresample={SAMPLE_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo", enhanced)
+        _ffmpeg_af(RAW_IN, STEREO_48K, raw_ref)
+        _ffmpeg_af(ENHANCED_IN, STEREO_48K, enhanced)
 
     # ---- the rawwin-aligned 15 s window for A/B/C (video+audio in sync) ----
     st, end = AB_START_S, AB_END_S

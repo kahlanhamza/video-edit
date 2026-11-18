@@ -44,18 +44,56 @@ def _verify_cut_alignment() -> None:
     a = OUT / "align_clip.jpg"
     b = OUT / "align_master.jpg"
     _run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-ss", "5", "-i", str(WIN),
-         "-frames:v", "1", "-vf", "scale=160:90,format=gray", str(a)],
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-ss",
+            "5",
+            "-i",
+            str(WIN),
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=160:90,format=gray",
+            str(a),
+        ],
         "cut align probe",
     )
     _run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-ss", "27", "-i", str(MASTER),
-         "-frames:v", "1", "-vf", "scale=160:90,format=gray", str(b)],
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-ss",
+            "27",
+            "-i",
+            str(MASTER),
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=160:90,format=gray",
+            str(b),
+        ],
         "master align probe",
     )
     r = subprocess.run(
-        ["ffmpeg", "-loglevel", "info", "-i", str(a), "-i", str(b),
-         "-filter_complex", "ssim", "-f", "null", "-"],
+        [
+            "ffmpeg",
+            "-loglevel",
+            "info",
+            "-i",
+            str(a),
+            "-i",
+            str(b),
+            "-filter_complex",
+            "ssim",
+            "-f",
+            "null",
+            "-",
+        ],
         capture_output=True,
     )
     import re
@@ -78,13 +116,31 @@ def main() -> int:
         # slower but frame-exact.
         _run(
             [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                "-i", str(SRC),
-                "-ss", f"{SS_S:.3f}", "-t", f"{T_S:.3f}",
-                "-map", "0:v:0", "-an",
-                "-vf", SCALE,
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                "-pix_fmt", "yuv420p", str(WIN),
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(SRC),
+                "-ss",
+                f"{SS_S:.3f}",
+                "-t",
+                f"{T_S:.3f}",
+                "-map",
+                "0:v:0",
+                "-an",
+                "-vf",
+                SCALE,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "20",
+                "-pix_fmt",
+                "yuv420p",
+                str(WIN),
             ],
             "cut A/B window from original webm",
         )
@@ -110,7 +166,10 @@ def main() -> int:
     faces = backend.detect_faces(cfr, max_samples=600)
     print(f"face tracks: {len(faces)}")
     for t in faces:
-        print(f"  {t.track_id}: {t.n_real} hits, {t.t_start_s:.1f}-{t.t_end_s:.1f}s, min {t.min_score:.2f}")
+        print(
+            f"  {t.track_id}: {t.n_real} hits, "
+            f"{t.t_start_s:.1f}-{t.t_end_s:.1f}s, min {t.min_score:.2f}"
+        )
     plates = []
     if caps.get("plates"):
         plates = backend.detect_plates(cfr, max_samples=600)
