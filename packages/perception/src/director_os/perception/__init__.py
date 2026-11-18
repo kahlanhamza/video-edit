@@ -62,3 +62,9 @@ from director_os.perception.vision_index import (  # noqa: F401
     qa_placement,
     suggest_fod_timestamps,
 )
+from director_os.perception.vision_meta import (  # noqa: F401
+    JsonlSpendRecorder,
+    MetaVisionClient,
+    VisionBudgetExceededError,
+    estimate_vision_cost_usd,
+)

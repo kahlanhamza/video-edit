@@ -47,6 +47,7 @@ class Settings:
     llm_allow_training_on_content: bool
     # --- vision LLM (M4)
     vision_api_key: str
+    vision_provider: str
     # --- compute backend (M4: local ONNX default / Kaggle free GPU / Modal optional)
     compute_backend: str
     kaggle_username: str
@@ -92,6 +93,7 @@ def _load() -> Settings:
             os.getenv("LLM_ALLOW_TRAINING_ON_CONTENT", "").lower() in {"1", "true", "yes"}
         ),
         vision_api_key=os.getenv("VISION_API_KEY", ""),
+        vision_provider=os.getenv("VISION_PROVIDER", ""),
         compute_backend=os.getenv("COMPUTE_BACKEND", "local").strip().lower(),
         kaggle_username=os.getenv("KAGGLE_USERNAME", ""),
         kaggle_key=os.getenv("KAGGLE_KEY", ""),

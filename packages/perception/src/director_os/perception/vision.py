@@ -19,12 +19,24 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     import httpx
+    from director_os.perception.vision_meta import MetaVisionClient
 
 from pydantic import BaseModel, Field
 
 
 class VisionError(RuntimeError):
     pass
+
+
+# Shared answer contract for every vision provider (Gemini + Meta Spark):
+# the model MUST reply with a JSON array of SceneInsight-shaped objects.
+INSIGHT_INSTRUCTION = (
+    "You are the vision half of a documentary editor. "
+    "Answer ONLY with a JSON array of objects: "
+    '[{"timestamp_s": float, "kind": "observation|risk|'
+    'redaction_candidate|event", "description": str, '
+    '"confidence": float 0..1}]. Question: '
+)
 
 
 class FrameRef(BaseModel):
@@ -121,17 +133,7 @@ class GeminiVisionClient:
         import base64
         import json as _json
 
-        parts: list[dict[str, Any]] = [
-            {
-                "text": (
-                    "You are the vision half of a documentary editor. "
-                    "Answer ONLY with a JSON array of objects: "
-                    '[{"timestamp_s": float, "kind": "observation|risk|'
-                    'redaction_candidate|event", "description": str, '
-                    '"confidence": float 0..1}]. Question: ' + question
-                )
-            }
-        ]
+        parts: list[dict[str, Any]] = [{"text": INSIGHT_INSTRUCTION + question}]
         for f in frames:
             data = base64.b64encode(f.image_path.read_bytes()).decode()
             mime = "image/png" if f.image_path.suffix.lower() == ".png" else "image/jpeg"
@@ -228,10 +230,50 @@ class GeminiVisionClient:
 
 
 def build_vision_client() -> VisionClient:
-    """VISION_API_KEY set -> real Gemini client; blank -> hermetic fake."""
+    """Provider selection law (M4 VLM).
+
+    - ``VISION_PROVIDER=fake`` -> hermetic fake (CI / offline runs)
+    - ``VISION_PROVIDER=gemini`` -> Gemini iff ``VISION_API_KEY`` else fake
+    - ``VISION_PROVIDER=meta`` -> Meta Spark media understanding on the shared
+      Model API key (``LLM_API_KEY``), spend-guarded against the same ledger
+    - unset (auto): ``VISION_API_KEY`` wins; else a Meta key on an
+      ``api.meta.ai`` base URL wins; else fake
+    """
+    from urllib.parse import urlparse
+
     from director_os.core.config import get_settings
 
-    key = get_settings().vision_api_key
-    if key:
-        return GeminiVisionClient(key)
+    settings = get_settings()
+    provider = (settings.vision_provider or "").strip().lower()
+    if provider == "fake":
+        return FakeVisionClient()
+    if provider == "gemini":
+        return (
+            GeminiVisionClient(settings.vision_api_key)
+            if settings.vision_api_key
+            else FakeVisionClient()
+        )
+    if provider == "meta":
+        return _meta_vision_client(settings)
+    if settings.vision_api_key:
+        return GeminiVisionClient(settings.vision_api_key)
+    if settings.llm_api_key and urlparse(settings.llm_base_url).hostname == "api.meta.ai":
+        return _meta_vision_client(settings)
     return FakeVisionClient()
+
+
+def _meta_vision_client(settings: Any) -> MetaVisionClient:
+    """Meta vision client wired to the shared text-LLM spend ledger.
+
+    One $20 credit pool, one budget cap: the ledger file (and therefore the
+    pre-call budget check) is the SAME one ``MetaModelBackend`` writes.
+    """
+    from director_os.perception.vision_meta import JsonlSpendRecorder, MetaVisionClient
+
+    ledger_path = settings.llm_spend_ledger or str(settings.output_dir / "llm_spend.jsonl")
+    return MetaVisionClient(
+        settings.llm_api_key,
+        ledger=JsonlSpendRecorder(ledger_path),
+        budget_usd=settings.llm_budget_usd,
+        allow_contributor=settings.llm_allow_training_on_content,
+    )
