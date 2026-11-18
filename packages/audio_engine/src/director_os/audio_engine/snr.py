@@ -42,6 +42,10 @@ TILT_MID_HZ = (500.0, 2000.0)
 TILT_PRESENCE_HZ = (2000.0, 5000.0)
 TILT_AIR_HZ = (5000.0, 12000.0)
 MIN_PRESENCE_TILT_DB = -24.0  # extreme-muffling floor (pre-fix real render: ~-20)
+# natural-dynamics law (user issue, 2026-11-18): the shipped voice must keep
+# audible dynamics — crest factor (speech peak - speech RMS) >= 6 dB. A crushed
+# "wall of voice" (crest ~3-4) fails; natural conversational speech lands 8-12.
+MIN_SPEECH_CREST_DB = 6.0
 
 
 def noise_floor_db(
@@ -193,6 +197,46 @@ def timbre_gate(
     )
     if not ok:
         detail += " | VOICE MUFFLED: presence band collapsed — check the Bus-1 timbre chain"
+    return ok, detail
+
+
+def speech_crest_db(
+    path: str,
+    speech_intervals: list[tuple[float, float]],
+    sr: int = 48_000,
+) -> float:
+    """Crest factor (peak - RMS, dB) of the VOICE on the merged speech spans."""
+    pcm = decode_pcm_mono(path, sr)
+    slices = []
+    for s, e in merge_intervals(speech_intervals):
+        a, b = int(s * sr), min(int(e * sr), pcm.size)
+        if b > a:
+            slices.append(pcm[a:b])
+    if not slices:
+        raise ValueError("no speech samples inside the given intervals")
+    x = np.concatenate(slices).astype(np.float64)
+    rms = float(np.sqrt(np.mean(np.square(x))))
+    peak = float(np.max(np.abs(x)))
+    return max(0.0, 20.0 * np.log10((peak + 1e-12) / (rms + 1e-12)))
+
+
+def natural_dynamics_gate(
+    crest_db: float,
+    min_crest_db: float = MIN_SPEECH_CREST_DB,
+) -> tuple[bool, str]:
+    """The dynamics law: the shipped voice keeps natural speech dynamics.
+
+    FAILS when the speech-span crest factor collapses below `min_crest_db` —
+    the crushed "wall of voice" signature (every syllable held at the same
+    level). Measured: pre-fix Eustis master crest ~9.5 dB passes; a fully
+    slammed broadcast chain would land 3-4 dB and fail.
+    """
+    ok = crest_db >= min_crest_db
+    detail = (
+        f"speech crest {crest_db:.1f} dB (gate >= {min_crest_db:g} dB)"
+    )
+    if not ok:
+        detail += " | VOICE CRUSHED: dynamics collapsed — soften the master gain/limiter work"
     return ok, detail
 
 

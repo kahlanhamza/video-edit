@@ -15,7 +15,6 @@ import numpy as np
 import pytest
 from director_os.audio_engine.two_bus import (
     BUS2_LIMITER_LINEAR,
-    BUS2_VOLUME_LINEAR,
     DUCK_LINEAR,
     ENCODE_HEADROOM_LIMITER_LINEAR,
     SAMPLE_RATE,
@@ -92,9 +91,9 @@ def test_bus1_chain_carries_eq_and_compressor_law():
 
 
 def test_bus2_chain_band_and_bed_level():
-    chain = bus2_chain()
+    chain = bus2_chain(volume=0.06)
     assert "highpass=f=150" in chain and "lowpass=f=4000" in chain
-    assert f"volume={BUS2_VOLUME_LINEAR}" in chain  # -24 dB bed
+    assert "volume=0.06" in chain  # -24 dB bed (opt-in via AUDIO_BUS2_VOLUME)
     assert f"limit={BUS2_LIMITER_LINEAR:g}" in chain  # soft-limit (alimiter floor)
 
 
@@ -118,12 +117,23 @@ def test_segment_fade_chain_is_20ms_with_encode_headroom():
     assert "d=0.0050" in segment_fade_chain(0.01)
 
 
-def test_build_two_bus_mix_cmd_amix_no_normalize():
+def test_build_mix_cmd_default_is_pure_voice_no_bus2():
+    """The 2026-11-18 ear verdict: default master = isolated voice only."""
     cmd = build_two_bus_mix_cmd(Path("b1.wav"), Path("raw.wav"), Path("out.wav"), 3.0)
     graph = cmd[cmd.index("-filter_complex") + 1]
-    assert "[b1][b2]amix=inputs=2:duration=first:normalize=0[mix]" in graph
+    assert "amix" not in graph  # single-input graph, no ambience bed
+    assert cmd.count("-i") == 1
     assert cmd[cmd.index("-ar") + 1] == "48000"
     assert cmd[cmd.index("-ac") + 1] == "2"
+
+
+def test_build_mix_cmd_opt_in_bus2_amix_no_normalize():
+    cmd = build_two_bus_mix_cmd(
+        Path("b1.wav"), Path("raw.wav"), Path("out.wav"), 3.0, bus2_level=0.06
+    )
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert "[b1][b2]amix=inputs=2:duration=first:normalize=0[mix]" in graph
+    assert cmd.count("-i") == 2
 
 
 # --------------------------------------------------------------------- gate apply

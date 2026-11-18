@@ -20,10 +20,22 @@ import numpy as np
 # speech target window (issue #15): dialogue RMS must sit inside it
 SPEECH_LO_DBFS = -12.0
 SPEECH_HI_DBFS = -6.0
-DEFAULT_TARGET_DBFS = -9.0  # window center; measured shipped-file offset
-# (pause-trim + headroom limiter + AAC) is ~1 dB under the master WAV, so
-# dialogue ships ~-10: comfortably inside -12..-6 with margin on both sides.
-MAX_GAIN_DB = 12.0  # never boost dead-air hiss into audibility
+# Target the window's LOWER half (user direction, 2026-11-18): -9 sat "in your
+# face" for conversational bodycam footage; -11 keeps margin above the -12
+# floor and eases the limiter's crest work.
+DEFAULT_TARGET_DBFS = -11.0
+MAX_GAIN_DB = 32.0  # measured ceiling, Nov 2026 (Eustis MossFormer2 harvest):
+# the extraction leaves speech RMS ~-25 dBFS with ~19 dB crest, and the
+# -1.5 dBTP limiter eats the peaks the one-shot gain adds — at a 20 dB clamp
+# speech landed -14.2 dBFS, BELOW the -12..-6 law window (speech_gated_loudness
+# audit FAIL); at 28 dB the refinement loop converged to -12.55 (still 0.55
+# short) because the limiter response is concave (~0.2 dB RMS per gain dB once
+# it engages). 32 dB lets the loop land dialogue at ~-11.8, inside the window
+# with crest ~10.5 (inside the natural-dynamics gate). The old "never boost
+# dead-air hiss" rationale is superseded: Bus-2 ambience is OFF by default
+# (2026-11-18 ear verdict) and the speech-gated -14 dB duck protects the
+# pauses; the limiter stays the absolute ceiling. Gain is always measured, so
+# loud sources are unaffected — only very quiet sources reach further.
 # -1.5 dBTP ceiling as a linear alimiter threshold: 10^(-1.5/20) = 0.8414
 LIMITER_DBTP = -1.5
 LIMITER_LINEAR = 0.8414

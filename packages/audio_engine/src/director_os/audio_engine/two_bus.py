@@ -1,18 +1,24 @@
-"""Broadcast 2-Bus Speech Isolation mix — raw bodycam clips (PLAN §4.5 M4 law).
+"""Broadcast Bus-1 Speech Isolation mix — raw bodycam clips (PLAN §4.5 M4 law).
 
 Why plain loudnorm fails on bodycam: it integrates EVERYTHING — highway
 traffic, wind gusts, cruiser engines — so the officer's voice arrives buried
-in a "normalized" wall of noise. The pro fix is a 2-bus mix:
+in a "normalized" wall of noise. The pro fix is voice isolation:
 
     BUS 1 (voice)      neural speech extraction -> intelligibility EQ (mud
                        cut + clarity/presence/air timbre restoration) ->
                        compression -> speech-gated -14 dB duck in gaps
-    BUS 2 (ambience)   tamed copy of the raw audio (150 Hz-4 kHz band,
+    BUS 2 (ambience)   OPT-IN tamed copy of the raw audio (150 Hz-4 kHz band,
                        -24 dB under the voice) so pauses keep outdoor air
-                       instead of creepy digital zero-silence
-    MASTER             Bus1 + Bus2 -> speech-gated gain (-12..-6 dBFS) ->
-                       -1.5 dBTP limiter -> 20 ms anti-click micro-fades ->
-                       48 kHz stereo lock
+                       DISABLED BY DEFAULT (AUDIO_BUS2_VOLUME=0): the 2026-11-18
+                       ear verdict on the real Eustis harvest preferred the
+                       pure-voice master — the raw-derived bed re-inflates the
+                       exact noise the extractor removed (user: sample B
+                       "clear speakers and no noises at all" vs sample C
+                       "clear speakers and noise"). Set AUDIO_BUS2_VOLUME=0.06
+                       to restore the outdoor-air bed.
+    MASTER             Bus1 (+ opt-in Bus2) -> speech-gated gain (-12..-6 dBFS
+                       window, target -11) -> -1.5 dBTP limiter -> 20 ms
+                       anti-click micro-fades -> 48 kHz stereo lock
 
 Chain of custody (per raw asset, in `stage_audio_enhance`):
   1. raw_48k.wav      full source audio, 48 kHz stereo (SNR "raw" reference)
@@ -24,7 +30,7 @@ Chain of custody (per raw asset, in `stage_audio_enhance`):
                       here first when music/siren is flagged
   4. bus1_gated.wav   EQ + compressor in ffmpeg, then the numpy gate envelope
                       (Silero VAD + ASR words, 150 ms attack/release ramps)
-  5. master_2bus.wav  the single ffmpeg 2-bus mix (this module builds the cmd)
+  5. master_2bus.wav  the single ffmpeg mix (this module builds the cmd)
 
 The segment renderer then slices master_2bus.wav with the exact same window
 as the video and adds the 20 ms anti-click micro-fades at the cut seams.
@@ -32,6 +38,7 @@ as the video and adds the 20 ms anti-click micro-fades at the cut seams.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -43,9 +50,10 @@ DUCK_DB = -14.0  # Bus-1 non-speech attenuation
 RAMP_S = 0.15  # gate attack/release ramps
 BUS2_HIGHPASS_HZ = 150
 BUS2_LOWPASS_HZ = 4000
-BUS2_VOLUME_LINEAR = 0.06  # -24.4 dB under the voice bus
-# alimiter's `limit` floor is 0.0625 — the bed clamp sits a hair above the
-# -24 dB volume target, so the bed can never poke above its own level
+# Bus-2 ambience bed level, OPT-IN (default OFF — see module docstring for the
+# 2026-11-18 ear verdict). One .env line re-enables the outdoor-air bed.
+BUS2_VOLUME_ENV = "AUDIO_BUS2_VOLUME"
+BUS2_VOLUME_DEFAULT = 0.0
 BUS2_LIMITER_LINEAR = 0.0625
 # Timbre restoration law (measured, Nov 2026 — scripts/measure_tilt.py on the
 # real MossFormer2_SE_48K Kaggle harvest): neural extractors preserve low-mid
@@ -104,13 +112,19 @@ def bus1_tone_chain() -> str:
     )
 
 
-def bus2_chain() -> str:
-    """Bus-2 tamed ambience: 150 Hz-4 kHz band, -24 dB, soft-limited."""
+def bus2_volume() -> float:
+    """Bed level from env, read at CALL time (config, not code — cost law)."""
+    return float(os.getenv(BUS2_VOLUME_ENV, str(BUS2_VOLUME_DEFAULT)))
+
+
+def bus2_chain(volume: float | None = None) -> str:
+    """Bus-2 tamed ambience: 150 Hz-4 kHz band, bed level, soft-limited."""
+    vol = bus2_volume() if volume is None else volume
     return ",".join(
         [
             f"highpass=f={BUS2_HIGHPASS_HZ}",
             f"lowpass=f={BUS2_LOWPASS_HZ}",
-            f"volume={BUS2_VOLUME_LINEAR}",
+            f"volume={vol:g}",
             (
                 f"alimiter=level_in=1:level_out=1:level=disabled:"
                 f"limit={BUS2_LIMITER_LINEAR:g}:attack=5:release=80"
@@ -161,35 +175,49 @@ def segment_fade_chain(dur_s: float, fade_s: float = SEGMENT_FADE_S) -> str:
 
 def build_two_bus_mix_cmd(
     bus1_wav: Path,
-    bus2_src_path: Path,
+    bus2_src_path: Path | None,
     out_path: Path,
     master_gain_db: float,
+    bus2_level: float | None = None,
 ) -> list[str]:
-    """THE 2-bus mix command (per asset). Output: 48 kHz stereo PCM WAV.
+    """THE master mix command (per asset). Output: 48 kHz stereo PCM WAV.
+
+    Bus-2 rides only when `bus2_level` (or $AUDIO_BUS2_VOLUME) > 0 AND a
+    source is given — the default master is pure isolated voice (the
+    2026-11-18 ear verdict; see module docstring).
 
     Inputs:  [0] = bus1_gated.wav (neural-clean + EQ + comp + gate)
-             [1] = raw asset audio (tamed ambience source)
+             [1] = raw asset audio (tamed ambience source, opt-in)
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    graph = ";".join(
-        [
-            "[0:a]aformat=sample_fmts=fltp:channel_layouts=stereo[b1]",
-            f"[1:a]aformat=sample_fmts=fltp:channel_layouts=stereo,{bus2_chain()}[b2]",
-            "[b1][b2]amix=inputs=2:duration=first:normalize=0[mix]",
-            f"[mix]{master_chain(master_gain_db)}[m]",
-        ]
-    )
+    vol = bus2_volume() if bus2_level is None else bus2_level
+    use_bus2 = vol > 0.0 and bus2_src_path is not None
+    if use_bus2:
+        graph = ";".join(
+            [
+                "[0:a]aformat=sample_fmts=fltp:channel_layouts=stereo[b1]",
+                f"[1:a]aformat=sample_fmts=fltp:channel_layouts=stereo,{bus2_chain(vol)}[b2]",
+                "[b1][b2]amix=inputs=2:duration=first:normalize=0[mix]",
+                f"[mix]{master_chain(master_gain_db)}[m]",
+            ]
+        )
+        inputs = ["-i", str(bus1_wav), "-i", str(bus2_src_path)]
+    else:
+        graph = ";".join(
+            [
+                "[0:a]aformat=sample_fmts=fltp:channel_layouts=stereo[b1]",
+                f"[b1]{master_chain(master_gain_db)}[m]",
+            ]
+        )
+        inputs = ["-i", str(bus1_wav)]
     return [
         "ffmpeg",
         "-y",
         "-hide_banner",
         "-loglevel",
         "error",
-        "-i",
-        str(bus1_wav),
-        "-i",
-        str(bus2_src_path),
+        *inputs,
         "-filter_complex",
         graph,
         "-map",

@@ -44,7 +44,11 @@ from director_os.audio_engine.leveling import (
     measure_speech_levels,
     speech_gated_gain,
 )
-from director_os.audio_engine.snr import measure_snr, speech_band_tilts
+from director_os.audio_engine.snr import (
+    measure_snr,
+    speech_band_tilts,
+    speech_crest_db,
+)
 from director_os.audio_engine.two_bus import (
     RUMBLE_HIGHPASS_HZ,
     SAMPLE_RATE,
@@ -55,10 +59,11 @@ from director_os.audio_engine.two_bus import (
 )
 from director_os.audio_engine.vad import SileroVad, speech_gate_intervals
 
-# v2: Bus-1 timbre-restoration chain (presence + air shelf). Bumping the
-# version is MANDATORY on any tone-chain change — the cache key must not let
-# a re-render silently reuse a master mixed with the old sound.
-ENHANCE_CACHE_VERSION = "v2"
+# v3: Bus-2 ambience default OFF (2026-11-18 ear verdict) + master target -11
+# dBFS. Bumping the version is MANDATORY on any mix/tone change — the cache
+# key must not let a re-render silently reuse a master mixed with the old
+# sound.
+ENHANCE_CACHE_VERSION = "v3"
 DURATION_DRIFT_TOLERANCE_S = 0.05
 
 
@@ -90,6 +95,8 @@ class EnhanceInfo:
     tilt_presence_raw_db: float = 0.0
     tilt_presence_clean_db: float = 0.0
     tilt_air_clean_db: float = 0.0
+    # natural-dynamics receipt (the crush law, user issue 2026-11-18)
+    speech_crest_db: float = 0.0
 
     def enhanced_audio_map(self) -> dict[str, Path]:
         return {self.asset_id: self.master_wav}
@@ -281,19 +288,24 @@ def stage_audio_enhance(
     # 7) the 2-bus mix: voice + tamed ambience -> limiter -> 48 kHz stereo
     run_two_bus_mix(bus1, raw_ref, master, gain_db)
 
-    # 7b) deterministic refinement: the limiter compresses crest after the
+    # 7b) deterministic refinement loop: the limiter compresses crest after the
     # one-shot gain was computed, so spoken words can land outside the
-    # -12..-6 window. Re-measure the MIXED master and correct once.
+    # -12..-6 window. The limiter response is concave (each +1 dB of gain
+    # raises speech RMS only ~0.4 dB once it engages), so iterate until the
+    # window is met or the correction converges (max 8 passes).
     from director_os.audio_engine.leveling import check_speech_window
 
-    mixed = measure_speech_levels(str(master), gate)
-    if not check_speech_window(mixed["speech_rms_dbfs"]):
+    for _ in range(8):
+        mixed = measure_speech_levels(str(master), gate)
+        if check_speech_window(mixed["speech_rms_dbfs"]):
+            break
         refined = round(gain_db + (DEFAULT_TARGET_DBFS - mixed["speech_rms_dbfs"]), 2)
         refined = max(-MAX_GAIN_DB, min(MAX_GAIN_DB, refined))
-        if abs(refined - gain_db) >= 0.5:
-            run_two_bus_mix(bus1, raw_ref, master, refined)
-            gain_db = refined
-            deps.log(f"  [audio] master gain refined -> {gain_db:+.1f} dB (post-limiter)")
+        if abs(refined - gain_db) < 0.4:
+            break
+        run_two_bus_mix(bus1, raw_ref, master, refined)
+        gain_db = refined
+        deps.log(f"  [audio] master gain refined -> {gain_db:+.1f} dB (post-limiter)")
 
     # 8) quantitative SNR receipt (raw vs clean, same word intervals)
     raw_snr = measure_snr(str(raw_ref), gate)
@@ -314,6 +326,13 @@ def stage_audio_enhance(
     except ValueError as e:  # no speech inside the gate: nothing to measure
         deps.log(f"  [audio] timbre tilt not measurable: {e}")
 
+    crest_db = 0.0
+    try:
+        crest_db = speech_crest_db(str(master), gate)
+        deps.log(f"  [audio] natural dynamics: speech crest {crest_db:.1f} dB")
+    except ValueError as e:
+        deps.log(f"  [audio] speech crest not measurable: {e}")
+
     info = EnhanceInfo(
         asset_id=asset_id,
         master_wav=master,
@@ -330,6 +349,7 @@ def stage_audio_enhance(
         tilt_presence_raw_db=tilt_raw["tilt_presence_db"],
         tilt_presence_clean_db=tilt_clean["tilt_presence_db"],
         tilt_air_clean_db=tilt_clean["tilt_air_db"],
+        speech_crest_db=crest_db,
         master_gain_db=gain_db,
         ducked_seconds=_ducked_seconds(gate, clean_snr["duration_s"]),
         total_seconds=clean_snr["duration_s"],
@@ -339,7 +359,8 @@ def stage_audio_enhance(
     _persist(deps, project_id, asset_id, info, t0)
     deps.log(
         f"  [audio] 2-bus master ready: snr {info.raw_snr_db:.1f} -> {info.clean_snr_db:.1f} dB "
-        f"(noise {info.delta_noise_db:+.1f} dB), master gain {gain_db:+.1f} dB"
+        f"(noise {info.delta_noise_db:+.1f} dB), master gain {gain_db:+.1f} dB, "
+        f"crest {crest_db:.1f} dB"
     )
     return info
 
@@ -361,7 +382,7 @@ def _receipt(info: EnhanceInfo, t0: float) -> dict:
         "params": {
             "duck_db": -14.0,
             "ramp_s": 0.15,
-            "bus2_volume": 0.06,
+            "bus2_volume": "opt-in via AUDIO_BUS2_VOLUME (default 0 = off)",
             "limiter_dbtp": -1.5,
             "sample_rate": SAMPLE_RATE,
         },

@@ -366,9 +366,11 @@ def _audio_verification_checks(
     from director_os.audio_engine.enhance import engine_is_production_legal
     from director_os.audio_engine.snr import (
         measure_snr,
+        natural_dynamics_gate,
         peak_true_dbfs,
         snr_gate,
         speech_band_tilts,
+        speech_crest_db,
         timbre_gate,
     )
 
@@ -439,6 +441,21 @@ def _audio_verification_checks(
             )
         except Exception as e:  # noqa: BLE001
             checks.append(AuditCheck(name="timbre_not_muffled", ok=False, detail=str(e)))
+
+        try:
+            crest = speech_crest_db(str(path), speech_intervals)
+            ok, ddetail = natural_dynamics_gate(crest)
+            checks.append(
+                AuditCheck(
+                    name="natural_dynamics",
+                    ok=ok,
+                    detail=(
+                        f"voice dynamics on word spans: crest {crest:.1f} dB | " + ddetail
+                    ),
+                )
+            )
+        except Exception as e:  # noqa: BLE001
+            checks.append(AuditCheck(name="natural_dynamics", ok=False, detail=str(e)))
 
     try:
         peak = peak_true_dbfs(str(path))

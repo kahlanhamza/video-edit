@@ -123,6 +123,36 @@ class TestSnrGate:
         assert ok  # improvement +10.5 >= 6.0 despite delta_noise > -8
 
 
+class TestNaturalDynamicsGate:
+    def test_natural_crest_passes(self):
+        from director_os.audio_engine.snr import natural_dynamics_gate
+
+        ok, detail = natural_dynamics_gate(9.5)
+        assert ok and "9.5" in detail
+
+    def test_crushed_voice_fails(self):
+        from director_os.audio_engine.snr import natural_dynamics_gate
+
+        ok, detail = natural_dynamics_gate(3.5)
+        assert not ok and "CRUSHED" in detail
+
+    def test_speech_crest_of_a_known_signal(self, tmp_path):
+        # constant-amplitude sine: crest of a full-scale sine = 3.01 dB
+        from director_os.audio_engine.snr import speech_crest_db
+
+        n = SR * 2
+        t = np.arange(n) / SR
+        pcm = 0.5 * np.sin(2 * np.pi * 440 * t)
+        path = tmp_path / "sine.wav"
+        with wave.open(str(path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(SR)
+            w.writeframes((pcm * 32767).astype(np.int16).tobytes())
+        crest = speech_crest_db(str(path), [(0.1, 1.9)])
+        assert crest == pytest.approx(3.01, abs=0.05)
+
+
 class TestTimbreTilt:
     def test_full_band_voice_measures_neutral_tilt(self, tmp_path):
         rng = np.random.default_rng(31)

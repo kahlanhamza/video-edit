@@ -82,8 +82,8 @@ def test_gain_moves_speech_into_window(bodycam_mix: tuple[Path, list[tuple[float
 
 
 def test_gain_clamped_against_hiss_inflation():
-    assert speech_gated_gain(-60.0) == MAX_GAIN_DB  # 51 dB boost -> clamped
-    assert speech_gated_gain(6.0) == -MAX_GAIN_DB  # 15 dB cut -> clamped
+    assert speech_gated_gain(-60.0) == MAX_GAIN_DB  # 81 dB boost -> clamped
+    assert speech_gated_gain(24.0) == -MAX_GAIN_DB  # 33 dB cut -> clamped
     assert speech_gated_gain(DEFAULT_TARGET_DBFS) == 0.0  # already at target
     assert speech_gated_gain(0.0) == DEFAULT_TARGET_DBFS  # modest cut stays unclamped
 
