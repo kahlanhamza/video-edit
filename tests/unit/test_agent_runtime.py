@@ -307,9 +307,11 @@ def test_registry_dispatches_and_rejects(timeline):
 def test_openai_schemas_available(timeline):
     reg = build_director_registry(DirectorToolbox(timeline, PROJECT))
     schemas = reg.openai_schemas()
-    assert len(schemas) == 9
+    assert len(schemas) == 10  # 9 editing tools + narration.add (M2 close-out)
     fn = next(s for s in schemas if s["function"]["name"] == "timeline.switch_camera")
     assert fn["function"]["parameters"]["properties"]["angle_asset_id"]["type"] == "string"
+    add_fn = next(s for s in schemas if s["function"]["name"] == "narration.add")
+    assert add_fn["function"]["parameters"]["properties"]["broll_audio_volume"]["type"] == "number"
 
 
 # ------------------------------------------------------------------ checkpoint store

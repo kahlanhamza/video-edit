@@ -20,12 +20,14 @@ Run from repo root with .env exported:
 
 Options: --start/--dur (segment window, default 60s + 240s), --full (skip
 segmenting, use the whole source), --render WxH (default 1280x720),
---redaction-backend yunet|modal|none, --vision (VLM enrichment when keys exist).
+--redaction-backend yunet|modal|none, --vision (VLM enrichment when keys exist),
+--llm-direct (the Gemini Director agent re-cuts the v1 timeline before render).
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -72,6 +74,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="vision enrichment: frame-quality scoring + VLM contact-sheet "
         "indexing + AXON timestamp OCR (VLM parts need VISION_API_KEY)",
+    )
+    p.add_argument(
+        "--llm-direct",
+        action="store_true",
+        help="Director autodrive: after the v1 auto-cut, the Gemini Director agent "
+        "re-cuts the timeline (keep/drop/tighten/narration/cards) via checkpointed "
+        "tool calls; soft-fails to the v1 cut when the LLM is unavailable",
     )
     p.add_argument("--skip-asr", action="store_true", help="reuse persisted transcript if any")
     p.add_argument(
@@ -235,6 +244,7 @@ def main() -> int:
         video=VideoRenderSpec(w=w, h=h, fps=30),
         redact_backend=None if args.redaction_backend == "none" else args.redaction_backend,
         vision_enrich=args.vision,
+        llm_direct=args.llm_direct,
         log=lambda m: print(m),
     )
 
@@ -281,6 +291,31 @@ def main() -> int:
     print(f"project:   {result.project_id}")
     print(f"asset:     {result.asset_id}")
     print(f"otio ver:  {result.otio_version}")
+
+    # the Director's paper trail: every timeline version + who authored it
+    from director_os.agent_runtime.checkpoint import CheckpointStore
+
+    store = CheckpointStore(deps.sessions)
+    versions = store.list_versions(pid)
+    dir_versions = [v for v in versions if "director" in str(v.get("created_by", ""))]
+    if dir_versions:
+        first, last = dir_versions[0], dir_versions[-1]
+        print(
+            f"director versions: {len(dir_versions)} "
+            f"(v{first['version_num']}..v{last['version_num']})"
+        )
+        for v in dir_versions[-4:]:
+            print(f"  v{v['version_num']}: {v.get('checkpoint_note', '')[:90]}")
+    logs = store.recent_logs(pid, limit=40)
+    if logs:
+        edit_prefixes = ("timeline.", "narration.", "cards.", "redaction.")
+        edits = [row for row in logs if str(row.get("tool", "")).startswith(edit_prefixes)]
+        if edits:
+            print(f"director tool calls ({len(edits)}):")
+            for row in edits:
+                mark = "ok" if row.get("ok", True) else "FAIL"
+                print(f"  [{mark}] {row['tool']} {json.dumps(row.get('args', {}))[:110]}")
+
     print(f"final:     {result.final_path} ({result.final_path.stat().st_size / 1e6:.1f} MB)")
     print(f"render:    {result.render.rendered} rendered / {result.render.cached} cached")
     print(f"redaction regions applied: {n_regions}")

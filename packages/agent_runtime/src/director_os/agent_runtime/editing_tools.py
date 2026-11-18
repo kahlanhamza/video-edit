@@ -20,6 +20,11 @@ from typing import Any
 import opentimelineio.opentime as ot_time
 import opentimelineio.schema as ot_schema
 from director_os.agent_runtime.registry import ToolRegistry
+from director_os.otio_engine.contract import (
+    NarratorClipMeta,
+    RawClipMeta,
+    attach,
+)
 from director_os.otio_engine.timeline import (
     MASTER_TRACK,
     OVERLAY_TRACK,
@@ -150,6 +155,45 @@ class DirectorToolbox:
             raise ToolOperationError("script_text must not be empty")
         meta["script_text"] = script_text
         return {"ok": True, "detail": f"narration {item_index} -> {script_text[:48]!r}"}
+
+    def add_narration(
+        self, item_index: int, script_text: str, broll_audio_volume: float = 0.0
+    ) -> dict[str, Any]:
+        """Convert a raw master clip into a narration clip (M2 close-out).
+
+        The voiceover script replaces the clip's source audio; the SAME source
+        window keeps playing as b-roll underneath (muted by default —
+        broll_audio_volume 0..1 restores ambience). The trimmed in/out points
+        are untouched, so the compiled segment still cuts exactly the action
+        the director kept; only the audio track swaps to the TTS stem, which
+        stage_narration synthesizes content-addressed before render.
+        """
+        clip = _master_clip(self.timeline, item_index)
+        meta = clip.metadata.get("director_os")
+        if not meta or meta.get("kind") != "raw":
+            raise ToolOperationError(
+                f"clip {item_index} is a {meta.get('kind') if meta else 'bare'} clip, "
+                "not a raw clip — narrate over raw footage"
+            )
+        raw = RawClipMeta.model_validate(meta)
+        text = script_text.strip()
+        if not text:
+            raise ToolOperationError("script_text must not be empty")
+        start_s = clip.source_range.start_time.to_seconds() if clip.source_range else 0.0
+        dur = item_duration_s(clip)
+        narr = NarratorClipMeta(
+            script_text=text,
+            broll_asset_id=raw.asset_id,
+            broll_range=(round(start_s, 3), round(start_s + dur, 3)),
+            broll_audio_volume=max(0.0, min(1.0, broll_audio_volume)),
+        )
+        attach(clip, narr)
+        return {
+            "ok": True,
+            "detail": f"narration {item_index}: {text[:48]!r} over "
+            f"{raw.asset_id[:8]} {start_s:.1f}+{dur:.1f}s "
+            f"(src audio {narr.broll_audio_volume:.2f})",
+        }
 
     # ------------------------------------------------------------ privacy redaction
     def add_blur_region(self, item_index: int, bbox: list[int], sigma: int = 24) -> dict[str, Any]:
@@ -437,6 +481,16 @@ def build_director_registry(toolbox: DirectorToolbox) -> ToolRegistry:
         lambda **kw: toolbox.set_narration_text(**kw),
     )
     reg.register(
+        "narration.add",
+        "Convert a raw master clip into a NARRATION clip: your voiceover script "
+        "replaces the clip's source audio while the same window plays as muted "
+        "b-roll (broll_audio_volume 0..1 restores ambience). Use on clips whose "
+        "raw audio carries no key dialogue; the TTS clip is synthesized and "
+        "cached before render.",
+        _NarrationAddInput,
+        lambda **kw: toolbox.add_narration(**kw),
+    )
+    reg.register(
         "redaction.add_blur",
         "Add a privacy blur box [x, y, w, h] (canvas px) to a raw clip.",
         _BlurAddInput,
@@ -480,6 +534,12 @@ class _MoveInput(BaseModel):
 class _NarrationInput(BaseModel):
     item_index: int = Field(ge=0)
     script_text: str = Field(min_length=1, max_length=4000)
+
+
+class _NarrationAddInput(BaseModel):
+    item_index: int = Field(ge=0)
+    script_text: str = Field(min_length=1, max_length=4000)
+    broll_audio_volume: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
 class _BlurAddInput(BaseModel):

@@ -85,6 +85,9 @@ class PipelineDeps:
     # --- M4 vision stack (all optional; None/False keeps the CPU-only pipeline)
     redact_backend: str | None = None  # "tracked" (3-pass, issue #14) | "yunet" | "modal"
     vision_enrich: bool = False  # frame-quality score + VLM timeline + timestamp OCR
+    # --- M2 close-out: LLM Director autodrive (Gemini controls the edit)
+    llm_direct: bool = False  # stage_director after planning (soft-fails to the v1 cut)
+    director_max_rounds: int | None = None  # None -> DIRECTOR_MAX_ROUNDS env (default 4)
     log: Callable[[str], None] = lambda _msg: None
 
 
@@ -1373,6 +1376,17 @@ def run_pipeline(
         _update_job(deps.sessions(), job_id, JobStage.planning, 40.0)
         timeline, version = stage_planning(asset_id, transcript, project_id, deps)
 
+        # Stage 6.5 — the Director agent re-cuts the v1 timeline when enabled.
+        # Soft-fail: no key / provider outage / bad rounds -> the deterministic
+        # cut rides on. Every accepted edit is a persisted timeline version.
+        if deps.llm_direct:
+            _update_job(deps.sessions(), job_id, JobStage.planning, 42.0)
+            from director_os.worker.director import stage_director
+
+            timeline, version, _director_report = stage_director(
+                timeline, asset_id, transcript, project_id, deps
+            )
+
         _update_job(deps.sessions(), job_id, JobStage.narration, 46.0)
         narration_audio: dict[str, Path] | None = None
         try:
@@ -1553,6 +1567,10 @@ def make_deps(
     # bodycam runs set AUDIO_MODE=isolate_2bus + AUDIO_ENHANCER=deepfilter
     overrides.setdefault(
         "audio_mode", os.getenv("AUDIO_MODE", "").strip().lower() or "loudnorm_48k"
+    )
+    # DIRECTOR_AUTODRIVE env default — the LLM Director re-cuts the v1 timeline
+    overrides.setdefault(
+        "llm_direct", os.getenv("DIRECTOR_AUTODRIVE", "").strip().lower() in {"1", "true", "yes"}
     )
     return PipelineDeps(
         sessions=make_session_factory(engine),
