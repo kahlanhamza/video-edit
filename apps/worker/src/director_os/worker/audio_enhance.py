@@ -75,7 +75,7 @@ from director_os.audio_engine.vad import SileroVad, speech_gate_intervals
 # dBFS. Bumping the version is MANDATORY on any mix/tone change — the cache
 # key must not let a re-render silently reuse a master mixed with the old
 # sound.
-ENHANCE_CACHE_VERSION = "v5"  # v5: numpy ceiling replaces the broken ffmpeg 7.1 alimiter
+ENHANCE_CACHE_VERSION = "v6"  # v6: clamp fix (v5 masters amplified silence — never reuse them)
 
 # --- speech-preservation rescue (ENHANCE_CACHE_VERSION v4) ---------------
 # A word span whose enhanced RMS dropped more than this below the precleaned
