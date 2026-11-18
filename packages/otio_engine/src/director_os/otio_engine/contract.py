@@ -72,6 +72,10 @@ class NarratorClipMeta(BaseModel):
     script_text: str
     broll_asset_id: str | None = None
     broll_range: tuple[float, float] | None = None
+    # 2-3 sequential muted b-roll windows under ONE spoken block — the TTS
+    # audio stays continuous while the visuals cut window-to-window (anti
+    # "frozen b-roll" law); the renderer cycles the list to fill the block.
+    broll_windows: list[tuple[float, float]] | None = None
     broll_audio_volume: float = 0.0
     jl_cut: JLCut | None = None
     act_name: str | None = None  # 6-act documentary marker (M5 Director session)

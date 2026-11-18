@@ -100,6 +100,7 @@ def test_invariants_reject_the_eustis_failure_shape():
         "narrator_floor",
         "raw_segment_floor",
         "coverage_span",
+        "hook_late",  # hook-first law: narration at 29.5s is already too late
     }
 
 

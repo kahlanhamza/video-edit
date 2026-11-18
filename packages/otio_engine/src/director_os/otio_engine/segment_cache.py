@@ -95,6 +95,10 @@ class SegmentRenderSpec(BaseModel):
     # hash; the content digest rides the key so an edited script re-renders.
     narration_audio_path: str | None = None
     narration_audio_digest: str | None = None
+    # --- multi-b-roll narration visuals (anti-frozen-b-roll law): 2-3 source
+    # windows concatenated under ONE continuous TTS block; the list rides the
+    # cache key so a re-planned cut re-renders exactly these segments.
+    broll_windows: list[tuple[float, float]] | None = None
 
 
 def segment_hash(spec: SegmentRenderSpec) -> str:

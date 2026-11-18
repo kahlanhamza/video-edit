@@ -13,6 +13,7 @@ completion order, so output is byte-plan identical to the serial path.
 
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -39,6 +40,37 @@ class RenderReport:
     total_dur_s: float
 
 
+def _broll_concat_prelude(
+    spec: SegmentRenderSpec, src_path: str, windows: list[tuple[float, float]], dur: float
+) -> tuple[list[str], list[str]]:
+    """Multi-b-roll narration visuals: N exact slices concat-cycled to fill dur.
+
+    Inputs 1..N are the additional windows (window 0 rides input 0, sliced by
+    the caller as usual). Every input is geometry-normalized then split into
+    `cycles` copies; the concat chain cycles the windows until the block's
+    full TTS duration is covered (-t dur cuts the exact length afterwards).
+    Returns (extra_input_args, graph_parts) — graph_parts produce `[vbase]`.
+    """
+    v = spec.video
+    geo = f"scale={v.w}:{v.h}:force_original_aspect_ratio=decrease:flags=lanczos," \
+          f"pad={v.w}:{v.h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={v.fps}"
+    total = sum(max(0.1, w1 - w0) for w0, w1 in windows)
+    cycles = max(1, int(math.ceil(dur / max(0.5, total))))
+    cmd: list[str] = []
+    graph: list[str] = []
+    labels: list[str] = []
+    for i, (w0, w1) in enumerate(windows[1:], start=1):
+        cmd += exact_slice_args(max(0.0, w0), max(0.1, w1))
+        cmd += ["-i", src_path]
+    for i in range(len(windows)):
+        outs = "".join(f"[bw{i}_{c}]" for c in range(cycles))
+        graph.append(f"[{i}:v]{geo},split={cycles}{outs}")
+        for c in range(cycles):
+            labels.append(f"[bw{i}_{c}]")
+    graph.append("".join(labels) + f"concat=n={len(labels)}:v=1:a=0[vbase]")
+    return cmd, graph
+
+
 def build_segment_cmd(
     spec: SegmentRenderSpec,
     src_path: str | None,
@@ -50,7 +82,17 @@ def build_segment_cmd(
     dur = spec.source_dur_s
     cmd: list[str] = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
 
+    multi_broll = (
+        spec.kind == "narration"
+        and bool(spec.broll_windows)
+        and len(spec.broll_windows) >= 2
+        and src_path is not None
+    )
     graph, uses_complex, n_overlay_inputs = compose_filter_complex(spec)
+    if multi_broll:
+        extra, prelude = _broll_concat_prelude(spec, src_path, spec.broll_windows, dur)
+        graph = ";".join([*prelude, graph.replace("[0:v]", "[vbase]", 1)])
+        uses_complex = True
 
     if spec.kind == "narration" and src_path is None:
         # narration on black (TTS audio lands in M2; broll visuals per contract)
@@ -62,10 +104,18 @@ def build_segment_cmd(
         if src_has_audio is None:
             src_has_audio = has_audio_stream(src_path)
         # guardrail 2: exact slicing, never -to
-        cmd += exact_slice_args(spec.source_start_s, spec.source_start_s + dur)
+        if not multi_broll:
+            cmd += exact_slice_args(spec.source_start_s, spec.source_start_s + dur)
+        else:
+            # window 0 rides input 0, sliced exactly as a single-window block
+            w0, w1 = spec.broll_windows[0]
+            cmd += exact_slice_args(max(0.0, w0), max(0.1, w1))
         cmd += ["-i", str(src_path)]
+        if multi_broll:
+            # inputs 1..N-1: the additional b-roll windows (concat prelude consumes them)
+            cmd += extra
 
-    n_inputs = 1 + n_overlay_inputs
+    n_inputs = 1 + (len(spec.broll_windows) - 1 if multi_broll else 0) + n_overlay_inputs
     for card in spec.cards:
         cmd += ["-loop", "1", "-i", card.png_path]
     if spec.spotlight_png_path:

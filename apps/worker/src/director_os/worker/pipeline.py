@@ -66,11 +66,17 @@ from director_os.otio_engine.timeline import (
 from sqlalchemy import select
 
 AUTO_CUT_MAX_SEGMENT_S = 8.0
-# sources >= this get the 6-act documentary treatment (LLM story-map Director
-# or deterministic fallback); shorter sources keep the v1 auto-cut
-DOCUMENTARY_MIN_SOURCE_S = 900.0
-# retention QA floors only bind at >= 20 min raw (Eustis postmortem rule)
-RETENTION_QA_MIN_SOURCE_S = 1200.0
+# sources >= this get the multi-act documentary treatment (LLM story-map
+# Director or deterministic fallback); shorter sources keep the v1 auto-cut.
+# SCALED LAW (owner rule 2026-11-19): the documentary path is length-adaptive
+# (doc_scale.py) — an 8-minute tape plans a ~2.5-min doc, a 43-minute tape a
+# 10-15-min doc; nothing in the law assumes one hardcoded source length.
+DOCUMENTARY_MIN_SOURCE_S = 480.0
+# retention QA binds on every documentary source (floors scale with length)
+RETENTION_QA_MIN_SOURCE_S = 480.0
+# narration re-time tail pad: sentence-final words never clip (bounded 0.2-3s
+# inside retime_narration_to_tts); measured TTS duration + this pad = item len
+NARR_TAIL_PAD_S = 0.35
 
 
 class PipelineError(RuntimeError):
@@ -100,6 +106,9 @@ class PipelineDeps:
     director_backend_factory: Callable[[], Any] | None = None
     complete_json: Callable[[str, str], str] | None = None  # dossier synthesis
     fetch: Callable[[str], Any] | None = None  # case-source fetching (tests)
+    # --- POST-FX (owner rule 2026-11-19): tracked blur + audio enhancement +
+    # caption burn run ONLY on the assembled deliverable, never the raw source
+    post_fx: bool = False
     log: Callable[[str], None] = lambda _msg: None
 
 
@@ -116,6 +125,7 @@ class PipelineResult:
     timeline: Any = None  # the shipped master timeline (act-breakdown reads)
     source_duration_s: float = 0.0
     dossier: dict | None = None
+    post_fx: Any = None  # PostFxReport receipt when the post-FX pass ran
 
 
 def _update_job(s, job_id: str, stage: JobStage, progress: float, error: str | None = None) -> None:
@@ -279,8 +289,10 @@ def stage_narration(timeline, project_id: str, deps: PipelineDeps) -> list[dict]
             clips.append(
                 {
                     "item": getattr(item, "name", "") or "",
+                    "script_text": meta.script_text,
                     "script_chars": len(meta.script_text),
                     "clip": str(result.path),
+                    "sidecar": str(result.path.with_suffix(".json")),
                     "duration_s": round(result.duration_s, 3),
                     "provider": result.provider,
                     "voice": meta.voice_id,
@@ -297,8 +309,178 @@ def stage_narration(timeline, project_id: str, deps: PipelineDeps) -> list[dict]
 
     manifest = deps.settings.output_dir / "pipeline" / project_id / "narration" / "clips.json"
     manifest.parent.mkdir(parents=True, exist_ok=True)
+    # entries carry the script + sidecar path so the POST-FX caption builder can
+    # lay TTS word stamps on the master clock without re-synthesizing
     _atomic_json_write(manifest, {"clips": clips})
     return clips
+
+
+def retime_narration_to_tts(timeline, narration_clips: list[dict]) -> int:
+    """Re-time narration segments to their REAL TTS clip durations.
+
+    The plan's dur_s is an LLM estimate; the shipped voiceover is the cached
+    TTS clip. Without this pass a short TTS leaves trailing dead air (the
+    sleepy-pause complaint) and a long TTS gets its final words CUT OFF.
+    Each NarratorClipMeta item is re-timed to tts_duration + NARR_TAIL_PAD_S
+    (bounded 0.2-3s pad), b-roll window start unchanged. Returns count.
+    """
+    import opentimelineio.opentime as ot_time
+
+    from director_os.otio_engine.compiler import master_track
+    from director_os.otio_engine.contract import NarratorClipMeta, parse_clip_meta
+    from director_os.otio_engine.timeline import is_gap
+
+    dur_by_script = {
+        c.get("script_text", ""): float(c.get("duration_s") or 0.0)
+        for c in narration_clips or []
+        if c.get("script_text")
+    }
+    if not dur_by_script:
+        return 0
+    retimed = 0
+    try:
+        master = master_track(timeline)
+    except Exception:
+        return 0
+    for item in master:
+        if is_gap(item):
+            continue
+        try:
+            meta = parse_clip_meta(item)
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(meta, NarratorClipMeta):
+            continue
+        tts_dur = dur_by_script.get(meta.script_text)
+        if not tts_dur or tts_dur <= 0:
+            continue
+        sr = getattr(item, "source_range", None)
+        if sr is None:
+            continue
+        pad = min(max(0.2, NARR_TAIL_PAD_S), 3.0)
+        new_dur = max(2.0, tts_dur + pad)
+        rate = sr.duration.rate
+        item.source_range = ot_time.TimeRange(
+            start_time=sr.start_time,
+            # RationalTime carries FRAMES at a rate: value = seconds * rate
+            # (the pre-fix code passed seconds as frames and shrank every
+            # narration item to 1/30th of its TTS duration)
+            duration=ot_time.RationalTime(value=new_dur * rate, rate=rate),
+        )
+        retimed += 1
+    return retimed
+
+
+def master_spans(timeline) -> list[tuple[float, float]]:
+    """[(start, dur), ...] of the master track — the pre-retime snapshot the
+    card re-anchor pass needs (call BEFORE retime_narration_to_tts)."""
+    from director_os.otio_engine.compiler import master_track
+    from director_os.otio_engine.timeline import item_duration_s
+
+    spans: list[tuple[float, float]] = []
+    t = 0.0
+    for item in master_track(timeline):
+        d = item_duration_s(item)
+        spans.append((t, d))
+        t += d
+    return spans
+
+
+def retime_cards_after_narration(timeline, pre_spans: list[tuple[float, float]]) -> int:
+    """Re-anchor overlay cards after the TTS re-time (measured WAV durations).
+
+    Cards were placed at planned (word-count estimated) narration boundaries;
+    after `retime_narration_to_tts` the narration items follow the REAL TTS
+    durations, so every card would drift by the accumulated delta — the
+    acceptance review caught location_intro landing inside the wrong block.
+    Each card keeps its anchor ITEM (pre-retime snapshot) and local offset:
+    new_pos = new_start[idx] + min(local, new_dur[idx]); the overlay track is
+    rebuilt as a gap/card sequence with the same mechanics as add_card.
+    """
+    import opentimelineio.opentime as ot_time
+    import opentimelineio.schema as ot_schema
+
+    from director_os.otio_engine.compiler import master_track
+    from director_os.otio_engine.timeline import (
+        OVERLAY_TRACK,
+        is_gap,
+        item_duration_s,
+        track_by_name,
+    )
+
+    master = master_track(timeline)
+    overlay = track_by_name(timeline, OVERLAY_TRACK)
+    if overlay is None or not pre_spans:
+        return 0
+
+    # post-retime master item starts
+    new_starts: list[float] = []
+    t = 0.0
+    for item in master:
+        new_starts.append(t)
+        t += item_duration_s(item)
+
+    cards: list[tuple[float, Any]] = []
+    t = 0.0
+    for item in overlay:
+        d = item_duration_s(item)
+        meta = item.metadata.get("director_os") or {}
+        if meta.get("kind") == "card" and not is_gap(item):
+            cards.append((t, item))
+        t += d
+    if not cards:
+        return 0
+
+    moved = 0
+    placements: list[tuple[float, Any]] = []
+    for pos, card in cards:
+        idx = len(pre_spans) - 1
+        for i, (s0, d0) in enumerate(pre_spans):
+            if s0 - 0.01 <= pos < s0 + max(d0, 0.01):
+                idx = i
+                break
+        local = max(0.0, pos - pre_spans[idx][0])
+        new_dur = item_duration_s(master[idx]) if idx < len(master) else 0.0
+        if new_dur > 0:
+            new_pos = new_starts[idx] + min(local, max(0.5, new_dur - 0.25))
+        else:
+            new_pos = new_starts[idx]
+        new_pos = max(0.0, new_pos)
+        if abs(new_pos - pos) > 0.05:
+            moved += 1
+        placements.append((new_pos, card))
+
+    # rebuild the overlay: gap/card sequence covering the (new) master duration
+    total = sum(item_duration_s(i) for i in master)
+    placements.sort(key=lambda p: p[0])
+    rate = 30  # overlay timings ride the master rate; compiler normalizes on read
+    new_items: list[Any] = []
+    cursor = 0.0
+    for pos, card in placements:
+        cd = item_duration_s(card)
+        pos = min(pos, max(0.0, total - cd))
+        if pos > cursor + 0.01:
+            g = ot_schema.Gap()
+            g.source_range = ot_time.TimeRange(
+                start_time=ot_time.RationalTime(0, rate),
+                duration=ot_time.RationalTime((pos - cursor) * rate, rate),
+            )
+            new_items.append(g)
+            cursor = pos
+        new_items.append(card)
+        cursor += cd
+    if total - cursor > 0.01:
+        g = ot_schema.Gap()
+        g.source_range = ot_time.TimeRange(
+            start_time=ot_time.RationalTime(0, rate),
+            duration=ot_time.RationalTime((total - cursor) * rate, rate),
+        )
+        new_items.append(g)
+    for it in list(overlay):
+        overlay.remove(it)
+    for it in new_items:
+        overlay.append(it)
+    return moved
 
 
 def _atomic_json_write(path: Path, payload: dict) -> None:
@@ -1225,7 +1407,9 @@ def _plan_documentary(
         scaffold = _documentary_scaffold(asset_id, dur, fps, deps.video.w, deps.video.h, audio_mode)
         toolbox = DirectorToolbox(scaffold, project_id, (deps.video.w, deps.video.h))
         registry = build_director_registry(toolbox)
-        session = DirectorSession(registry, store, project_id, backend, source_duration_s=dur)
+        session = DirectorSession(
+            registry, store, project_id, backend, source_duration_s=dur, transcript=transcript
+        )
         plan, plan_err = session.plan_macro(buckets, dossier)
         if plan is None:
             deps.log(f"  [planning] Phase A failed ({plan_err}) — deterministic fallback")
@@ -1798,6 +1982,7 @@ def run_pipeline(
 
         _update_job(deps.sessions(), job_id, JobStage.narration, 46.0)
         narration_audio: dict[str, Path] | None = None
+        narration_clips: list[dict] = []
         try:
             narration_clips = stage_narration(timeline, project_id, deps)
         except Exception as e:  # noqa: BLE001 — a TTS outage must not kill the cut
@@ -1806,6 +1991,18 @@ def run_pipeline(
         if narration_clips:
             from director_os.otio_engine.contract import NarratorClipMeta, parse_clip_meta
             from director_os.otio_engine.timeline import MASTER_TRACK, is_gap, track_by_name
+
+            # RETIME: narration segments follow the REAL TTS durations (no
+            # trailing dead air, no clipped final words); cards re-anchor to
+            # the measured durations so location_intro stays on its block
+            pre_spans = master_spans(timeline)
+            n_retimed = retime_narration_to_tts(timeline, narration_clips)
+            if n_retimed:
+                n_cards = retime_cards_after_narration(timeline, pre_spans)
+                deps.log(
+                    f"  [narration] retimed {n_retimed} segment(s) to TTS durations, "
+                    f"re-anchored {n_cards} card(s)"
+                )
 
             master = track_by_name(timeline, MASTER_TRACK)
             narration_audio = {}
@@ -1876,9 +2073,31 @@ def run_pipeline(
         _update_job(deps.sessions(), job_id, JobStage.subtitles, 85.0)
         stage_subtitles(timeline, transcript, project_id, deps)
 
+        # POST-FX (owner rule): blur + enhance + captions run ONLY now, on the
+        # assembled deliverable — never on the 43-min source. QA below audits
+        # THIS file.
+        post_fx_report = None
+        final_for_qa = report.final_path
+        if deps.post_fx:
+            _update_job(deps.sessions(), job_id, JobStage.qa, 88.0)
+            try:
+                from director_os.worker.post_fx import stage_post_fx
+
+                post_fx_report = stage_post_fx(
+                    report.final_path,
+                    timeline,
+                    transcript,
+                    project_id,
+                    deps,
+                    narration_clips=narration_clips,
+                )
+                final_for_qa = post_fx_report.final_path or report.final_path
+            except Exception as e:  # noqa: BLE001
+                deps.log(f"  [post-fx] FAILED ({e}) — QA audits the un-post-fx'd master")
+
         _update_job(deps.sessions(), job_id, JobStage.qa, 90.0)
         audit = stage_qa(
-            report.final_path,
+            final_for_qa,
             dag_total_dur(timeline),
             job_id,
             project_id,
@@ -1933,19 +2152,21 @@ def run_pipeline(
         _update_job(deps.sessions(), job_id, stage, progress, error=str(e)[:2000])
         raise
 
-    deps.log(f"[pipeline] DONE {report.final_path} (audit ok)")
+    shipped = post_fx_report.final_path if post_fx_report else report.final_path
+    deps.log(f"[pipeline] DONE {shipped} (audit ok)")
     return PipelineResult(
         job_id=job_id,
         project_id=project_id,
         asset_id=asset_id,
         otio_version=version,
-        final_path=report.final_path,
+        final_path=shipped,
         otio_path=otio_path,
         render=report,
         audit=audit,
         timeline=timeline,
         source_duration_s=_source_duration(deps, asset_id),
         dossier=_load_dossier(project_id, deps),
+        post_fx=post_fx_report,
     )
 
 
@@ -1991,6 +2212,11 @@ def make_deps(
     # DIRECTOR_AUTODRIVE env default — the LLM Director re-cuts the v1 timeline
     overrides.setdefault(
         "llm_direct", os.getenv("DIRECTOR_AUTODRIVE", "").strip().lower() in {"1", "true", "yes"}
+    )
+    # POST_FX env default — the owner rule is now the standing law for
+    # documentary runs; explicit overrides always win; tests stay hermetic
+    overrides.setdefault(
+        "post_fx", os.getenv("POST_FX", "").strip().lower() in {"1", "true", "yes"}
     )
     return PipelineDeps(
         sessions=make_session_factory(engine),

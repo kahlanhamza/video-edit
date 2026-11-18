@@ -28,51 +28,75 @@ from director_os.worker.pipeline import PipelineDeps, stage_planning
 SOURCE_DUR = 2627.0
 
 
+def _script_n(n: int, seed: str) -> str:
+    """A narration script with EXACTLY n words (the word-count law fixture)."""
+    words = seed.split()
+    filler = "the record shows the camera keeps rolling and every detail lands on the tape".split()
+    i = 0
+    while len(words) < n:
+        words.append(filler[i % len(filler)])
+        i += 1
+    return " ".join(words[:n])
+
+
 def _plan_json() -> str:
-    """v0.3-law plan: 14 narration blocks / 14 raw / ~776s / ratio ~0.41."""
+    """Word-count-law plan (hook-first): 50-word hook <=8s in, 60-word mid
+    blocks, 85-word outro, utterance-aligned raw windows — ~919s, ratio ~0.37.
+    Matches the TRANSCRIPT below (40s utterances every 60s)."""
     acts = [
         {
             "name": "Cold Open",
             "blocks": [
-                {"type": "raw", "source_start_s": 1650.0, "dur_s": 26.0},
-                {"type": "raw", "source_start_s": 1900.0, "dur_s": 26.0},
+                {"type": "raw", "source_start_s": 1662.0, "dur_s": 4.0},
                 {
                     "type": "narration",
-                    "script": (
-                        "July 4th, 2022, Eustis, Florida. A bodycam is rolling, and what "
-                        "it catches over the next forty minutes turns a routine call into a case."
+                    "script": _script_n(
+                        50,
+                        "July 4th 2022 Eustis Florida. A bodycam is rolling on a "
+                        "police officer and what it catches over the next forty "
+                        "minutes turns a routine holiday call into a criminal case "
+                        "the report never saw coming. Every second of it is on tape.",
                     ),
                     "dur_s": 20.0,
                 },
+                {"type": "raw", "source_start_s": 1925.0, "dur_s": 45.0},
             ],
         }
     ]
-    windows = [(60, 380), (390, 760), (770, 1140), (1150, 1520), (1530, 1990), (2000, 2560)]
-    for i, (lo, hi) in enumerate(windows, start=1):
+    for i in range(1, 7):
+        u = 60 + (i - 1) * 420
         blocks = [
             {
                 "type": "narration",
-                "script": f"Act {i} opening commentary on the record. " * 2,
+                "script": _script_n(
+                    60,
+                    f"Act {i} commentary on what the camera just showed and what the "
+                    "verified record says about it, plainly",
+                ),
                 "dur_s": 22.0,
-            }
-        ]
-        for j in range(2):
-            blocks.append(
-                {"type": "raw", "source_start_s": round(lo + j * ((hi - lo) / 3), 1), "dur_s": 34.0}
-            )
-        blocks.append(
+            },
+            {"type": "raw", "source_start_s": float(u), "dur_s": 45.0},
+            {"type": "raw", "source_start_s": float(u + 180), "dur_s": 45.0},
             {
                 "type": "narration",
-                "script": f"Act {i} closing analysis, said plainly. " * 2,
+                "script": _script_n(
+                    60,
+                    f"Act {i} closing analysis of the contradiction the tape just "
+                    "proved, said calmly and on the record",
+                ),
                 "dur_s": 22.0,
-            }
-        )
+            },
+        ]
         if i == 6:
             blocks.append(
                 {
                     "type": "narration",
-                    "script": "The record closes the loop: booking finishes, the tests come "
-                    "back, and the case files state the verified outcome.",
+                    "script": _script_n(
+                        85,
+                        "The record closes the loop: booking finishes, the tests come "
+                        "back, and the case files state the verified outcome in plain "
+                        "terms for everyone involved in this stop",
+                    ),
                     "dur_s": 32.0,
                 }
             )
@@ -153,16 +177,16 @@ TRANSCRIPT = {
             "end_s": float(t) + 0.4,
             "speaker": "Officer" if t % 120 < 60 else "Suspect",
         }
-        for t in range(0, 2600, 45)
+        for t in range(0, 2600, 60)
     ],
     "segments": [
         {
             "speaker": "Officer" if t % 120 < 60 else "Suspect",
             "start_s": float(t),
-            "end_s": float(t) + 18,
+            "end_s": float(t) + 40.0,
             "text": f"utterance at {t}s about the case",
         }
-        for t in range(0, 2600, 45)
+        for t in range(0, 2600, 60)
     ],
 }
 

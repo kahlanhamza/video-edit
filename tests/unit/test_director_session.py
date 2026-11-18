@@ -34,53 +34,90 @@ from director_os.otio_engine.timeline import (
 SOURCE_DUR = 2627.0
 
 
+def _script_n(n: int, seed: str) -> str:
+    """A narration script with EXACTLY n words (the word-count law fixture)."""
+    words = seed.split()
+    filler = "the record shows the camera keeps rolling and every detail lands on the tape".split()
+    i = 0
+    while len(words) < n:
+        words.append(filler[i % len(filler)])
+        i += 1
+    return " ".join(words[:n])
+
+
+# transcript the fixture windows are built against: 40s utterances each minute
+FIXTURE_TRANSCRIPT = {
+    "words": [
+        {"text": "w", "start_s": float(t), "end_s": float(t) + 0.4, "speaker": "Officer"}
+        for t in range(0, 2600, 60)
+    ],
+    "segments": [
+        {"speaker": "Officer", "start_s": float(t), "end_s": float(t) + 40.0,
+         "text": f"minute {t} dialogue about the case"}
+        for t in range(0, 2600, 60)
+    ],
+}
+
+
 def _good_plan_json() -> str:
-    """A v0.3-law plan: 14 narration blocks (~316s), 14 raw clips (~460s),
-    total ~776s, ratio ~0.41 — every pre-flight + QA floor satisfied."""
+    """A word-count-law plan (hook-first): cold open = 4s silent-gap sting +
+    50-word hook narration (<=8s in, context <=32s), 12 mid blocks of 60 words
+    (~23.9s each at 2.6 w/s), an 85-word outro, and 14 raw windows aligned to
+    real utterances (41.1s snapped pieces) — ~919s total, ratio ~0.37."""
     acts = [
         {
             "name": "Cold Open",
             "blocks": [
-                {"type": "raw", "source_start_s": 1650.0, "dur_s": 26.0},
-                {"type": "raw", "source_start_s": 1900.0, "dur_s": 26.0},
+                # a silent gap between utterances (1660..1680): snaps to itself
+                {"type": "raw", "source_start_s": 1662.0, "dur_s": 4.0},
                 {
                     "type": "narration",
-                    "script": (
-                        "July 4th, 2022, Eustis, Florida. A bodycam is rolling, and what it "
-                        "catches over the next forty minutes turns a routine call into a case."
+                    "script": _script_n(
+                        50,
+                        "July 4th 2022 Eustis Florida. A bodycam is rolling on a "
+                        "police officer and what it catches over the next forty "
+                        "minutes turns a routine holiday call into a criminal case "
+                        "the report never saw coming. Every second of it is on tape.",
                     ),
                     "dur_s": 20.0,
                 },
+                {"type": "raw", "source_start_s": 1925.0, "dur_s": 45.0},
             ],
         }
     ]
-    windows = [(60, 380), (390, 760), (770, 1140), (1150, 1520), (1530, 1990), (2000, 2560)]
-    for i, (lo, hi) in enumerate(windows, start=1):
+    for i in range(1, 7):
+        u = 60 + (i - 1) * 420
         blocks = [
             {
                 "type": "narration",
-                "script": f"Act {i} commentary on the record so far, plainly. " * 2,
+                "script": _script_n(
+                    60,
+                    f"Act {i} commentary on what the camera just showed and what the "
+                    "verified record says about it, plainly",
+                ),
                 "dur_s": 22.0,
-            }
-        ]
-        for j in range(2):
-            start = lo + j * ((hi - lo) / 3)
-            blocks.append({"type": "raw", "source_start_s": round(start, 1), "dur_s": 34.0})
-        blocks.append(
+            },
+            {"type": "raw", "source_start_s": float(u), "dur_s": 45.0},
+            {"type": "raw", "source_start_s": float(u + 180), "dur_s": 45.0},
             {
                 "type": "narration",
-                "script": f"Act {i} closing analysis of what the camera just showed, factually. "
-                * 2,
+                "script": _script_n(
+                    60,
+                    f"Act {i} closing analysis of the contradiction the tape just "
+                    "proved, said calmly and on the record",
+                ),
                 "dur_s": 22.0,
-            }
-        )
-        if i == 6:  # the outro: 75-100 words (~32s)
+            },
+        ]
+        if i == 6:
             blocks.append(
                 {
                     "type": "narration",
-                    "script": (
-                        "The record closes the loop: booking finishes, the tests come back, "
-                        "and the case files state the verified outcome in plain terms."
+                    "script": _script_n(
+                        85,
+                        "The record closes the loop: booking finishes, the tests come "
+                        "back, and the case files state the verified outcome in plain "
+                        "terms for everyone involved in this stop",
                     ),
                     "dur_s": 32.0,
                 }
@@ -213,10 +250,15 @@ def test_plan_problems_flag_undercoverage_and_thin_narration():
 
 def test_plan_problems_flag_ratio_violation():
     plan = parse_macro_plan(_good_plan_json())
-    # starve the narration: shrink every narration block to 5s
+    # starve the narration WORDS: dur_s is ignored (computed from word count),
+    # so only a thin script can drag the narration ratio under the floor
     for act in plan.acts:
         act.blocks = [
-            (b.model_copy(update={"dur_s": 5.0}) if b.__class__.__name__ == "PlanNarration" else b)
+            (
+                b.model_copy(update={"script": "A short look at what happened.", "dur_s": 22.0})
+                if b.__class__.__name__ == "PlanNarration"
+                else b
+            )
             for b in act.blocks
         ]
     session = DirectorSession(
@@ -237,11 +279,18 @@ def test_expand_macro_plan_orders_steps_and_computes_card_positions():
     tools = [s.tool for s in steps]
     # first block is raw -> scaffold consumed by trim
     assert steps[0].tool == "timeline.trim_clip"
-    assert steps[0].args["new_start_s"] == 1650.0
+    assert steps[0].args["new_start_s"] == 1662.0  # the silent-gap climax sting
     assert "timeline.add_narration" in tools and "timeline.insert_raw_clip" in tools
     card_steps = [s for s in steps if s.tool == "cards.add"]
     assert card_steps[0].args["start_s"] > 60.0  # after cold open + act1 narration
     assert all(s.args["start_s"] >= 0 for s in card_steps)
+    # card_anchors FIX: location_intro lands at the TRUE start of act 1
+    # (sting + hook + cold raw), not a full act late
+    cold_total = sum(
+        b.est_s if b.__class__.__name__ == "PlanNarration" else b.dur_s
+        for b in plan.acts[0].blocks
+    )
+    assert abs(card_steps[0].args["start_s"] - cold_total) < 0.5
 
 
 def test_expand_macro_plan_narration_first_keeps_and_drops_scaffold():
@@ -279,16 +328,7 @@ def test_director_session_end_to_end_passes_invariants(store):
     backend = ScriptedChain(_good_plan_json())
     session = DirectorSession(registry, store, "proj_e2e", backend, source_duration_s=SOURCE_DUR)
 
-    transcript = {
-        "words": [
-            {"text": "w", "start_s": t, "end_s": t + 0.4, "speaker": "Officer"}
-            for t in range(0, 2600, 60)
-        ],
-        "segments": [
-            {"speaker": "Officer", "start_s": t, "end_s": t + 18, "text": f"minute {t}"}
-            for t in range(0, 2600, 60)
-        ],
-    }
+    transcript = FIXTURE_TRANSCRIPT
     buckets = build_story_map(transcript, SOURCE_DUR)
     plan, err = session.plan_macro(buckets, {"subject_name": "Eustis officer"})
     assert plan is not None, err
@@ -312,6 +352,8 @@ def test_director_session_keeps_prompting_while_under_target(store):
     registry = build_director_registry(toolbox)
 
     # Phase A returns a TRUNCATED, narration-starved plan (2 raw, 1 narr, 75s)
+    # — hook-first ordering (sting + narration first) so the loop's failure is
+    # the floors, not the hook law
     truncated = json.dumps(
         {
             "title": "truncated",
@@ -319,7 +361,7 @@ def test_director_session_keeps_prompting_while_under_target(store):
                 {
                     "name": "Cold Open",
                     "blocks": [
-                        {"type": "raw", "source_start_s": 60.0, "dur_s": 45.0},
+                        {"type": "raw", "source_start_s": 60.0, "dur_s": 4.0},
                         {
                             "type": "narration",
                             "script": "A short look at what happened.",
@@ -344,9 +386,10 @@ def test_director_session_keeps_prompting_while_under_target(store):
         {
             "tool": "timeline.add_narration",
             "args": {
-                "script_text": (
-                    f"Bridge {i}: the story turns on what the camera keeps showing, "
-                    "and the record is about to say so in plain terms."
+                "script_text": _script_n(
+                    62,
+                    f"Bridge {i}: the story turns on what the camera keeps showing and "
+                    "the record is about to say so in plain terms before this act closes",
                 ),
                 "dur_s": 25.0,
                 "act_name": f"Act {i + 1}",

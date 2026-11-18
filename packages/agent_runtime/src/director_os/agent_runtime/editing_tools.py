@@ -149,6 +149,7 @@ class DirectorToolbox:
         dur_s: float,
         at_index: int | None = None,
         broll_source_start_s: float | None = None,
+        broll_windows: list[list[float]] | None = None,
         act_name: str = "",
     ) -> dict[str, Any]:
         """Add a narrator block (TTS over muted, darkened B-roll).
@@ -156,6 +157,9 @@ class DirectorToolbox:
         B-roll defaults to the source range of the preceding raw clip (a quiet
         moment of the same scene the narration describes). Volume is 0 by the
         audio law for narration bridges (speech rides the TTS bus).
+        `broll_windows` (2-3 [start, end] pairs) cuts the VISUALS across
+        sequential muted windows while the voiceover stays one continuous TTS
+        block — the anti-frozen-b-roll law.
         """
         if not script_text.strip():
             raise ToolOperationError("script_text must not be empty")
@@ -196,6 +200,13 @@ class DirectorToolbox:
             "broll_audio_volume": 0.0,
             "jl_cut": {"j_s": 0.4},
         }
+        clean_windows = [
+            [round(float(w0), 2), round(float(w1), 2)]
+            for w0, w1 in (broll_windows or [])
+            if float(w1) > float(w0)
+        ]
+        if len(clean_windows) >= 2:
+            narr_meta["broll_windows"] = clean_windows
         if act_name:
             narr_meta["act_name"] = act_name
         clip.metadata.update({"director_os": narr_meta})
@@ -204,7 +215,8 @@ class DirectorToolbox:
             "ok": True,
             "detail": (
                 f"narration at {at_index}: {dur_s:.1f}s over broll "
-                f"{broll_source_start_s:.1f}s — {script_text[:60]!r}"
+                f"{broll_source_start_s:.1f}s ({len(clean_windows)} window(s)) — "
+                f"{script_text[:60]!r}"
             ),
         }
 
@@ -680,6 +692,7 @@ class _AddNarrationInput(BaseModel):
     dur_s: float = Field(ge=1.0, le=120.0)
     at_index: int | None = Field(default=None, ge=0)
     broll_source_start_s: float | None = Field(default=None, ge=0.0)
+    broll_windows: list[list[float]] | None = Field(default=None, max_length=4)
     act_name: str = Field(default="", max_length=120)
 
 

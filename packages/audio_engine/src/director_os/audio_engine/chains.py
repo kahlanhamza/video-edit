@@ -31,12 +31,20 @@ def tts_pause_trim_chain(
     start_threshold_db: float = -50.0,
     start_silence_s: float = 0.30,
     end_silence_s: float = 0.40,
+    *,
+    compress_pauses: bool = True,
+    pause_min_s: float = 0.30,
+    pause_keep_s: float = 0.15,
+    pause_threshold_db: float = -45.0,
 ) -> str:
-    """Trim TTS dead padding on both ends (audio.generate_tts `trim_pauses=True`).
+    """Trim TTS dead padding on both ends + COMPRESS internal pauses.
 
-    Pattern: silence at head -> reverse -> silence at tail -> reverse.
+    Pattern: silence at head -> reverse -> silence at tail -> reverse
+    -> internal pause compression (owner rule 2026-11-19: the narration must
+    catch attention — pauses longer than `pause_min_s` are shortened to
+    `pause_keep_s`, so a sleepy 1.2s mid-sentence gap becomes a 150ms beat).
     """
-    return (
+    chain = (
         f"silenceremove=start_periods=1:start_threshold={start_threshold_db:g}dB"
         f":start_silence={start_silence_s:g},"
         "areverse,"
@@ -44,6 +52,12 @@ def tts_pause_trim_chain(
         f":start_silence={end_silence_s:g},"
         "areverse"
     )
+    if compress_pauses:
+        chain += (
+            f",silenceremove=stop_periods=-1:stop_duration={pause_min_s:g}"
+            f":stop_threshold={pause_threshold_db:g}dB:stop_silence={pause_keep_s:g}"
+        )
+    return chain
 
 
 def narration_bed_chain(mute_head_s: float | None = None) -> str:

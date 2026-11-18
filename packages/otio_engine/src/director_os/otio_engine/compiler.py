@@ -246,6 +246,11 @@ def compile_timeline(
                 narration_text=meta.script_text,
                 narration_audio_path=narr_path,
                 narration_audio_digest=narr_digest,
+                broll_windows=(
+                    [(float(w0), float(w1)) for w0, w1 in meta.broll_windows]
+                    if meta.broll_windows
+                    else None
+                ),
                 codec_profile=f"{video.codec}-{video.pix_fmt}-{video.fps}fps-{audio.sample_rate}hz",
             )
         else:  # pragma: no cover — master track must be raw/narration only

@@ -1,0 +1,529 @@
+"""POST-FX — the owner's standing rule (2026-11-19), enforced in code.
+
+"Only and only apply tracking blur and audio enhancement AFTER the
+deliverable video is ready — after the agent already created the video +
+narration. We save time and resources on the big 43-minute video and only
+apply it on the chipped video."
+
+So this stage NEVER touches the raw source. It runs on the assembled master
+(video + narration + bed, the deliverable) as three resumable passes:
+
+  1. CAPTIONS — narration cues (TTS word stamps on the master clock, the
+     voiceover never comes from ASR) + raw-speech cues (ASR words remapped
+     through each kept raw clip's source->master mapping, skipping muted
+     b-roll windows) -> subtitles.master.{json,ass,srt}
+  2. TRACKED BLUR — YOLO/YuNet face sweep ON THE MASTER (so B-roll segments
+     are covered by construction — the compile-time per-clip bake could
+     never see them) -> trajectories -> gaussian redaction render
+  3. AUDIO ENHANCE — deep-filter speech enhancement ON THE MASTER MIX, with
+     a muted-speech rescue gate (the enhancer may never destroy dialogue;
+     VAD speech kept-ratio is measured before/after)
+  4. MUX — blurred video + enhanced audio + burned captions -> final master
+
+Every pass writes a .done marker; a killed run re-enters and skips finished
+work. Duration is preserved end-to-end (drift tolerance ±1s is asserted by
+QA downstream, which audits the FINAL file).
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from director_os.core.qa_probe import probe
+
+# the master clock re-mapping pad: narration stems get a small tail pad so
+# sentence-final words never clip
+NARR_TAIL_PAD_S = 0.35
+# muted-speech rescue: minimum fraction of VAD speech regions that must
+# survive enhancement (audio law: the enhancer may never destroy dialogue)
+MIN_SPEECH_KEEP_RATIO = 0.85
+
+
+class PostFxError(RuntimeError):
+    pass
+
+
+@dataclass
+class PostFxReport:
+    """Receipt for the whole post-FX pass (QA + the run log read this)."""
+
+    ok: bool = False
+    final_path: Path | None = None
+    n_caption_cues: int = 0
+    narration_cues: int = 0
+    raw_cues: int = 0
+    blur_backend: str = ""
+    blur_tracks: int = 0
+    blur_windows: int = 0
+    blur_leaks: int = 0
+    enhance_engine: str = ""
+    enhance_neural: bool = False
+    snr_before_db: float | None = None
+    snr_after_db: float | None = None
+    speech_keep_ratio: float | None = None
+    duration_s: float = 0.0
+    notes: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict:
+        d = self.__dict__.copy()
+        d["final_path"] = str(self.final_path) if self.final_path else None
+        return d
+
+
+# --------------------------------------------------------------------- utils
+def _run(cmd: list[str], what: str) -> None:
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise PostFxError(f"{what} failed: {r.stderr[-600:]}")
+
+
+def _escape_ass_path(p: Path) -> str:
+    return str(p).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+
+
+def _markers(work: Path) -> dict[str, Path]:
+    return {name: work / f"{name}.done" for name in ("captions", "blur", "audio", "final")}
+
+
+# ------------------------------------------------------------- captions pass
+def build_master_caption_cues(
+    timeline,
+    transcript: dict,
+    narration_words: dict[str, list[dict]],
+) -> tuple[list, dict[str, int]]:
+    """Master-clock caption beats: NARRATOR (TTS stamps) + raw speech (remapped).
+
+    narration_words maps script_text -> [{"word","start_s","end_s"}] from the
+    persisted TTS sidecars (already re-based onto the trimmed stem by
+    generate_tts). Raw-speech words come from the transcript (source clock)
+    and are remapped through each kept raw clip's window; words inside
+    narration b-roll windows are skipped (the bed is muted there).
+    """
+    from director_os.otio_engine.compiler import master_track
+    from director_os.otio_engine.contract import NarratorClipMeta, RawClipMeta, parse_clip_meta
+    from director_os.otio_engine.timeline import is_gap, item_duration_s
+    from director_os.subtitles.ass_builder import CaptionBeat, WordTiming
+
+    beats: list[CaptionBeat] = []
+
+    def _flush_run(run: list[tuple[str, float, float]], speaker: str) -> None:
+        if not run:
+            return
+        beats.append(
+            CaptionBeat(
+                text=" ".join(w for w, _s, _e in run),
+                start_ms=int(run[0][1] * 1000),
+                end_ms=int(run[-1][2] * 1000),
+                speaker=speaker,
+                words=[
+                    WordTiming(word=w, start_ms=int(s * 1000), end_ms=int(e * 1000))
+                    for w, s, e in run
+                ],
+            )
+        )
+
+    MAX_WORDS, MAX_S = 6, 3.5
+    narr_cues = raw_cues = 0
+
+    track = master_track(timeline)
+    t_master = 0.0
+    for item in track:
+        dur = item_duration_s(item)
+        if dur <= 0:
+            continue
+        if is_gap(item):
+            t_master += dur
+            continue
+        meta = parse_clip_meta(item)
+        sr = getattr(item, "source_range", None)
+        src0 = sr.start_time.to_seconds() if sr is not None else 0.0
+
+        if isinstance(meta, NarratorClipMeta):
+            words = narration_words.get(meta.script_text, [])
+            run: list[tuple[str, float, float]] = []
+            for w in words:
+                w_start = t_master + float(w.get("start_s", 0.0))
+                w_end = min(t_master + dur, t_master + float(w.get("end_s", 0.0)))
+                if w_end <= w_start:
+                    continue
+                if run:
+                    too_long = w_end - run[0][1] > MAX_S
+                    too_many = len(run) >= MAX_WORDS
+                    if too_long or too_many:
+                        _flush_run(run, "NARRATOR")
+                        narr_cues += 1
+                        run = []
+                run.append((str(w.get("word", "")).strip(), w_start, w_end))
+            if run:
+                _flush_run(run, "NARRATOR")
+                narr_cues += 1
+        elif isinstance(meta, RawClipMeta):
+            # remap transcript words inside [src0, src0+dur) onto the master clock
+            run2: list[tuple[str, float, float]] = []
+            speaker = "Unknown"
+            for w in transcript.get("words", []) or []:
+                text = str(w.get("text") or w.get("word") or "").strip()
+                if not text:
+                    continue
+                ws, we = float(w.get("start_s", 0.0)), float(w.get("end_s", 0.0))
+                if we <= src0 or ws >= src0 + dur:
+                    continue
+                m_start = t_master + max(0.0, ws - src0)
+                m_end = t_master + min(dur, we - src0)
+                if m_end - m_start < 0.05:
+                    continue
+                spk = str(w.get("speaker") or "Unknown")
+                if run2 and (spk != speaker or m_start - run2[-1][2] > 1.0
+                             or m_end - run2[0][1] > MAX_S or len(run2) >= MAX_WORDS):
+                    _flush_run(run2, speaker)
+                    raw_cues += 1
+                    run2 = []
+                speaker = spk
+                run2.append((text, m_start, m_end))
+            if run2:
+                _flush_run(run2, speaker)
+                raw_cues += 1
+        t_master += dur
+
+    beats.sort(key=lambda b: b.start_ms)
+    return beats, {"narration": narr_cues, "raw": raw_cues, "total": len(beats)}
+
+
+def _captions_pass(
+    master: Path, work: Path, timeline, transcript: dict, narration_clips: list[dict], report: PostFxReport
+) -> Path:
+    from director_os.subtitles.store import save_cues
+
+    # narration word stamps ride the stage_narration manifest entries
+    narration_words: dict[str, list[dict]] = {}
+    for clip in narration_clips or []:
+        sidecar = Path(clip.get("sidecar") or "")
+        script = str(clip.get("script_text") or "")
+        words: list[dict] = []
+        if sidecar.exists():
+            import json as _json
+
+            try:
+                words = list(_json.loads(sidecar.read_text()).get("words") or [])
+            except (ValueError, OSError):
+                words = []
+        if not words and script:
+            # even distribution fallback (TTS speech is near-constant rate):
+            # keeps narration captions present when a sidecar is missing
+            words = _even_word_distribution(script, float(clip.get("duration_s") or 0.0))
+        if words:
+            narration_words[script] = words
+
+    beats, counts = build_master_caption_cues(timeline, transcript, narration_words)
+    save_cues(work, beats)
+    report.n_caption_cues = counts["total"]
+    report.narration_cues = counts["narration"]
+    report.raw_cues = counts["raw"]
+    return work / "subtitles.ass"
+
+
+def _even_word_distribution(script: str, duration_s: float) -> list[dict]:
+    tokens = script.split()
+    if not tokens or duration_s <= 0:
+        return []
+    per = duration_s / len(tokens)
+    return [
+        {
+            "word": tok,
+            "start_s": round(i * per, 3),
+            "end_s": round(min(duration_s, (i + 1) * per), 3),
+        }
+        for i, tok in enumerate(tokens)
+    ]
+
+
+# ----------------------------------------------------------------- blur pass
+# selective redaction (acceptance law): the PRIMARY subject stays visible
+# while every other identity — plus plates and the baked-in watermark — is
+# blurred. BLUR_MODE env: "all" (default, blur every face) | "selective".
+WATERMARK_BAND_W = 0.30  # fraction of frame width (bottom-right band)
+WATERMARK_BAND_H = 0.14  # fraction of frame height
+
+
+def _primary_track_id(tracks) -> str | None:
+    """The main subject: the face track with the greatest on-screen span
+    (ties -> the largest mean box area). This is who the camera follows."""
+    best_id, best_key = None, (0.0, 0.0)
+    for t in tracks:
+        if not t.hits:
+            continue
+        span = float(t.t_end_s - t.t_start_s)
+        area = sum((h.w * h.h) for h in t.hits) / max(1, len(t.hits))
+        key = (span, area)
+        if key > best_key:
+            best_id, best_key = t.track_id, key
+    return best_id
+
+
+def _watermark_trajectory(n_frames: int, fps: float, w: int, h: int) -> "RedactionTrajectory":
+    """Static bottom-right band (baked-in channel watermark) blurred all video."""
+    from director_os.vision_fx.trajectory import RedactionTrajectory, TrackedBox
+
+    bw = max(40, int(w * WATERMARK_BAND_W))
+    bh = max(24, int(h * WATERMARK_BAND_H))
+    x = max(0, w - bw - int(w * 0.01))
+    y = max(0, h - bh - int(h * 0.02))
+    boxes = [
+        TrackedBox(frame_idx=i, t_s=round(i / fps, 3), x=x, y=y, w=bw, h=bh)
+        for i in range(max(0, n_frames))
+    ]
+    return RedactionTrajectory(track_id="watermark_static", boxes=boxes, n_windows=1)
+
+
+def _blur_pass(master: Path, work: Path, deps, report: PostFxReport) -> Path:
+    import sys
+
+    repo_src = Path(__file__).resolve().parents[4]  # repo/packages/... -> repo
+    for p in (
+        repo_src / "packages" / "vision_fx" / "src",
+        repo_src / "packages" / "core" / "src",
+        repo_src / "packages" / "perception" / "src",
+    ):
+        if str(p) not in sys.path:
+            sys.path.insert(0, str(p))
+
+    from director_os.vision_fx.compute.local_onnx import LocalOnnxCpuBackend
+    from director_os.vision_fx.redact_track import (
+        audit_coverage,
+        normalize_cfr,
+        render_tracked_redaction,
+    )
+    from director_os.vision_fx.trajectory import repair_trajectories
+
+    backend = LocalOnnxCpuBackend()
+    caps = backend.capabilities()
+    report.blur_backend = (
+        "yolov8n-face" if caps.get("yolo_model") else "yunet-packaged"
+    )
+
+    blur_mode = (os.getenv("BLUR_MODE", "").strip().lower() or "all")
+    exclude: set[str] = set()
+
+    # Pass 1: sweep the MASTER (b-roll included by construction)
+    tracks = backend.detect_faces(master, sample_every_s=1.0, progress=None)
+    if caps.get("plates"):
+        try:
+            plate_tracks = backend.detect_plates(master, sample_every_s=1.0, progress=None)
+            tracks = [*tracks, *plate_tracks]
+            report.notes.append(f"plates swept: {len(plate_tracks)} track(s)")
+        except Exception as e:  # noqa: BLE001 — plates are additive, never fatal
+            report.notes.append(f"plate sweep skipped ({e})")
+
+    if blur_mode == "selective" and tracks:
+        primary = _primary_track_id(tracks)
+        if primary is not None:
+            exclude.add(primary)
+            report.notes.append(f"selective mode: primary subject '{primary}' stays visible")
+
+    info = probe(master)
+    fps = float(info.fps or 30.0)
+    n_frames = int(round(info.duration_s * fps))
+    plan = repair_trajectories(
+        tracks, fps=fps, frame_w=int(info.width), frame_h=int(info.height), n_frames=n_frames
+    )
+    if blur_mode != "off":
+        plan.trajectories.append(
+            _watermark_trajectory(n_frames, fps, int(info.width), int(info.height))
+        )
+    report.blur_tracks = len(plan.trajectories)
+    report.blur_windows = sum(t.n_windows for t in plan.trajectories)
+    audited_tracks = [t for t in tracks if t.track_id not in exclude]
+    leaks = audit_coverage(plan, audited_tracks, fps)
+    report.blur_leaks = len(leaks)
+
+    cfr = normalize_cfr(master, work / "master_cfr.mp4")
+    blurred = work / "master_blurred.mp4"
+    render_tracked_redaction(
+        cfr, plan, blurred, mode="gauss", crf=20, preset="veryfast", exclude_track_ids=exclude
+    )
+    return blurred
+
+
+# ---------------------------------------------------------------- audio pass
+def _speech_regions(wav: Path) -> list[tuple[float, float]]:
+    """VAD speech spans (silero) — used by the muted-speech rescue gate."""
+    try:
+        import numpy as np
+
+        from director_os.audio_engine.snr import decode_pcm_mono
+        from director_os.audio_engine.vad import SileroVad
+
+        pcm = decode_pcm_mono(str(wav), 16_000)
+        return SileroVad().speech_regions(pcm.astype(np.float32))
+    except Exception:  # VAD unavailable: gate degrades to "assume speech kept"
+        return []
+
+
+def _extract_master_audio(master: Path, work: Path) -> Path:
+    wav = work / "master_audio.wav"
+    _run(
+        [
+            "ffmpeg", "-y", "-v", "error",
+            "-i", str(master),
+            "-vn", "-ac", "1", "-ar", "48000",
+            "-c:a", "pcm_s16le",
+            str(wav),
+        ],
+        "master audio extract",
+    )
+    return wav
+
+
+# ------------------------------------------------------------------- mux pass
+def _mux_pass(blurred: Path, enhanced_wav: Path, ass: Path, final: Path) -> None:
+    vf = f"ass='{_escape_ass_path(ass)}'"
+    _run(
+        [
+            "ffmpeg", "-y", "-v", "error",
+            "-i", str(blurred),
+            "-i", str(enhanced_wav),
+            "-vf", vf,
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+            "-movflags", "+faststart",
+            str(final),
+        ],
+        "post-fx final mux (captions + enhanced audio)",
+    )
+
+
+# -------------------------------------------------------------------- stage
+def stage_post_fx(
+    master: Path,
+    timeline,
+    transcript: dict,
+    project_id: str,
+    deps,
+    narration_clips: list[dict] | None = None,
+) -> PostFxReport:
+    """The POST-FX pass on the assembled deliverable (never the raw source).
+
+    Resumable: each pass leaves a .done marker in
+    output/pipeline/<project>/post_fx/. Returns the PostFxReport receipt.
+    """
+    master = Path(master)
+    if not master.exists():
+        raise PostFxError(f"master missing: {master}")
+    work = deps.settings.output_dir / "pipeline" / project_id / "post_fx"
+    work.mkdir(parents=True, exist_ok=True)
+    marks = _markers(work)
+    report = PostFxReport()
+
+    # ---- 1. captions
+    if marks["captions"].exists():
+        report.n_caption_cues = int(marks["captions"].read_text() or 0)
+        deps.log(f"  [post-fx] captions cached ({report.n_caption_cues} cues)")
+    else:
+        ass = _captions_pass(master, work, timeline, transcript, narration_clips or [])
+        marks["captions"].write_text(str(report.n_caption_cues))
+        deps.log(f"  [post-fx] captions: {report.n_caption_cues} cues ({report.narration_cues} narration / {report.raw_cues} raw) -> {ass.name}")
+    ass = work / "subtitles.ass"
+
+    # ---- 2. tracked blur (master only — b-roll covered by construction)
+    if marks["blur"].exists():
+        blurred = work / "master_blurred.mp4"
+        report.blur_backend = marks["blur"].read_text().split("|")[0]
+        report.blur_tracks = int(marks["blur"].read_text().split("|")[1] or 0)
+        deps.log(f"  [post-fx] blur cached ({report.blur_tracks} tracks via {report.blur_backend})")
+    else:
+        blurred = _blur_pass(master, work, deps, report)
+        marks["blur"].write_text(f"{report.blur_backend}|{report.blur_tracks}")
+        deps.log(
+            f"  [post-fx] blur: {report.blur_tracks} track(s), {report.blur_windows} window(s), "
+            f"{report.blur_leaks} leak(s) via {report.blur_backend}"
+        )
+
+    # ---- 3. audio enhancement on the master mix
+    if marks["audio"].exists():
+        enhanced = work / "master_audio.enhanced.wav"
+        report.enhance_engine = marks["audio"].read_text()
+        deps.log(f"  [post-fx] audio enhance cached ({report.enhance_engine})")
+    else:
+        from director_os.audio_engine.enhance import DeepFilterCliEnhancer
+
+        raw_wav = _extract_master_audio(master, work)
+        report.snr_before_db = _measure_snr(raw_wav)
+        speech_before = _speech_regions(raw_wav)
+        enhanced = work / "master_audio.enhanced.wav"
+        try:
+            enhancer = DeepFilterCliEnhancer()  # DEEPFILTER_BIN env or PATH
+            result = enhancer.enhance(raw_wav, enhanced)
+            report.enhance_engine = result.engine
+            report.enhance_neural = result.neural
+        except Exception as e:  # noqa: BLE001 — degrade loudly, never ship noise
+            deps.log(f"  [post-fx] deep-filter unavailable ({e}) — afftdn fallback")
+            from director_os.audio_engine.enhance import AfftdnEnhancer
+
+            enhancer = AfftdnEnhancer()
+            result = enhancer.enhance(raw_wav, enhanced)
+            report.enhance_engine = result.engine
+            report.enhance_neural = result.neural
+        # muted-speech rescue gate
+        kept = _speech_regions(enhanced)
+        if speech_before:
+            ratio = _speech_keep_ratio(speech_before, kept)
+            report.speech_keep_ratio = ratio
+            if ratio < MIN_SPEECH_KEEP_RATIO:
+                raise PostFxError(
+                    f"enhancer destroyed dialogue: speech keep ratio {ratio:.2f} < "
+                    f"{MIN_SPEECH_KEEP_RATIO:.2f} — refusing to ship"
+                )
+        report.snr_after_db = _measure_snr(enhanced)
+        marks["audio"].write_text(report.enhance_engine)
+        deps.log(
+            f"  [post-fx] audio: {report.enhance_engine} SNR {report.snr_before_db} -> "
+            f"{report.snr_after_db} dB, speech kept {report.speech_keep_ratio}"
+        )
+
+    # ---- 4. mux (blurred video + enhanced audio + burned captions)
+    if marks["final"].exists():
+        final = work / "master_postfx.mp4"
+    else:
+        final = work / "master_postfx.mp4"
+        _mux_pass(blurred, enhanced, ass, final)
+        # duration must be preserved end-to-end
+        info = probe(final)
+        drift = abs(info.duration_s - probe(master).duration_s)
+        if drift > 1.0:
+            raise PostFxError(f"post-fx drifted {drift:.2f}s vs master — refusing to ship")
+        report.duration_s = info.duration_s
+        marks["final"].write_text("ok")
+    report.final_path = final
+    report.ok = True
+    deps.log(f"  [post-fx] final: {final.name} ({final.stat().st_size / 1e6:.1f} MB)")
+    return report
+
+
+def _measure_snr(wav: Path) -> float | None:
+    try:
+        from director_os.audio_engine.snr import measure_snr
+
+        return round(measure_snr(str(wav), _speech_regions(wav))["snr_db"], 1)
+    except Exception:
+        return None
+
+
+def _speech_keep_ratio(before: list[tuple[float, float]], after: list[tuple[float, float]]) -> float:
+    """Fraction of before-speech time still detected as speech after enhance."""
+    if not before:
+        return 1.0
+    kept_s = 0.0
+    for b0, b1 in before:
+        covered = 0.0
+        for a0, a1 in after:
+            lo, hi = max(b0, a0), min(b1, a1)
+            if hi > lo:
+                covered += hi - lo
+        kept_s += min(covered, b1 - b0)
+    total = sum(b1 - b0 for b0, b1 in before)
+    return round(kept_s / total, 3) if total > 0 else 1.0

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import re as _re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,23 @@ from director_os.core.ffmpeg_args import audio_output_args
 from director_os.core.qa_probe import probe
 
 DEFAULT_VOICE = "en-US-GuyNeural"
+# Retention law: narration must CATCH attention, never lull it (owner rule
+# 2026-11-19 — the +0% default read sleepy and viewers bailed). +14% keeps
+# Brian's documentary timbre while landing ~2.9-3.0 words/sec. Override with
+# TTS_RATE env ("+0%" .. "+30%"); the rate rides the TTS cache key so a
+# change re-synthesizes exactly the affected clips.
+DEFAULT_TTS_RATE = "+14%"
+
+
+def resolve_tts_rate(rate: str | None = None) -> str:
+    """Explicit arg > TTS_RATE env > DEFAULT_TTS_RATE (validated shape)."""
+    import os as _os
+
+    value = (rate if rate is not None else _os.getenv("TTS_RATE")) or DEFAULT_TTS_RATE
+    value = str(value).strip()
+    if not _re.match(r"^[+-]\d{1,2}%$", value):
+        raise TtsError(f"invalid TTS rate '{value}' (expected e.g. '+14%')")
+    return value
 ELEVENLABS_DEFAULT_BASE = "https://api.elevenlabs.io"
 # public shared voice (Rachel) — overridable via ELEVENLABS_VOICE_ID
 ELEVENLABS_DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
@@ -48,27 +66,50 @@ class TtsError(RuntimeError):
 class TtsBackend(Protocol):
     """Produces audio bytes (mp3/wav) for a text + voice pair."""
 
-    def synthesize(self, text: str, voice: str) -> bytes: ...
+    def synthesize(self, text: str, voice: str, rate: str | None = None) -> bytes: ...
 
 
 class EdgeTtsBackend:
     """Real backend: edge-tts (Microsoft Edge neural voices, no API key)."""
 
     provider = "edge-tts"
+    supports_rate = True
 
-    def synthesize(self, text: str, voice: str) -> bytes:
+    def synthesize(self, text: str, voice: str, rate: str | None = None) -> bytes:
+        audio, _ = self.synthesize_with_timestamps(text, voice, rate=rate)
+        return audio
+
+    def synthesize_with_timestamps(
+        self, text: str, voice: str, rate: str | None = None
+    ) -> tuple[bytes, tuple[WordStamp, ...]]:
+        """Stream audio + WordBoundary events -> (bytes, word stamps).
+
+        WordBoundary offsets are 100-ns ticks from the STREAM start (which is
+        the raw clip's clock, pre-trim). `generate_tts` re-bases them onto the
+        trimmed stem using the first word's offset.
+        """
         try:
             import edge_tts
         except ImportError as e:  # pragma: no cover - exercised only without dep
             raise TtsError("edge-tts is not installed (uv sync should provide it)") from e
 
-        async def _run() -> bytes:
-            comms = edge_tts.Communicate(text, voice)
+        async def _run() -> tuple[bytes, tuple[WordStamp, ...]]:
+            comms = edge_tts.Communicate(
+                text, voice, rate=resolve_tts_rate(rate), boundary="WordBoundary"
+            )
             chunks: list[bytes] = []
+            words: list[WordStamp] = []
             async for chunk in comms.stream():
                 if chunk["type"] == "audio":
                     chunks.append(chunk["data"])
-            return b"".join(chunks)
+                elif chunk["type"] == "WordBoundary":
+                    token = str(chunk.get("text") or "").strip()
+                    if not token:
+                        continue
+                    start_s = float(chunk.get("offset") or 0) / 1e7
+                    end_s = start_s + float(chunk.get("duration") or 0) / 1e7
+                    words.append(WordStamp(word=token, start_s=start_s, end_s=end_s))
+            return b"".join(chunks), tuple(words)
 
         try:
             return asyncio.run(_run())
@@ -160,7 +201,7 @@ class ElevenLabsTtsBackend:
         # a Microsoft-style voice name means "use the configured default"
         return self.voice_id if voice == DEFAULT_VOICE or not voice else voice
 
-    def synthesize(self, text: str, voice: str = "") -> bytes:
+    def synthesize(self, text: str, voice: str = "", rate: str | None = None) -> bytes:
         audio, _ = self.synthesize_with_timestamps(text, voice)
         return audio
 
@@ -224,19 +265,24 @@ def tts_cache_key(
     provider: str,
     trim_pauses: bool = True,
     model_id: str = "",
+    rate: str | None = None,
 ) -> str:
-    """Content-addressed TTS identity: provider | voice | model | text | trim.
+    """Content-addressed TTS identity: provider | voice | model | text | trim | rate.
 
     The SAME law as the segment cache: an unchanged script never re-synthesizes
-    (and never re-bills); a one-word edit changes exactly one key.
+    (and never re-bills); a one-word edit changes exactly one key. The speaking
+    rate rides the key — a pace change re-synthesizes exactly what it affects.
     """
     import hashlib
     import json as _json
 
     payload = _json.dumps(
-        [provider, voice, model_id, " ".join(text.split()), trim_pauses], sort_keys=True
+        [provider, voice, model_id, " ".join(text.split()), trim_pauses, resolve_tts_rate(rate)],
+        sort_keys=True,
     )
-    return hashlib.sha256(("dos-tts-v1|" + payload).encode()).hexdigest()[:40]
+    # v3: the pause-trim chain now COMPRESSES internal pauses (>300ms -> 150ms)
+    # — a chain change invalidates every cached stem
+    return hashlib.sha256(("dos-tts-v3|" + payload).encode()).hexdigest()[:40]
 
 
 def generate_tts_cached(
@@ -245,6 +291,7 @@ def generate_tts_cached(
     voice: str = DEFAULT_VOICE,
     backend: TtsBackend | None = None,
     trim_pauses: bool = True,
+    rate: str | None = None,
 ) -> tuple[TtsResult, bool]:
     """`generate_tts` behind a content-addressed clip cache.
 
@@ -262,7 +309,8 @@ def generate_tts_cached(
     backend = backend or build_tts_backend()
     provider = str(getattr(backend, "provider", "unknown"))
     model_id = str(getattr(backend, "model_id", ""))
-    key = tts_cache_key(text, voice, provider, trim_pauses, model_id)
+    rate = resolve_tts_rate(rate)
+    key = tts_cache_key(text, voice, provider, trim_pauses, model_id, rate)
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -289,7 +337,9 @@ def generate_tts_cached(
         except (ValueError, KeyError, TypeError):
             pass  # corrupt sidecar: re-synthesize and overwrite below
 
-    result = generate_tts(text, clip, voice=voice, backend=backend, trim_pauses=trim_pauses)
+    result = generate_tts(
+        text, clip, voice=voice, backend=backend, trim_pauses=trim_pauses, rate=rate
+    )
     tmp = sidecar.with_suffix(".tmp.json")
     tmp.write_text(
         _json.dumps(
@@ -298,6 +348,7 @@ def generate_tts_cached(
                 "voice": result.voice,
                 "provider": result.provider,
                 "model_id": model_id,
+                "rate": rate,
                 "duration_s": result.duration_s,
                 "text_chars": result.text_chars,
                 "words": [
@@ -319,11 +370,14 @@ def generate_tts(
     voice: str = DEFAULT_VOICE,
     backend: TtsBackend | None = None,
     trim_pauses: bool = True,
+    rate: str | None = None,
 ) -> TtsResult:
     """Synthesize narration -> trim dead padding -> 48 kHz stereo stem.
 
     `text` must be non-empty (an empty narration would silently produce a
     silent stem that later fails the QA loudness floor — fail here instead).
+    `rate` (e.g. "+14%") is the retention-law speaking pace; it rides the
+    cache key upstream so a pace change re-synthesizes exactly what it affects.
     """
     text = text.strip()
     if not text:
@@ -332,19 +386,27 @@ def generate_tts(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     backend = backend or build_tts_backend()
+    rate = resolve_tts_rate(rate) if getattr(backend, "supports_rate", False) else None
 
-    # word stamps ride along when the provider aligns (ElevenLabs today) —
-    # call with-timestamps ONCE and reuse its audio bytes (never double-bill)
+    # word stamps ride along when the provider aligns (edge WordBoundary /
+    # ElevenLabs alignment) — call with-timestamps ONCE and reuse its audio
+    # bytes (never double-bill)
     words: tuple[WordStamp, ...] = ()
     raw: bytes | None = None
     ts_method = getattr(backend, "synthesize_with_timestamps", None)
     if ts_method is not None:
         try:
-            raw, words = ts_method(text, voice)
+            raw, words = ts_method(text, voice, rate=rate)
         except TypeError:
-            raw = None
+            try:
+                raw, words = ts_method(text, voice)  # provider without rate support
+            except TypeError:
+                raw = None
     if not raw:
-        raw = backend.synthesize(text, voice)
+        try:
+            raw = backend.synthesize(text, voice, rate=rate)
+        except TypeError:
+            raw = backend.synthesize(text, voice)
     if not raw:
         raise TtsError("tts backend returned empty audio")
 
@@ -365,11 +427,28 @@ def generate_tts(
     raw_path.unlink(missing_ok=True)
 
     result = probe(out_path)
+
+    # re-base word stamps onto the TRIMMED stem: the head trim removes exactly
+    # the dead air before the first sound, and the first word's offset is that
+    # same boundary (threshold -50 dB) — shift every stamp back by it and clip
+    # to the trimmed duration.
+    shifted: tuple[WordStamp, ...] = words
+    if words and trim_pauses:
+        head = words[0].start_s
+        shifted = tuple(
+            WordStamp(
+                word=w.word,
+                start_s=min(max(0.0, w.start_s - head), result.duration_s),
+                end_s=min(max(0.0, w.end_s - head), result.duration_s),
+            )
+            for w in words
+            if w.end_s > head
+        )
     return TtsResult(
         path=out_path,
         duration_s=result.duration_s,
         voice=voice,
         text_chars=len(text),
         provider=getattr(backend, "provider", "unknown"),
-        words=words,
+        words=shifted,
     )

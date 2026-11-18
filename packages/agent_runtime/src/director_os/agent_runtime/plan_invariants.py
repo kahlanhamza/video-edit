@@ -23,10 +23,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-LONG_SOURCE_S = 1200.0
-DOCUMENTARY_MIN_SOURCE_S = 900.0  # >= this gets the 6-act documentary treatment
+from director_os.agent_runtime.doc_scale import (
+    DOCUMENTARY_MIN_SOURCE_S,
+    DocScale,
+    doc_scale,
+)
+
+LONG_SOURCE_S = 1200.0  # >= this: the absolute 600s QA floor (was the only law)
 MIN_FINAL_DURATION_S = 600.0
-MIN_NARRATOR_SEGMENTS = 9  # v0.3 narration law: rich commentary, not 15% sprinkles
+MIN_NARRATOR_SEGMENTS = 9  # the >= 36-min law; shorter sources scale down
 MIN_RAW_SEGMENTS = 8
 MIN_COVERAGE_SPAN = 0.70
 HEAD_FRACTION = 0.15  # earliest allowed clip start (as fraction of raw)
@@ -35,6 +40,14 @@ TAIL_FRACTION = 0.25  # latest allowed clip end must reach into the final 25%
 # — monetization-safe rich analysis, never a podcast, never a sprinkle
 NARRATION_RATIO_MIN = 0.30
 NARRATION_RATIO_MAX = 0.52
+# HOOK-FIRST LAW (owner rule 2026-11-19 — "think like a real pro editor"):
+HOOK_MAX_START_S = 8.0   # first narration starts ≤ 8s into the master
+HOOK_MAX_END_S = 32.0    # who/what/where/when complete ≤ 32s in
+
+
+def _scale_for(source_duration_s: float) -> DocScale:
+    """The length-adaptive law — planner (director_session) and QA share it."""
+    return doc_scale(source_duration_s)
 
 
 @dataclass
@@ -48,6 +61,12 @@ class TimelineComposition:
     first_source_s: float | None = None
     last_source_end_s: float | None = None
     acts: list[str] = field(default_factory=list)
+    # HOOK-FIRST LAW (owner rule 2026-11-19): the first narration block's
+    # position on the MASTER clock — narration must start ≤ 8s and the hook
+    # (who/what/where/when) must complete ≤ 32s, or viewers bail before the
+    # story exists.
+    first_narration_start_s: float | None = None
+    first_narration_end_s: float | None = None
 
 
 def timeline_composition(timeline) -> TimelineComposition:
@@ -62,6 +81,8 @@ def timeline_composition(timeline) -> TimelineComposition:
         return comp
     for item in track:
         if is_gap(item):
+            dur_total = item_duration_s(item)
+            comp.final_duration_s += dur_total
             continue
         dur = item_duration_s(item)
         comp.final_duration_s += dur
@@ -70,6 +91,11 @@ def timeline_composition(timeline) -> TimelineComposition:
         if kind == "narration":
             comp.narrator_segment_count += 1
             comp.narration_duration_s += dur
+            if comp.first_narration_start_s is None:
+                comp.first_narration_start_s = (
+                    comp.final_duration_s - dur
+                )  # master clock: items before this one
+                comp.first_narration_end_s = comp.final_duration_s
         elif kind == "raw":
             comp.raw_segment_count += 1
             sr = getattr(item, "source_range", None)
@@ -109,14 +135,17 @@ class InvariantFailure:
 
 
 def audit_invariants(comp: TimelineComposition, source_duration_s: float) -> list[InvariantFailure]:
-    """The mandatory-change gate list; empty list = plan is acceptable."""
-    failures: list[InvariantFailure] = []
+    """The mandatory-change gate list; empty list = plan is acceptable.
 
-    if source_duration_s >= LONG_SOURCE_S:
-        min_dur = MIN_FINAL_DURATION_S
-    else:
-        # proportional floor for shorter sources (50-65% of raw), capped
-        min_dur = min(source_duration_s * 0.5, MIN_FINAL_DURATION_S)
+    Every floor derives from DocScale (the source's length), so a 8-minute
+    tape is not judged by the 43-minute acceptance law. For sources >= ~36 min
+    the absolute numbers are identical to the pre-scaling law (600s floor, 9
+    narration blocks, 8 raw clips, 0.70 span).
+    """
+    failures: list[InvariantFailure] = []
+    scale = _scale_for(source_duration_s)
+
+    min_dur = scale.min_final_s
     if comp.final_duration_s < min_dur:
         failures.append(
             InvariantFailure(
@@ -126,17 +155,17 @@ def audit_invariants(comp: TimelineComposition, source_duration_s: float) -> lis
             )
         )
 
-    if comp.narrator_segment_count < MIN_NARRATOR_SEGMENTS:
+    if comp.narrator_segment_count < scale.narr_lo:
         failures.append(
             InvariantFailure(
                 code="narrator_floor",
                 detail=(
                     f"narrator_segment_count={comp.narrator_segment_count} "
-                    f"< {MIN_NARRATOR_SEGMENTS}"
+                    f"< {scale.narr_lo}"
                 ),
             )
         )
-    if source_duration_s >= DOCUMENTARY_MIN_SOURCE_S and comp.final_duration_s > 0:
+    if scale.is_documentary and comp.final_duration_s > 0:
         ratio = comp.narration_duration_s / comp.final_duration_s
         if not (NARRATION_RATIO_MIN <= ratio <= NARRATION_RATIO_MAX):
             failures.append(
@@ -150,23 +179,52 @@ def audit_invariants(comp: TimelineComposition, source_duration_s: float) -> lis
                     ),
                 )
             )
-    if comp.raw_segment_count < MIN_RAW_SEGMENTS:
+    if comp.raw_segment_count < scale.raw_min:
         failures.append(
             InvariantFailure(
                 code="raw_segment_floor",
-                detail=f"raw_segment_count={comp.raw_segment_count} < {MIN_RAW_SEGMENTS}",
+                detail=f"raw_segment_count={comp.raw_segment_count} < {scale.raw_min}",
             )
         )
 
-    if source_duration_s >= LONG_SOURCE_S:
+    if scale.is_documentary:
         span = coverage_span(comp, source_duration_s)
-        if span < MIN_COVERAGE_SPAN:
+        if span < scale.min_coverage_span:
             failures.append(
                 InvariantFailure(
                     code="coverage_span",
-                    detail=f"source_coverage_span={span:.2f} < {MIN_COVERAGE_SPAN:.2f} "
+                    detail=f"source_coverage_span={span:.2f} < {scale.min_coverage_span:.2f} "
                     f"(clips {comp.first_source_s:.0f}s..{comp.last_source_end_s:.0f}s "
                     f"of {source_duration_s:.0f}s raw — the ending is being dropped)",
+                )
+            )
+
+    # --- HOOK-FIRST LAW: narration ≤8s in, hook done ≤32s in (documentaries)
+    if scale.hook_law and comp.narrator_segment_count > 0:
+        if (
+            comp.first_narration_start_s is None
+            or comp.first_narration_start_s > HOOK_MAX_START_S
+        ):
+            failures.append(
+                InvariantFailure(
+                    code="hook_late",
+                    detail=(
+                        f"first narration starts at "
+                        f"{comp.first_narration_start_s if comp.first_narration_start_s is not None else -1:.1f}s "
+                        f"> {HOOK_MAX_START_S:.0f}s — the hook must open the video "
+                        "(a ≤4s climax sting may precede it)"
+                    ),
+                )
+            )
+        elif comp.first_narration_end_s is not None and comp.first_narration_end_s > HOOK_MAX_END_S:
+            failures.append(
+                InvariantFailure(
+                    code="hook_overlong",
+                    detail=(
+                        f"hook narration ends at {comp.first_narration_end_s:.1f}s "
+                        f"> {HOOK_MAX_END_S:.0f}s — who/what/where/when must land "
+                        "inside 30s or viewers bail"
+                    ),
                 )
             )
     return failures
@@ -182,20 +240,30 @@ def audit_retention(
     timeline,
     source_duration_s: float,
     *,
-    min_final_duration_s: float = MIN_FINAL_DURATION_S,
-    min_narrator_segments: int = MIN_NARRATOR_SEGMENTS,
-    min_raw_segments: int = MIN_RAW_SEGMENTS,
-    min_coverage_span: float = MIN_COVERAGE_SPAN,
+    min_final_duration_s: float | None = None,
+    min_narrator_segments: int | None = None,
+    min_raw_segments: int | None = None,
+    min_coverage_span: float | None = None,
 ):
     """Full-arc retention audit (PLAN §3.3G `qa.audit_retention`, M5).
 
-    The Eustis postmortem gate: a rendered documentary from a 20+ minute raw
-    source that is under 10 minutes, under-narrated, clip-starved, or that
-    drops the arrest/booking ending NEVER ships — Stage 8 parks the job in
-    `qa_failed` and the master is quarantined. Same floors the Director
-    session retried against in Phase B, so planner and QA cannot disagree.
+    The Eustis postmortem gate: a rendered documentary that is under its
+    length-scaled duration floor, under-narrated, clip-starved, or that drops
+    the arrest/booking ending NEVER ships — Stage 8 parks the job in
+    `qa_failed` and the master is quarantined. Floors derive from DocScale
+    (the source's length) unless a caller pins explicit values; the Director
+    session retried against the SAME floors, so planner and QA cannot
+    disagree.
     """
     from director_os.core.qa_probe import AuditCheck, AuditReport
+
+    scale = _scale_for(source_duration_s)
+    floor = min_final_duration_s if min_final_duration_s is not None else scale.min_final_s
+    min_narr = (
+        min_narrator_segments if min_narrator_segments is not None else scale.narr_lo
+    )
+    min_raw = min_raw_segments if min_raw_segments is not None else scale.raw_min
+    min_span = min_coverage_span if min_coverage_span is not None else scale.min_coverage_span
 
     checks: list[AuditCheck] = []
     try:
@@ -207,10 +275,6 @@ def audit_retention(
             checks=[AuditCheck(name="timeline_readable", ok=False, detail=str(e))],
         )
 
-    if source_duration_s >= LONG_SOURCE_S:
-        floor = min_final_duration_s
-    else:
-        floor = min(source_duration_s * 0.5, min_final_duration_s)
     checks.append(
         AuditCheck(
             name="final_duration_floor",
@@ -224,11 +288,11 @@ def audit_retention(
     checks.append(
         AuditCheck(
             name="narrator_floor",
-            ok=comp.narrator_segment_count >= min_narrator_segments,
-            detail=f"narration blocks={comp.narrator_segment_count} (min {min_narrator_segments})",
+            ok=comp.narrator_segment_count >= min_narr,
+            detail=f"narration blocks={comp.narrator_segment_count} (min {min_narr})",
         )
     )
-    if source_duration_s >= DOCUMENTARY_MIN_SOURCE_S and comp.final_duration_s > 0:
+    if scale.is_documentary and comp.final_duration_s > 0:
         ratio = comp.narration_duration_s / comp.final_duration_s
         checks.append(
             AuditCheck(
@@ -244,18 +308,18 @@ def audit_retention(
     checks.append(
         AuditCheck(
             name="raw_floor",
-            ok=comp.raw_segment_count >= min_raw_segments,
-            detail=f"raw clips={comp.raw_segment_count} (min {min_raw_segments})",
+            ok=comp.raw_segment_count >= min_raw,
+            detail=f"raw clips={comp.raw_segment_count} (min {min_raw})",
         )
     )
-    if source_duration_s >= LONG_SOURCE_S:
+    if scale.is_documentary:
         span = coverage_span(comp, source_duration_s)
         checks.append(
             AuditCheck(
                 name="coverage_span",
-                ok=span >= min_coverage_span,
+                ok=span >= min_span,
                 detail=(
-                    f"source span={span:.2f} (min {min_coverage_span:.2f}; clips "
+                    f"source span={span:.2f} (min {min_span:.2f}; clips "
                     f"{comp.first_source_s:.0f}s..{comp.last_source_end_s:.0f}s of "
                     f"{source_duration_s:.0f}s)"
                 ),
