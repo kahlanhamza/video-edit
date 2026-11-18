@@ -29,21 +29,52 @@ SOURCE_DUR = 2627.0
 
 
 def _plan_json() -> str:
+    """v0.3-law plan: 14 narration blocks / 14 raw / ~776s / ratio ~0.41."""
     acts = [
         {
             "name": "Cold Open",
             "blocks": [
-                {"type": "raw", "source_start_s": 1650.0, "dur_s": 30.0},
-                {"type": "narration", "script": "July 4th, 2022, Eustis, Florida.", "dur_s": 16.0},
+                {"type": "raw", "source_start_s": 1650.0, "dur_s": 26.0},
+                {"type": "raw", "source_start_s": 1900.0, "dur_s": 26.0},
+                {
+                    "type": "narration",
+                    "script": (
+                        "July 4th, 2022, Eustis, Florida. A bodycam is rolling, and what "
+                        "it catches over the next forty minutes turns a routine call into a case."
+                    ),
+                    "dur_s": 20.0,
+                },
             ],
         }
     ]
     windows = [(60, 380), (390, 760), (770, 1140), (1150, 1520), (1530, 1990), (2000, 2560)]
     for i, (lo, hi) in enumerate(windows, start=1):
-        blocks = [{"type": "narration", "script": f"Act {i} bridge.", "dur_s": 12.0}]
+        blocks = [
+            {
+                "type": "narration",
+                "script": f"Act {i} opening commentary on the record. " * 2,
+                "dur_s": 22.0,
+            }
+        ]
         for j in range(2):
             blocks.append(
-                {"type": "raw", "source_start_s": round(lo + j * ((hi - lo) / 3), 1), "dur_s": 55.0}
+                {"type": "raw", "source_start_s": round(lo + j * ((hi - lo) / 3), 1), "dur_s": 34.0}
+            )
+        blocks.append(
+            {
+                "type": "narration",
+                "script": f"Act {i} closing analysis, said plainly. " * 2,
+                "dur_s": 22.0,
+            }
+        )
+        if i == 6:
+            blocks.append(
+                {
+                    "type": "narration",
+                    "script": "The record closes the loop: booking finishes, the tests come "
+                    "back, and the case files state the verified outcome.",
+                    "dur_s": 32.0,
+                }
             )
         acts.append({"name": f"Act {i}", "blocks": blocks})
     return json.dumps({"title": "Eustis", "acts": acts, "cards": []})

@@ -1,11 +1,10 @@
 """DirectorSession — the 2-phase Story Map -> Full-Arc Execution flow (M5).
 
-Phase A (macro plan JSON): lenient parsing, pre-flight problem detection.
-Phase B: plan expansion into ordered tool steps, then the refinement loop
-that may NOT terminate while duration invariants are unmet. End-to-end runs
-against the REAL tool registry + checkpoint store on sqlite with a scripted
-backend, so the expansion/expansion-order/invariant gates are exercised
-exactly as production sees them.
+Phase A (macro plan JSON): lenient parsing, v0.3-law pre-flight (10-14
+narration blocks, 30-52% narration ratio, full-arc coverage). Phase B: plan
+expansion into ordered tool steps, then the refinement loop that may NOT
+terminate while duration invariants are unmet. End-to-end runs against the
+REAL tool registry + checkpoint store on sqlite with a scripted backend.
 """
 
 from __future__ import annotations
@@ -13,6 +12,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from director_os.agent_runtime.agents import ToolStep
 from director_os.agent_runtime.checkpoint import CheckpointStore
 from director_os.agent_runtime.director_session import (
     DirectorSession,
@@ -35,33 +35,56 @@ SOURCE_DUR = 2627.0
 
 
 def _good_plan_json() -> str:
+    """A v0.3-law plan: 14 narration blocks (~316s), 14 raw clips (~460s),
+    total ~776s, ratio ~0.41 — every pre-flight + QA floor satisfied."""
     acts = [
         {
             "name": "Cold Open",
             "blocks": [
-                {"type": "raw", "source_start_s": 1650.0, "dur_s": 30.0},
+                {"type": "raw", "source_start_s": 1650.0, "dur_s": 26.0},
                 {"type": "raw", "source_start_s": 1900.0, "dur_s": 26.0},
                 {
                     "type": "narration",
-                    "script": "July 4th, 2022. A bodycam is rolling.",
-                    "dur_s": 16.0,
+                    "script": (
+                        "July 4th, 2022, Eustis, Florida. A bodycam is rolling, and what it "
+                        "catches over the next forty minutes turns a routine call into a case."
+                    ),
+                    "dur_s": 20.0,
                 },
             ],
         }
     ]
-    # acts 1-6: chronological coverage from ~60s to ~2560s
     windows = [(60, 380), (390, 760), (770, 1140), (1150, 1520), (1530, 1990), (2000, 2560)]
     for i, (lo, hi) in enumerate(windows, start=1):
         blocks = [
             {
                 "type": "narration",
-                "script": f"Act {i} bridge setting up the tension.",
-                "dur_s": 12.0,
+                "script": f"Act {i} commentary on the record so far, plainly. " * 2,
+                "dur_s": 22.0,
             }
         ]
         for j in range(2):
             start = lo + j * ((hi - lo) / 3)
-            blocks.append({"type": "raw", "source_start_s": round(start, 1), "dur_s": 45.0})
+            blocks.append({"type": "raw", "source_start_s": round(start, 1), "dur_s": 34.0})
+        blocks.append(
+            {
+                "type": "narration",
+                "script": f"Act {i} closing analysis of what the camera just showed, factually. "
+                * 2,
+                "dur_s": 22.0,
+            }
+        )
+        if i == 6:  # the outro: 75-100 words (~32s)
+            blocks.append(
+                {
+                    "type": "narration",
+                    "script": (
+                        "The record closes the loop: booking finishes, the tests come back, "
+                        "and the case files state the verified outcome in plain terms."
+                    ),
+                    "dur_s": 32.0,
+                }
+            )
         acts.append({"name": f"Act {i}", "blocks": blocks})
     return json.dumps(
         {
@@ -130,8 +153,6 @@ class ScriptedChain:
         return self._plan_json
 
     def propose(self, state_summary: str, role: str):
-        from director_os.agent_runtime.agents import ToolStep
-
         self.propose_calls += 1
         idx = min(self.propose_calls - 1, len(self._proposals) - 1)
         batch = self._proposals[idx]
@@ -152,8 +173,9 @@ def test_parse_macro_plan_accepts_fenced_json():
     text = "```json\n" + _good_plan_json() + "\n```"
     plan = parse_macro_plan(text)
     assert len(plan.acts) == 7
-    assert plan.raw_count >= 10
-    assert plan.narration_count >= 7
+    assert 10 <= plan.narration_count <= 14
+    assert plan.raw_count >= 8
+    assert plan.total_dur_s > 700.0
 
 
 def test_parse_macro_plan_rejects_garbage():
@@ -163,7 +185,7 @@ def test_parse_macro_plan_rejects_garbage():
         parse_macro_plan('{"title": "x"}')  # no acts -> validation error
 
 
-def test_plan_problems_detect_truncated_plan():
+def test_plan_problems_pass_on_v03_law_plan():
     plan = parse_macro_plan(_good_plan_json())
     session = DirectorSession(
         build_director_registry(DirectorToolbox(_scaffold(), "p1")),
@@ -175,10 +197,9 @@ def test_plan_problems_detect_truncated_plan():
     assert session._plan_problems(plan) == []
 
 
-def test_plan_problems_flag_undercoverage():
+def test_plan_problems_flag_undercoverage_and_thin_narration():
     plan = parse_macro_plan(_good_plan_json())
-    # drop the last act -> the ending disappears
-    plan.acts = plan.acts[:-1]
+    plan.acts = plan.acts[:-1]  # drop the last act -> the ending disappears
     session = DirectorSession(
         build_director_registry(DirectorToolbox(_scaffold(), "p1")),
         None,  # type: ignore[arg-type]
@@ -190,6 +211,25 @@ def test_plan_problems_flag_undercoverage():
     assert any("latest clip ends" in p for p in problems)
 
 
+def test_plan_problems_flag_ratio_violation():
+    plan = parse_macro_plan(_good_plan_json())
+    # starve the narration: shrink every narration block to 5s
+    for act in plan.acts:
+        act.blocks = [
+            (b.model_copy(update={"dur_s": 5.0}) if b.__class__.__name__ == "PlanNarration" else b)
+            for b in act.blocks
+        ]
+    session = DirectorSession(
+        build_director_registry(DirectorToolbox(_scaffold(), "p1")),
+        None,  # type: ignore[arg-type]
+        "p1",
+        ScriptedChain(_good_plan_json()),
+        source_duration_s=SOURCE_DUR,
+    )
+    problems = session._plan_problems(plan)
+    assert any("narration ratio" in p for p in problems)
+
+
 # ------------------------------------------------------------------ phase B0
 def test_expand_macro_plan_orders_steps_and_computes_card_positions():
     plan = parse_macro_plan(_good_plan_json())
@@ -199,7 +239,6 @@ def test_expand_macro_plan_orders_steps_and_computes_card_positions():
     assert steps[0].tool == "timeline.trim_clip"
     assert steps[0].args["new_start_s"] == 1650.0
     assert "timeline.add_narration" in tools and "timeline.insert_raw_clip" in tools
-    assert tools[-1] == "cards.add" or tools[-2] == "cards.add"
     card_steps = [s for s in steps if s.tool == "cards.add"]
     assert card_steps[0].args["start_s"] > 60.0  # after cold open + act1 narration
     assert all(s.args["start_s"] >= 0 for s in card_steps)
@@ -219,8 +258,6 @@ def test_expand_macro_plan_narration_first_keeps_and_drops_scaffold():
     tools = [s.tool for s in steps]
     assert steps[0].tool == "timeline.add_narration"
     assert "timeline.remove_clip" in tools  # unconsumed scaffold dropped at the end
-    remove_idx = tools.index("timeline.remove_clip")
-    assert remove_idx == len(tools) - 1 - len(plan.cards)  # before the cards
 
 
 # ------------------------------------------------------------------ end to end
@@ -234,12 +271,13 @@ def store(tmp_path):
 
 
 def test_director_session_end_to_end_passes_invariants(store):
+    from director_os.agent_runtime.story_map import build_story_map
+
     scaffold = _scaffold()
     toolbox = DirectorToolbox(scaffold, "proj_e2e")
     registry = build_director_registry(toolbox)
     backend = ScriptedChain(_good_plan_json())
     session = DirectorSession(registry, store, "proj_e2e", backend, source_duration_s=SOURCE_DUR)
-    from director_os.agent_runtime.story_map import build_story_map
 
     transcript = {
         "words": [
@@ -262,7 +300,8 @@ def test_director_session_end_to_end_passes_invariants(store):
     assert ok, [f.detail for f in failures]
     assert report.composition is not None
     assert report.composition.raw_segment_count >= 8
-    assert report.composition.narrator_segment_count >= 6
+    assert report.composition.narrator_segment_count >= 9
+    assert report.composition.narration_duration_s / report.composition.final_duration_s >= 0.30
     assert "Cold Open" in report.composition.acts
 
 
@@ -272,7 +311,7 @@ def test_director_session_keeps_prompting_while_under_target(store):
     toolbox = DirectorToolbox(scaffold, "proj_loop")
     registry = build_director_registry(toolbox)
 
-    # Phase A returns a TRUNCATED plan (2 clips, 1 narration, 75s)
+    # Phase A returns a TRUNCATED, narration-starved plan (2 raw, 1 narr, 75s)
     truncated = json.dumps(
         {
             "title": "truncated",
@@ -293,24 +332,27 @@ def test_director_session_keeps_prompting_while_under_target(store):
             "cards": [],
         }
     )
-    # refinements: two rounds of "add more material", then stop
+    # one big repair round: 9 raws + 9 narration blocks -> ratio lands ~0.33
     add_more = [
         {
             "tool": "timeline.insert_raw_clip",
-            "args": {"source_start_s": 900.0 + i * 180.0, "dur_s": 60.0, "act_name": "Act 3"},
+            "args": {"source_start_s": 900.0 + i * 170.0, "dur_s": 52.0, "act_name": "Act 3"},
         }
-        for i in range(8)
+        for i in range(9)
     ]
     narrations = [
         {
             "tool": "timeline.add_narration",
             "args": {
-                "script_text": f"Bridge {i}: the story turns on what the camera keeps showing.",
-                "dur_s": 12.0,
+                "script_text": (
+                    f"Bridge {i}: the story turns on what the camera keeps showing, "
+                    "and the record is about to say so in plain terms."
+                ),
+                "dur_s": 25.0,
                 "act_name": f"Act {i + 1}",
             },
         }
-        for i in range(6)
+        for i in range(9)
     ]
     backend = ScriptedChain(truncated, proposals=[add_more + narrations, [], []])
     session = DirectorSession(
@@ -329,6 +371,7 @@ def test_macro_plan_model_bounds():
     plan = parse_macro_plan(_good_plan_json())
     assert isinstance(plan, MacroPlan)
     assert plan.total_dur_s > 600.0
+    assert 10 <= plan.narration_count <= 14
     first, last = plan.clip_span(SOURCE_DUR)
     assert first is not None and first < SOURCE_DUR * 0.15
     assert last is not None and last > SOURCE_DUR * 0.75

@@ -30,33 +30,49 @@ TARGET_CEIL_S = 900.0
 HOOK_REGION = (0.60, 0.80)  # climax hooks come from later in the video
 
 ACT_WINDOWS = (
-    ("Act 1: Initial Contact", 0.02, 0.15),
-    ("Act 2: Evidence & Excuses", 0.15, 0.38),
-    ("Act 3: Escalation & Admissions", 0.38, 0.58),
-    ("Act 4: Miranda / Policy", 0.58, 0.72),
-    ("Act 5: The Arrest", 0.72, 0.88),
-    ("Act 6: Booking & Outro", 0.88, 1.00),
+    ("Act 1: Arrival & Contact", 0.02, 0.15),
+    ("Act 2: Investigation & Friction", 0.15, 0.38),
+    ("Act 3: Escalation", 0.38, 0.58),
+    ("Act 4: The Arrest", 0.58, 0.74),
+    ("Act 5: Aftermath & Booking", 0.74, 0.88),
+    ("Act 6: Verified Outcome", 0.88, 1.00),
 )
 
 NARRATOR_BRIDGES = {
     "Cold Open": (
-        "The bodycam was already rolling. What it caught turned a routine "
-        "night shift into a criminal case."
+        "The bodycam was already rolling. What it caught next turned a routine "
+        "night shift into a criminal case — and every second of it is on tape."
     ),
-    "Act 1: Initial Contact": (
-        "It starts like any other stop. Small talk, routine questions — and "
-        "the first details that will not add up."
+    "Act 1: Arrival & Contact": (
+        "It starts like any other call. Small talk, routine questions — and the "
+        "first small details that will not add up later. Watch how casually this "
+        "begins; nothing about the next forty minutes is casual."
     ),
-    "Act 2: Evidence & Excuses": (
-        "Officers start comparing what they are seeing with what they are "
-        "being told. The excuses are not holding."
+    "Act 2: Investigation & Friction": (
+        "Now the officers start comparing what they are seeing with what they "
+        "are being told. The answers get a little too rehearsed. The excuses "
+        "are not holding — and everyone in this frame knows it."
     ),
-    "Act 3: Escalation & Admissions": ("The questions get sharper. So do the answers."),
-    "Act 4: Miranda / Policy": (
-        "Miranda rights, department policy, and the conversation that decides how this case ends."
+    "Act 3: Escalation": (
+        "This is the turning point. The questions get sharper, the posture "
+        "changes, and the tone flips from patience to procedure. From here, "
+        "the encounter stops being a conversation."
     ),
-    "Act 5: The Arrest": ("The arrest itself — caught in full, from both sides of the handcuffs."),
-    "Act 6: Booking & Outro": ("Booking, processing, and the tests that lock the facts in place."),
+    "Act 4: The Arrest": (
+        "The arrest itself — caught in full, from both sides of the handcuffs. "
+        "Listen closely to what gets said in these seconds; it is the part "
+        "every report afterwards has to match."
+    ),
+    "Act 5: Aftermath & Booking": (
+        "What follows the cuffs matters just as much: transport, processing, "
+        "and the tests that lock the facts in place — the part of the record "
+        "that decides how this case actually ends."
+    ),
+    "Act 6: Verified Outcome": (
+        "Booking finishes, the tests come back, and the record closes the loop "
+        "on everything you just watched. This is the verified outcome, exactly "
+        "as the case files state it."
+    ),
 }
 
 
@@ -94,12 +110,18 @@ def _top_intervals(
 
 
 def plan_fallback_blocks(source_duration_s: float, transcript: dict) -> list[_Block]:
-    """Pure deterministic planner: the full-arc block list."""
+    """Pure deterministic planner: the full-arc block list.
+
+    v0.3 narration math: 13 commentary blocks (~294s = 40% of a 735s target,
+    inside the 30-52% law), 12 raw clips (~440s), cold open 2 hooks + a 20s
+    narration hook, act 6 closes with a 32s outro — every documentary floor
+    satisfied with zero LLM involvement.
+    """
     target = max(TARGET_FLOOR_S, min(TARGET_CEIL_S, source_duration_s * 0.28))
     intervals = _speech_intervals(transcript)
 
     blocks: list[_Block] = []
-    # --- cold open: 2 climax hooks + 15s narrator hook
+    # --- cold open: 2 climax hooks + a 45-60 word narrator hook (~20s)
     hook_a, hook_b = HOOK_REGION
     hooks = _top_intervals(intervals, (hook_a, hook_b), source_duration_s, 4)[:2]
     if hooks:
@@ -109,29 +131,37 @@ def plan_fallback_blocks(source_duration_s: float, transcript: dict) -> list[_Bl
     else:  # no speech signal: fixed climax positions
         blocks.append(_Block("raw", source_duration_s * hook_a, 28.0, act="Cold Open"))
         blocks.append(_Block("raw", source_duration_s * (hook_a + 0.08), 28.0, act="Cold Open"))
-    blocks.append(_Block("narration", 0.0, 15.0, NARRATOR_BRIDGES["Cold Open"], "Cold Open"))
+    blocks.append(_Block("narration", 0.0, 20.0, NARRATOR_BRIDGES["Cold Open"], "Cold Open"))
 
-    # --- acts: narrator bridge + 3 speech-anchored clips each
+    # --- acts: commentary BRACKET (22s before + 22s after) + 3 raw clips per
+    #     act; act 6's closing bridge extends to a 32s outro
     n_acts = len(ACT_WINDOWS)
-    narr_per_act = 12.0
-    narration_total = 15.0 + n_acts * narr_per_act
-    per_act = max(40.0, (target - narration_total) / n_acts)
+    narration_total = 20.0 + (n_acts - 1) * 2 * 22.0 + (2 * 22.0 + 32.0)
+    per_act = max(50.0, (target - narration_total) / n_acts)
     per_clip = per_act / 3.0
 
     for name, lo, hi in ACT_WINDOWS:
         blocks.append(
-            _Block("narration", source_duration_s * lo, narr_per_act, NARRATOR_BRIDGES[name], name)
+            _Block("narration", source_duration_s * lo, 22.0, NARRATOR_BRIDGES[name], name)
         )
         picks = _top_intervals(intervals, (lo, hi), source_duration_s, 3)
         if picks:
             for a, b in picks:
-                d = min(max(12.0, min(per_clip + 6.0, b - a + 1.2)), 75.0)
+                d = min(max(14.0, min(per_clip + 6.0, b - a + 1.2)), 55.0)
                 blocks.append(_Block("raw", max(0.0, a - 0.5), d, act=name))
         else:  # fixed grid fallback inside the window
             w = (hi - lo) * source_duration_s
             for k in range(3):
                 start = lo * source_duration_s + k * (w / 3.2)
                 blocks.append(_Block("raw", start, min(per_clip, w / 3.0), act=name))
+        blocks.append(
+            _Block("narration", source_duration_s * hi, 22.0, NARRATOR_BRIDGES[name], name)
+        )
+    # the final act's closing bridge becomes the longer 75-100 word outro
+    for blk in reversed(blocks):
+        if blk.kind == "narration" and blk.act == "Act 6: Verified Outcome":
+            blk.dur_s = 32.0
+            break
     return blocks
 
 
@@ -201,20 +231,20 @@ def build_fallback_documentary(
             t += b.dur_s
 
     _card_at(
-        "Act 1: Initial Contact",
+        "Act 1: Arrival & Contact",
         "location_intro",
         "CASE FILE",
         "Bodycam footage — public record",
         4.0,
     )
     _card_at(
-        "Act 3: Escalation & Admissions",
+        "Act 3: Escalation",
         "evidence_fact",
         "THE EVIDENCE",
         "From the raw transcript",
         4.0,
     )
-    _card_at("Act 6: Booking & Outro", "case_outcome", "CASE OUTCOME", "Per official records", 5.0)
+    _card_at("Act 6: Verified Outcome", "case_outcome", "CASE OUTCOME", "Per official records", 5.0)
 
     overlay: list[ClipSpec | GapSpec] = []
     cursor = 0.0

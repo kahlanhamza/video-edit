@@ -24,12 +24,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 LONG_SOURCE_S = 1200.0
+DOCUMENTARY_MIN_SOURCE_S = 900.0  # >= this gets the 6-act documentary treatment
 MIN_FINAL_DURATION_S = 600.0
-MIN_NARRATOR_SEGMENTS = 6
+MIN_NARRATOR_SEGMENTS = 9  # v0.3 narration law: rich commentary, not 15% sprinkles
 MIN_RAW_SEGMENTS = 8
 MIN_COVERAGE_SPAN = 0.70
 HEAD_FRACTION = 0.15  # earliest allowed clip start (as fraction of raw)
 TAIL_FRACTION = 0.25  # latest allowed clip end must reach into the final 25%
+# narration ratio law (v0.3): 30-52% of the final runtime is narrator commentary
+# — monetization-safe rich analysis, never a podcast, never a sprinkle
+NARRATION_RATIO_MIN = 0.30
+NARRATION_RATIO_MAX = 0.52
 
 
 @dataclass
@@ -38,6 +43,7 @@ class TimelineComposition:
 
     final_duration_s: float = 0.0
     narrator_segment_count: int = 0
+    narration_duration_s: float = 0.0
     raw_segment_count: int = 0
     first_source_s: float | None = None
     last_source_end_s: float | None = None
@@ -63,6 +69,7 @@ def timeline_composition(timeline) -> TimelineComposition:
         kind = str(meta.get("kind", "?"))
         if kind == "narration":
             comp.narrator_segment_count += 1
+            comp.narration_duration_s += dur
         elif kind == "raw":
             comp.raw_segment_count += 1
             sr = getattr(item, "source_range", None)
@@ -129,6 +136,20 @@ def audit_invariants(comp: TimelineComposition, source_duration_s: float) -> lis
                 ),
             )
         )
+    if source_duration_s >= DOCUMENTARY_MIN_SOURCE_S and comp.final_duration_s > 0:
+        ratio = comp.narration_duration_s / comp.final_duration_s
+        if not (NARRATION_RATIO_MIN <= ratio <= NARRATION_RATIO_MAX):
+            failures.append(
+                InvariantFailure(
+                    code="narration_ratio",
+                    detail=(
+                        f"narration_ratio={ratio:.2f} outside "
+                        f"{NARRATION_RATIO_MIN:.2f}..{NARRATION_RATIO_MAX:.2f} "
+                        f"({comp.narration_duration_s:.0f}s narration of "
+                        f"{comp.final_duration_s:.0f}s master)"
+                    ),
+                )
+            )
     if comp.raw_segment_count < MIN_RAW_SEGMENTS:
         failures.append(
             InvariantFailure(
@@ -207,6 +228,19 @@ def audit_retention(
             detail=f"narration blocks={comp.narrator_segment_count} (min {min_narrator_segments})",
         )
     )
+    if source_duration_s >= DOCUMENTARY_MIN_SOURCE_S and comp.final_duration_s > 0:
+        ratio = comp.narration_duration_s / comp.final_duration_s
+        checks.append(
+            AuditCheck(
+                name="narration_ratio",
+                ok=NARRATION_RATIO_MIN <= ratio <= NARRATION_RATIO_MAX,
+                detail=(
+                    f"narration ratio={ratio:.2f} "
+                    f"({comp.narration_duration_s:.0f}s of {comp.final_duration_s:.0f}s; "
+                    f"law {NARRATION_RATIO_MIN:.2f}..{NARRATION_RATIO_MAX:.2f})"
+                ),
+            )
+        )
     checks.append(
         AuditCheck(
             name="raw_floor",

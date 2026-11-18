@@ -134,6 +134,21 @@ def _target_hi(source_duration_s: float) -> float:
     return max(600.0, min(900.0, source_duration_s * 0.35))
 
 
+NARRATION_PROMPT_LAW = """## Narration law (author by WORD COUNT; Brian +5% speaks ~2.6 words/sec)
+- Total narration: 700-950 words (~4.5-6.0 min = 35-45% of runtime) across 10-14 blocks.
+- Cold Open narration: 45-60 words (~18-23s) -> dur_s ~= words/2.6.
+- Mid-video commentary: 50-80 words each (~20-30s), never above ~95 words.
+- Final Outro: 75-100 words (~30-38s).
+- Tone: calm, observant, analytical true-crime documentary voice — zero melodrama,
+  zero snark; surface contradictions factually, never editorialize guilt.
+- Facts come ONLY from the dossier; hint at mystery rather than invent.
+- J/L-cut: at most 0.3-0.6s into silent padding — narration NEVER overlaps
+  active Officer/Suspect dialogue.
+- Visual movement: never one frozen b-roll for 25-30s of speech — back longer
+  blocks with 2-3 sequential muted dimmed b-roll moments (split into consecutive
+  narration blocks with different broll_source_start_s), a slow zoom, or a card."""
+
+
 def macro_plan_user_prompt(
     buckets: list[StoryBucket],
     source_duration_s: float,
@@ -152,32 +167,36 @@ def macro_plan_user_prompt(
 
 ## Your task
 Plan a COMPLETE {_target_lo(source_duration_s):.0f}-{_target_hi(source_duration_s):.0f}s
-(12-15 minute) 6-Act documentary edit of this {source_duration_s / 60:.0f}-minute bodycam video.
+(12-15 min) Cold Open + 6-Act documentary of this {source_duration_s / 60:.0f}-min bodycam video.
 
-Structure (acts[0] is the Cold Open):
+Structure (acts[0] is the Cold Open) — the GENERAL arrest arc, not a DUI template:
 1. Cold Open Hook (25-45s): 1-2 climax raw clips PULLED FROM LATER IN THE VIDEO
-   (pick the most dramatic moments from the story index) + a 15-20s narration
-   hook setting date/location/mystery using ONLY dossier facts.
-2. Act 1: Initial Contact / Disarming / First Contradictions
-3. Act 2: Evidence Discovery & Excuses
-4. Act 3: Escalation / Key Admissions
-5. Act 4: Miranda / Policy Violations / Interrogation
-6. Act 5: Arrest / Detention / Witness Interaction
-7. Act 6: Booking / Final Testing + Outro (verified outcome from the dossier)
+   (raw audio on) + a 45-60 word narration hook setting date/location/mystery
+   from the dossier only.
+2. Act 1: Arrival & Contact — the stop/call begins; first oddities/contradictions.
+3. Act 2: Investigation & Friction — questions, searches, excuses, evidence.
+4. Act 3: Escalation / Turning Point — the moment the encounter changes.
+5. Act 4: Arrest / Detention — the arrest, witness interaction.
+6. Act 5: Aftermath / Transport / Booking — include when present in the footage.
+7. Act 6: Verified Outcome — booking completion, tests, disposition.
+Miranda, policy violations, and sobriety/field tests are HIGHLIGHTS to surface
+whenever present — never force them into a beat they don't belong to.
+
+{NARRATION_PROMPT_LAW}
 
 Hard rules:
-- Total runtime 720-900s; raw clips 15-75s each (split >90s scenes; bridge the
-  split with a 10-15s narration calling out the lie/contradiction/rule).
-- 8-12 narration blocks total (25-35% of runtime), each over muted B-roll from
-  a QUIET, non-spoiling moment (broll_source_start_s).
+- Raw clips: 12-18 clips totaling 7.5-9.0 minutes, mostly 20-55s per stretch;
+  split anything >65s with a commentary block between the halves.
 - Clip starts must span the WHOLE file: earliest within the first 15%, latest
   ending inside the final 25% (never drop the arrest/booking ending).
 - Cut dead air and logistics (keys, phone details, radio spelling); KEEP
   ironic, emotional, and incriminating exchanges.
 - Cards: location_intro on Act 1's narration; 1-3 evidence_fact mid-doc on
-  concrete contradictions/BAC/policy facts; case_outcome on the Outro.
-- Narration voice: veteran true-crime podcaster, short sentences, present
-  tense, zero melodrama, never editorialize guilt, never mention timestamps.
+  concrete contradictions/BAC/policy facts; case_outcome on the Outro. If the
+  dossier has a verified verdict, state it cleanly; only use "presumed innocent"
+  framing when the verdict is pending/unknown.
+- Never mention video timestamps/timecodes (like "at 04:12"); real case
+  durations ("a 20-minute observation period") are fine.
 - Source seconds come from the story index [mm:ss] markers; mm:ss -> seconds.
 
 {MACRO_PLAN_SCHEMA_DOC}"""
@@ -448,8 +467,18 @@ class DirectorSession:
             )
         if plan.total_dur_s < 600.0 and self.source_duration_s >= 1200.0:
             problems.append(f"total plan duration {plan.total_dur_s:.0f}s < 600s")
-        if plan.narration_count < 6:
-            problems.append(f"only {plan.narration_count} narration blocks (< 6)")
+        if not 10 <= plan.narration_count <= 14:
+            problems.append(f"{plan.narration_count} narration blocks — need 10-14 (700-950 words)")
+        if plan.total_dur_s > 0:
+            narr_dur = sum(
+                b.dur_s for a in plan.acts for b in a.blocks if isinstance(b, PlanNarration)
+            )
+            ratio = narr_dur / plan.total_dur_s
+            if not 0.30 <= ratio <= 0.52:
+                problems.append(
+                    f"narration ratio {ratio:.2f} outside 0.30..0.52 "
+                    "(rich commentary, not a sprinkle, not a podcast)"
+                )
         if plan.raw_count < 8:
             problems.append(f"only {plan.raw_count} raw clips (< 8)")
         first, last = plan.clip_span(self.source_duration_s)

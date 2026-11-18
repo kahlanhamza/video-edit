@@ -149,8 +149,8 @@ def test_fallback_blocks_full_arc_structure():
     blocks = plan_fallback_blocks(2627.0, _transcript(44))
     acts = [b.act for b in blocks if b.kind == "narration"]
     assert acts[0] == "Cold Open"
-    assert acts[-1] == "Act 6: Booking & Outro"
-    assert len(acts) == 7  # cold open + 6 acts
+    assert acts[-1] == "Act 6: Verified Outcome"
+    assert len(acts) >= 10  # v0.3 narration law: 10-14 commentary blocks
     raw_starts = [b.source_start_s for b in blocks if b.kind == "raw"]
     assert min(raw_starts) < 2627.0 * 0.15
     assert max(raw_starts) > 2627.0 * 0.60
@@ -159,7 +159,9 @@ def test_fallback_blocks_full_arc_structure():
 def test_fallback_passes_every_retention_invariant(fallback_timeline):
     comp = timeline_composition(fallback_timeline)
     assert comp.final_duration_s >= 600.0
-    assert comp.narrator_segment_count >= 6
+    assert comp.narrator_segment_count >= 9  # v0.3: rich commentary floor
+    assert comp.narration_duration_s / comp.final_duration_s >= 0.30
+    assert comp.narration_duration_s / comp.final_duration_s <= 0.52
     assert comp.raw_segment_count >= 8
     assert coverage_span(comp, 2627.0) >= 0.70
     ok, failures = invariants_ok(fallback_timeline, 2627.0)
