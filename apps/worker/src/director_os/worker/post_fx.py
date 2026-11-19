@@ -85,7 +85,16 @@ def _escape_ass_path(p: Path) -> str:
 
 
 def _markers(work: Path) -> dict[str, Path]:
-    return {name: work / f"{name}.done" for name in ("captions", "blur", "audio", "final")}
+    return {
+        name: work / f"{name}.done"
+        for name in ("captions", "blur", "audio", "final", "cfr", "sweep")
+    }
+
+
+# the sandbox watchdog kills long processes: the blur render is CHUNKED
+# (~150s of master per chunk, one .done marker each) so a killed run resumes
+# at the exact chunk instead of re-rendering 10 minutes of frames
+BLUR_CHUNK_FRAMES = 4800
 
 
 # ------------------------------------------------------------- captions pass
@@ -263,6 +272,34 @@ def _primary_track_id(tracks) -> str | None:
     return best_id
 
 
+# selective law: the camera's own subject stays VISIBLE when the camera is ON
+# them (a close-up box = >= 40% of frame height); everyone far away or off to
+# the side — bystanders, passengers, reflections — is blurred regardless.
+# Bodycam trackers fragment one person into many short IDs, so a single
+# "primary track keep" can never cover the subject; the SIZE law does.
+KEEP_MIN_HEIGHT_FRAC = 0.20
+KEEP_MIN_HITS = 4
+
+
+def _selective_keep_ids(tracks, frame_h: int) -> set[str]:
+    """Track ids that stay VISIBLE under selective redaction.
+
+    The SIZE law only: a close-up box (>= 40% of frame height, sustained) is
+    the person the camera is ON — the subject stays visible. Long-but-small
+    tracks (a bystander parked in frame the whole video) are NOT the subject
+    and must blur, so span alone never qualifies. No close-ups at all ->
+    nothing is kept (privacy-safe default).
+    """
+    keep: set[str] = set()
+    for t in tracks:
+        if not t.hits or len(t.hits) < KEEP_MIN_HITS:
+            continue
+        mean_h = sum(h.h for h in t.hits) / len(t.hits)
+        if frame_h > 0 and mean_h / frame_h >= KEEP_MIN_HEIGHT_FRAC:
+            keep.add(t.track_id)
+    return keep
+
+
 def _watermark_trajectory(n_frames: int, fps: float, w: int, h: int) -> "RedactionTrajectory":
     """Static bottom-right band (baked-in channel watermark) blurred all video."""
     from director_os.vision_fx.trajectory import RedactionTrajectory, TrackedBox
@@ -290,13 +327,15 @@ def _blur_pass(master: Path, work: Path, deps, report: PostFxReport) -> Path:
         if str(p) not in sys.path:
             sys.path.insert(0, str(p))
 
+    import json as _json
+
     from director_os.vision_fx.compute.local_onnx import LocalOnnxCpuBackend
     from director_os.vision_fx.redact_track import (
         audit_coverage,
         normalize_cfr,
         render_tracked_redaction,
     )
-    from director_os.vision_fx.trajectory import repair_trajectories
+    from director_os.vision_fx.trajectory import PerFrameRedaction, repair_trajectories
 
     backend = LocalOnnxCpuBackend()
     caps = backend.capabilities()
@@ -307,25 +346,47 @@ def _blur_pass(master: Path, work: Path, deps, report: PostFxReport) -> Path:
     blur_mode = (os.getenv("BLUR_MODE", "").strip().lower() or "all")
     exclude: set[str] = set()
 
-    # Pass 1: sweep the MASTER (b-roll included by construction)
-    tracks = backend.detect_faces(master, sample_every_s=1.0, progress=None)
-    if caps.get("plates"):
-        try:
-            plate_tracks = backend.detect_plates(master, sample_every_s=1.0, progress=None)
-            tracks = [*tracks, *plate_tracks]
-            report.notes.append(f"plates swept: {len(plate_tracks)} track(s)")
-        except Exception as e:  # noqa: BLE001 — plates are additive, never fatal
-            report.notes.append(f"plate sweep skipped ({e})")
-
-    if blur_mode == "selective" and tracks:
-        primary = _primary_track_id(tracks)
-        if primary is not None:
-            exclude.add(primary)
-            report.notes.append(f"selective mode: primary subject '{primary}' stays visible")
+    marks = _markers(work)
+    cfr = work / "master_cfr.mp4"
+    if not marks["cfr"].exists() or not cfr.exists():
+        cfr = normalize_cfr(master, cfr)
+        marks["cfr"].write_text("ok")
+        deps.log("  [post-fx] blur: master normalized to CFR")
+    else:
+        deps.log("  [post-fx] blur: CFR normalize cached")
 
     info = probe(master)
     fps = float(info.fps or 30.0)
     n_frames = int(round(info.duration_s * fps))
+
+    tracks_path = work / "face_tracks.json"
+    if marks["sweep"].exists() and tracks_path.exists():
+        from director_os.vision_fx.compute.base import FaceTrack
+
+        tracks = [FaceTrack.model_validate(t) for t in _json.loads(tracks_path.read_text())]
+        deps.log(f"  [post-fx] blur: face sweep cached ({len(tracks)} tracks)")
+    else:
+        # Pass 1: sweep the MASTER (b-roll included by construction)
+        tracks = backend.detect_faces(master, sample_every_s=1.0, progress=None)
+        if caps.get("plates"):
+            try:
+                plate_tracks = backend.detect_plates(master, sample_every_s=1.0, progress=None)
+                tracks = [*tracks, *plate_tracks]
+                report.notes.append(f"plates swept: {len(plate_tracks)} track(s)")
+            except Exception as e:  # noqa: BLE001 — plates are additive, never fatal
+                report.notes.append(f"plate sweep skipped ({e})")
+        tracks_path.write_text(_json.dumps([t.model_dump(mode="json") for t in tracks]))
+        marks["sweep"].write_text(str(len(tracks)))
+        deps.log(f"  [post-fx] blur: {len(tracks)} identity track(s) swept on the master")
+
+    if blur_mode == "selective" and tracks:
+        keep = _selective_keep_ids(tracks, int(info.height))
+        exclude.update(keep)
+        report.notes.append(
+            f"selective mode: {len(keep)} close-up identity track(s) stay visible "
+            "(primary + >=20%-height followed subjects); all far/small faces blurred"
+        )
+
     plan = repair_trajectories(
         tracks, fps=fps, frame_w=int(info.width), frame_h=int(info.height), n_frames=n_frames
     )
@@ -339,12 +400,39 @@ def _blur_pass(master: Path, work: Path, deps, report: PostFxReport) -> Path:
     leaks = audit_coverage(plan, audited_tracks, fps)
     report.blur_leaks = len(leaks)
 
-    cfr = normalize_cfr(master, work / "master_cfr.mp4")
-    blurred = work / "master_blurred.mp4"
-    render_tracked_redaction(
-        cfr, plan, blurred, mode="gauss", crf=20, preset="veryfast", exclude_track_ids=exclude
-    )
-    return blurred
+    # chunked, resumable render: each chunk is one .done marker
+    n_chunks = max(1, -(-n_frames // BLUR_CHUNK_FRAMES))
+    parts: list[Path] = []
+    for ci in range(n_chunks):
+        f0, f1 = ci * BLUR_CHUNK_FRAMES, min((ci + 1) * BLUR_CHUNK_FRAMES, n_frames)
+        part = work / f"blur_chunk_{ci:02d}.mp4"
+        parts.append(part)
+        if (work / f"blur_chunk_{ci:02d}.done").exists() and part.exists():
+            continue
+        render_tracked_redaction(
+            cfr,
+            plan,
+            part,
+            mode="gauss",
+            crf=20,
+            preset="veryfast",
+            exclude_track_ids=exclude,
+            frame_start=f0,
+            frame_end=f1,
+        )
+        (work / f"blur_chunk_{ci:02d}.done").write_text(str(f1 - f0))
+        deps.log(f"  [post-fx] blur: chunk {ci + 1}/{n_chunks} rendered ({f1 - f0} frames)")
+    if n_chunks == 1:
+        parts[0].replace(work / "master_blurred.mp4")
+    else:
+        lst = work / "blur_chunks.txt"
+        lst.write_text("".join(f"file '{p.name}'\n" for p in parts))
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(lst),
+             "-c", "copy", str(work / "master_blurred.mp4")],
+            check=True, capture_output=True,
+        )
+    return work / "master_blurred.mp4"
 
 
 # ---------------------------------------------------------------- audio pass
@@ -424,7 +512,7 @@ def stage_post_fx(
         report.n_caption_cues = int(marks["captions"].read_text() or 0)
         deps.log(f"  [post-fx] captions cached ({report.n_caption_cues} cues)")
     else:
-        ass = _captions_pass(master, work, timeline, transcript, narration_clips or [])
+        ass = _captions_pass(master, work, timeline, transcript, narration_clips or [], report)
         marks["captions"].write_text(str(report.n_caption_cues))
         deps.log(f"  [post-fx] captions: {report.n_caption_cues} cues ({report.narration_cues} narration / {report.raw_cues} raw) -> {ass.name}")
     ass = work / "subtitles.ass"

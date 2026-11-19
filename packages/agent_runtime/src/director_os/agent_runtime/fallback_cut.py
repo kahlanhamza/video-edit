@@ -37,7 +37,9 @@ FALLBACK_MIN_SOURCE_S = DOCUMENTARY_MIN_SOURCE_S  # below this the v1 auto-cut s
 STING_MAX_S = 4.0  # the cold-open raw sting before narration — narration ≤8s
 HOOK_MAX_START_S = 8.0  # first narration block must START by this master time
 HOOK_MAX_END_S = 32.0  # ... and the hook (context) must END by this time
-NARRATION_WPS = 2.9  # planned words/sec at the +14% retention-law TTS rate
+NARRATION_WPS = 3.3  # MEASURED pace: Brian +14% with the pause-compression chain
+# (the plan's estimate must match reality — the post-TTS retime closes the
+# residual gap, and the floor top-up below adds the safety margin)
 HOOK_REGION = (0.60, 0.80)  # climax hooks come from later in the video
 
 # Act layouts by act count — every layout covers the SAME full-arc semantic
@@ -353,6 +355,27 @@ def plan_fallback_blocks(
                 name,
             )
         )
+
+    # --- floor top-up: rounding + skipped cold-open beats + the TTS re-time
+    #     shrink (real Brian speaks faster than the plan estimate) can leave
+    #     the SHIPPED master under the length-scaled floor — extend the raw
+    #     blocks proportionally with a measured-pace safety margin. Raw spans
+    #     are speech-anchored exacts; a few extra seconds ride into the
+    #     following pause, never a silent stall.
+    floor = scale.min_final_s
+    aim = floor + max(25.0, floor * 0.05)
+    for _pass in range(3):
+        total = sum(b.dur_s for b in blocks)
+        if total >= aim:
+            break
+        raws = [b for b in blocks if b.kind == "raw"]
+        raw_sum = sum(b.dur_s for b in raws)
+        if not raws:
+            break
+        need = aim - total
+        factor = min(1.35, (raw_sum + need) / raw_sum)
+        for b in raws:
+            b.dur_s = min(75.0, b.dur_s * factor)
     return blocks
 
 
@@ -400,7 +423,10 @@ def build_fallback_documentary(
     for i, b in enumerate(blocks):
         if b.kind == "raw":
             end = min(b.source_start_s + b.dur_s, source_duration_s - 0.5)
-            dur = max(8.0, end - b.source_start_s)
+            # the ≤4s cold-open sting keeps its planned length (the 8s floor
+            # would push the hook narration past the 8s hook law)
+            floor_dur = 8.0 if b.dur_s > STING_MAX_S else min(b.dur_s, STING_MAX_S)
+            dur = max(floor_dur, end - b.source_start_s)
             master.append(
                 ClipSpec(
                     name=f"raw_{i}",
@@ -410,15 +436,21 @@ def build_fallback_documentary(
                 )
             )
         else:
+            # b-roll must FIT the source: a window starting at/after EOF slices
+            # zero frames (the acceptance run caught the outro narration at
+            # 2627.08s = source end) — clamp the start so the window lands
+            broll_start = max(
+                0.0, min(b.source_start_s, max(0.0, source_duration_s - b.dur_s))
+            )
             master.append(
                 ClipSpec(
                     name=f"narration_{i}",
-                    source_start_s=b.source_start_s,
+                    source_start_s=broll_start,
                     dur_s=b.dur_s,
                     meta=NarratorClipMeta(
                         script_text=b.script,
                         broll_asset_id=asset_id,
-                        broll_range=(b.source_start_s, b.source_start_s + b.dur_s),
+                        broll_range=(broll_start, broll_start + b.dur_s),
                         broll_audio_volume=0.0,
                         act_name=b.act,
                     ),

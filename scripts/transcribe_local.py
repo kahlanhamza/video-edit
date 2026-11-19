@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -34,7 +35,6 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--model", default=os.getenv("WHISPER_MODEL", "small"))
     args = ap.parse_args()
-    import os  # noqa: PLC0415 — argparse first, then env read
 
     src = Path(args.source)
     out = Path(args.out)

@@ -44,22 +44,61 @@ class LocalTranscript:
     it into perception_index on first use, re-runs never re-transcribe)."""
 
     def __init__(self, payload: dict):
-        self.payload = payload
+        from director_os.perception.transcript import Transcript
+
         self.calls = 0
+        self._template = payload
 
     def __call__(self, path: Path, asset_id: str):
+        from director_os.perception.transcript import Transcript
+
         self.calls += 1
-        print(f"  [asr] serving local transcript ({len(self.payload.get('segments') or [])} "
-              f"segments) for {asset_id[:8]}", flush=True)
-        return self.payload
+        # whisper word stamps can be zero-width at chunk seams — nudge end_s so
+        # the model's "end > start" law holds without losing the token
+        words = []
+        for raw in self._template.get("words") or []:
+            text = str(raw.get("text") or raw.get("word") or "").strip()
+            if not text:
+                continue
+            s = float(raw.get("start_s", 0.0))
+            e = float(raw.get("end_s", 0.0))
+            if e <= s:
+                e = s + 0.02
+            words.append({"text": text, "start_s": s, "end_s": e,
+                          "speaker": raw.get("speaker")})
+        segments = []
+        for raw in self._template.get("segments") or []:
+            text = str(raw.get("text") or "").strip()
+            if not text:
+                continue
+            s = float(raw.get("start_s", 0.0))
+            e = float(raw.get("end_s", 0.0))
+            if e <= s:
+                e = s + 0.05
+            segments.append({"speaker": raw.get("speaker") or "Unknown",
+                             "start_s": s, "end_s": e, "text": text})
+        t = Transcript(
+            asset_id=asset_id,
+            language=self._template.get("language", "en"),
+            duration_s=max([w["end_s"] for w in words] or [0.0]),
+            words=words,
+            segments=segments,
+            provider="faster-whisper-local",
+        )
+        print(f"  [asr] serving local transcript ({len(t.segments)} segments) "
+              f"for {asset_id[:8]}", flush=True)
+        return t
 
 
-def chunked_build_proxies(source, asset, settings, log):  # noqa: ANN001 — e2e shim
+def chunked_build_proxies(source, out_dir):  # noqa: ANN001 — e2e shim
     """Sandbox proxies: processes die at call boundaries, so the proxy build is
-    chunk-resumable (a stub is enough for the acceptance render — segments cut
-    from the source directly with exact_slice_args)."""
-    log("  [proxy] acceptance shim: skipping proxy bundle (segments cut from source)")
-    return None
+    a pass-through — the acceptance render cuts segments straight from the
+    source with exact_slice_args, so the 'bundle' IS the source file."""
+    from types import SimpleNamespace
+
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    print("  [proxy] acceptance shim: bundle = source file (no re-encode)", flush=True)
+    return SimpleNamespace(proxy_path=Path(source), audio_path=Path(source))
 
 
 def main() -> int:

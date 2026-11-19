@@ -390,3 +390,21 @@ def test_primary_track_selection_and_watermark_band():
     b = wm.boxes[0]
     assert b.x + b.w <= 1280 and b.y + b.h <= 720  # inside the canvas
     assert b.y > 720 * 0.7  # bottom band
+
+
+def test_selective_keep_uses_the_size_law():
+    from director_os.vision_fx.compute.base import FaceTrack, TrackHit
+    from director_os.worker.post_fx import _selective_keep_ids
+
+    closeup = FaceTrack(track_id="close", hits=[
+        TrackHit(t_s=t, x=300, y=80, w=360, h=360, score=0.9) for t in range(0, 8)  # 50% height
+    ])
+    far = FaceTrack(track_id="far", hits=[
+        TrackHit(t_s=t, x=20, y=400, w=80, h=90, score=0.6) for t in range(0, 30)  # 12% height
+    ])
+    long_far = FaceTrack(track_id="long_far", hits=[
+        TrackHit(t_s=t, x=600, y=500, w=90, h=80, score=0.6) for t in range(0, 60)  # long but small
+    ])
+    keep = _selective_keep_ids([closeup, far, long_far], 720)
+    assert "close" in keep  # close-up subject stays visible
+    assert "far" not in keep and "long_far" not in keep  # far/small always blur

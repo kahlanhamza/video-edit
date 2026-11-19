@@ -230,14 +230,21 @@ def render_tracked_redaction(
     crf: int = 18,
     preset: str = "medium",
     n_frames_expected: int | None = None,
+    frame_start: int = 0,
+    frame_end: int | None = None,
 ) -> Path:
-    """Sequential decode by exact frame index -> per-frame blur -> x264 + audio copy."""
+    """Sequential decode by exact frame index -> per-frame blur -> x264.
+
+    `frame_start`/`frame_end` render a SLICE of the video with NO audio
+    (chunked/resumable blur passes concat the slices and mux audio later;
+    the full-video call keeps the audio copy law)."""
     import cv2
 
     exclude = frozenset(exclude_track_ids)
     src, dst = Path(src), Path(dst)
     fps = redaction.fps
     w, h = redaction.frame_w, redaction.frame_h
+    chunked = frame_start > 0 or frame_end is not None
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -258,8 +265,10 @@ def render_tracked_redaction(
         str(src),
         "-map",
         "0:v:0",
-        "-map",
-        "1:a?",
+    ]
+    if not chunked:
+        cmd += ["-map", "1:a?"]
+    cmd += [
         "-c:v",
         "libx264",
         "-preset",
@@ -268,11 +277,12 @@ def render_tracked_redaction(
         str(crf),
         "-pix_fmt",
         "yuv420p",
-        "-c:a",
-        "copy",
-        "-shortest",
-        str(dst),
     ]
+    if chunked:
+        cmd += ["-an"]
+    else:
+        cmd += ["-c:a", "copy"]
+    cmd += ["-shortest", str(dst)]
     proc = subprocess.Popen(
         cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
@@ -282,10 +292,16 @@ def render_tracked_redaction(
         proc.kill()
         raise RedactTrackError(f"cannot open video: {src}")
     idx = 0
+    end_frame = redaction.n_frames if frame_end is None else min(frame_end, redaction.n_frames)
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
+                break
+            if idx < frame_start:
+                idx += 1
+                continue
+            if idx >= end_frame:
                 break
             if frame.shape[1] != w or frame.shape[0] != h:
                 frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
@@ -320,7 +336,7 @@ def render_tracked_redaction(
     if proc.returncode != 0:
         err = (proc.stderr.read().decode() if proc.stderr else "")[-400:]
         raise RedactTrackError(f"tracked redaction render failed: {err}")
-    if n_frames_expected is not None and idx != n_frames_expected:
+    if n_frames_expected is not None and not chunked and idx != n_frames_expected:
         raise RedactTrackError(
             f"frame drift: decoded {idx}, expected {n_frames_expected} — CFR alignment broken"
         )

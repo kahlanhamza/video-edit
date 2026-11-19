@@ -25,7 +25,7 @@ for attempt in $(seq 1 40); do
     head -c 200 "$DEST" 2>/dev/null | grep -qi "429 Too Many" && sleep 605 && rm -f "$DEST" && continue
     head -c 200 "$DEST" 2>/dev/null | grep -qi "<html" && rm -f "$DEST"
   fi
-  sleep 30
+  sleep 120
 done
 echo "GAVE_UP" >> "$LOG"
 exit 1

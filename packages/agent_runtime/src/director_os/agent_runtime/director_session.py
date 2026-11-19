@@ -637,9 +637,17 @@ def expand_macro_plan(plan: MacroPlan, source_duration_s: float) -> list[ToolSte
                 starts = [s for s in (blk.broll_source_starts or []) if s is not None]
                 if not starts and blk.broll_source_start_s is not None:
                     starts = [blk.broll_source_start_s]
+                if starts:
+                    # b-roll windows must FIT the source: a start at/after EOF
+                    # slices zero frames (empty-chunk render crash)
+                    win = min(blk.est_s / max(1, len(starts)) + 2.0, 30.0)
+                    starts = [
+                        round(max(0.0, min(s, source_duration_s - min(win, source_duration_s))), 2)
+                        for s in starts
+                    ]
                 if len(starts) >= 2:
                     args["broll_windows"] = [
-                        [round(s, 2), round(s + min(blk.est_s / len(starts) + 2.0, 30.0), 2)]
+                        [s, round(s + min(blk.est_s / len(starts) + 2.0, 30.0), 2)]
                         for s in starts
                     ]
                 elif starts:
