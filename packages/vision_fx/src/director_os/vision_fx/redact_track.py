@@ -414,7 +414,17 @@ def audit_coverage(
             if h.interpolated:
                 continue
             fi = int(round(h.t_s * fps))
-            raw = (h.x, h.y, h.x + h.w, h.y + h.h)
+            # clamp to frame bounds: a detector box hanging off the frame edge
+            # can only be covered up to the edge — pixels outside don't exist
+            frame_w = redaction.frame_w
+            frame_h = redaction.frame_h
+            rx0 = max(0, h.x)
+            ry0 = max(0, h.y)
+            rx1 = min(frame_w, h.x + h.w)
+            ry1 = min(frame_h, h.y + h.h)
+            if rx1 - rx0 < 2 or ry1 - ry0 < 2:
+                continue  # fully outside the frame — nothing to redact
+            raw = (rx0, ry0, rx1, ry1)
             covered = False
             for box in redaction.boxes_at(fi):
                 if (

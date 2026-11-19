@@ -58,13 +58,19 @@ def test_gap_within_25_bridged_with_inflation():
 
 
 def test_gap_over_25_not_bridged():
-    """A 40-frame hole splits coverage: no stale box held across it."""
+    """A 40-frame hole splits coverage: no stale box held across its MIDDLE.
+
+    Windows now carry their own lead-in/out (pre/post roll) — the true
+    absence is only the gap's interior, clear of both windows' rolls."""
     plan = repair_trajectories([_track([9, 49])], fps=FPS, frame_w=1920, frame_h=1080)
     idx = _hits_by_frame("person_1", plan)
     covered = set(idx)
-    hole = [f for f in range(10, 49) if f in covered]
+    hole = [f for f in range(10 + DEFAULT_LEAD_FRAMES, 49 - DEFAULT_LEAD_FRAMES) if f in covered]
     assert not hole, f"stale boxes held across unbridgeable gap: {hole[:5]}"
     assert plan.trajectories[0].n_windows == 2
+    # both windows get their own pre/post roll now
+    assert 9 - DEFAULT_LEAD_FRAMES in covered
+    assert 49 + DEFAULT_LEAD_FRAMES in covered
 
 
 def test_declared_stride_bridges_sampled_cadence():
@@ -132,9 +138,10 @@ def test_long_interpolated_fills_dropped_no_stale_box():
     assert 40 not in idx and 70 not in idx, "stale fill held across an absence"
 
 
-def test_noise_windows_dropped_with_zero_lead():
-    """With lead_frames=0, isolated 1-frame hits form 1-frame windows —
-    detector noise that must be dropped (min_window_frames default 3)."""
+def test_isolated_real_hits_survive_min_window():
+    """LEAK LAW (owner finding 2026-11-20): with lead_frames=0, isolated
+    1-frame hits still form their windows — a real detection may NEVER be
+    dropped by the noise-window filter; only bridged/interp artifacts can."""
     plan = repair_trajectories(
         [_track([100, 140])],
         fps=FPS,
@@ -143,9 +150,8 @@ def test_noise_windows_dropped_with_zero_lead():
         lead_frames=0,
         min_window_frames=3,
     )
-    assert plan.trajectories == [] or all(
-        len({b.frame_idx for b in t.boxes}) >= 3 for t in plan.trajectories
-    )
+    idx = _hits_by_frame("person_1", plan)
+    assert 100 in idx and 140 in idx, "isolated real detection dropped (leak)"
 
 
 def test_lead_in_and_out_exact():

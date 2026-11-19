@@ -144,6 +144,8 @@ def repair_trajectories(
             continue
         dense = _dense_frames(real, max_bridge_frames, gap_inflate, lead_frames)
         dense = _drop_short_windows(dense, min_window_frames)
+        dense = _rebridge(dense, max_bridge_frames, gap_inflate)
+        dense = _drop_short_windows(dense, min_window_frames)
         if not dense:
             continue
         smoothed = _one_euro_smooth(dense, min_cutoff, beta)
@@ -257,7 +259,12 @@ def _real_hits_by_frame(track: FaceTrack, fps: float) -> list[dict]:
 
 
 def _drop_short_windows(dense: list[dict], min_window_frames: int) -> list[dict]:
-    """Drop contiguous runs shorter than `min_window_frames` (noise flicker)."""
+    """Drop contiguous runs shorter than `min_window_frames` (noise flicker).
+
+    A run that contains a REAL detection (not bridged, not lead) always
+    survives: dropping it would leak the raw detection — noise windows are
+    bridged/interp artifacts only.
+    """
     if min_window_frames <= 1 or not dense:
         return dense
     runs: list[list[dict]] = [[dense[0]]]
@@ -266,7 +273,34 @@ def _drop_short_windows(dense: list[dict], min_window_frames: int) -> list[dict]
             runs[-1].append(cur)
         else:
             runs.append([cur])
-    return [f for run in runs if len(run) >= min_window_frames for f in run]
+    keep: list[dict] = []
+    for run in runs:
+        has_real = any(not f.get("bridged") and not f.get("lead") for f in run)
+        if len(run) >= min_window_frames or has_real:
+            keep.extend(run)
+    return keep
+
+
+def _rebridge(dense: list[dict], max_bridge: int, gap_inflate: float) -> list[dict]:
+    """Fill small holes between windows (hysteresis).
+
+    _drop_short_windows can remove a noise run BETWEEN two real windows,
+    leaving a 1..max_bridge frame hole — a visible on/off flicker. Any gap
+    that small is re-bridged with linear interpolation; only true absences
+    (> max_bridge) stay split.
+    """
+    if len(dense) < 2:
+        return dense
+    out: list[dict] = [dense[0]]
+    for cur in dense[1:]:
+        prev = out[-1]
+        gap = cur["frame_idx"] - prev["frame_idx"]
+        if 1 < gap <= max_bridge:
+            for k in range(1, gap):
+                frac = k / gap
+                out.append(_interp_frame(prev, cur, frac, bridged=True, inflate=gap_inflate))
+        out.append(cur)
+    return out
 
 
 def _dense_frames(
@@ -275,35 +309,50 @@ def _dense_frames(
     gap_inflate: float,
     lead: int,
 ) -> list[dict]:
-    """Real detections + bridged gaps + lead-in/out -> dense per-frame dicts."""
+    """Real detections + bridged gaps + PER-WINDOW lead-in/out -> dense dicts.
+
+    Windows (real-detection runs separated by unbridgeable gaps) each get
+    their own lead-in/lead-out: a face detected for a single sample in the
+    middle of a track still gets a padded window — dropping it would leak the
+    raw detection (owner finding 2026-11-20: mid-track windows must survive).
+    Leads are clamped at frame 0 and against neighbouring windows' leads.
+    """
+    if not real:
+        return []
+    segments: list[list[dict]] = [[real[0]]]
+    for cur in real[1:]:
+        if cur["frame_idx"] - segments[-1][-1]["frame_idx"] <= max_bridge:
+            segments[-1].append(cur)
+        else:
+            segments.append([cur])
     out: list[dict] = []
-    for prev, cur in zip(real, real[1:], strict=False):
-        out.append({**prev, "bridged": False, "lead": False})
-        gap = cur["frame_idx"] - prev["frame_idx"]
-        if 1 < gap <= max_bridge:
-            for s in range(1, gap):
-                frac = s / gap
-                inflate = gap_inflate if gap_inflate > 1.0 else 1.0
-                out.append(_interp_frame(prev, cur, frac, bridged=True, inflate=inflate))
-    out.append({**real[-1], "bridged": False, "lead": False})
-    if lead > 0:
-        # lead-in: frames before the first real detection, clamped at 0.
-        # Emitted in ASCENDING frame order (the historical insert(0, ...) wrote
-        # them reversed — boxes_at()'s binary search and window splitting both
-        # require dense frames sorted by frame_idx).
-        first = real[0]
-        lead_in: list[dict] = []
-        for i in range(lead, 0, -1):
-            fi = max(0, first["frame_idx"] - i)
-            if fi >= first["frame_idx"]:
-                break  # clamped onto the first real frame — nothing earlier
-            if lead_in and fi <= lead_in[-1]["frame_idx"]:
-                continue  # clamp collapsed onto an earlier lead frame
-            lead_in.append({**first, "frame_idx": fi, "bridged": False, "lead": True})
-        out[:0] = lead_in
-        last = out[-1]
-        for i in range(1, lead + 1):
-            out.append({**last, "frame_idx": last["frame_idx"] + i, "bridged": False, "lead": True})
+    for si, seg in enumerate(segments):
+        seg_dense: list[dict] = []
+        for prev, cur in zip(seg, seg[1:], strict=False):
+            seg_dense.append({**prev, "bridged": False, "lead": False})
+            gap = cur["frame_idx"] - prev["frame_idx"]
+            if 1 < gap <= max_bridge:
+                for s in range(1, gap):
+                    frac = s / gap
+                    seg_dense.append(
+                        _interp_frame(prev, cur, frac, bridged=True, inflate=gap_inflate)
+                    )
+        seg_dense.append({**seg[-1], "bridged": False, "lead": False})
+        first_fi = seg[0]["frame_idx"]
+        lo = first_fi - lead
+        if si > 0:
+            lo = max(lo, segments[si - 1][-1]["frame_idx"] + lead + 1)
+        lo = max(0, lo)
+        seg_dense[:0] = [
+            {**seg[0], "frame_idx": f, "bridged": False, "lead": True} for f in range(lo, first_fi)
+        ]
+        last_fi = seg[-1]["frame_idx"]
+        hi = last_fi + lead
+        if si < len(segments) - 1:
+            hi = min(hi, segments[si + 1][0]["frame_idx"] - lead - 1)
+        for f in range(last_fi + 1, hi + 1):
+            seg_dense.append({**seg[-1], "frame_idx": f, "bridged": False, "lead": True})
+        out.extend(seg_dense)
     return out
 
 

@@ -222,7 +222,28 @@ def _local_candidates(
     return boxes
 
 
-def _vision_confirm(client, samples, cluster_idx: list[int]) -> list[dict]:
+def _analyze_with_timeout(client, question, frames, timeout_s: float = 90.0) -> list:
+    """client.analyze behind a hard wall-clock cap.
+
+    A vision provider that hangs (geo-blocked endpoint retrying through an
+    egress fleet that never answers) must never stall the watermark pass —
+    the local heuristic fallback is always available.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import TimeoutError as FutureTimeout
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(client.analyze, question, frames)
+        try:
+            return future.result(timeout=timeout_s)
+        except FutureTimeout:
+            future.cancel()
+            return []
+
+
+def _vision_confirm(
+    client, samples: list[tuple[float, np.ndarray]], cluster_idx: list[int]
+) -> list[dict]:
     """Ask the vision model for labeled overlay boxes on 1-2 cluster frames.
 
     The shared INSIGHT_INSTRUCTION contract returns SceneInsight JSON; the
@@ -246,7 +267,7 @@ def _vision_confirm(client, samples, cluster_idx: list[int]) -> list[dict]:
         "accordingly and it will be kept visible. Answer with the JSON array only."
     )
     try:
-        insights = client.analyze(question, frames)
+        insights = _analyze_with_timeout(client, question, frames)
     except Exception:  # noqa: BLE001 — vision is an accelerator, not a gate
         return []
     out: list[dict] = []
@@ -321,33 +342,49 @@ def detect_watermarks(
         else:
             by_label[key] = WatermarkFinding(label, kind, (x, y, w, h), t0, t1, conf, src)
 
+    # one sample-stride of context on each side of an evidence run
+    stride_t = duration / max(1, len(samples))
     for c in clusters:
         t0, t1 = samples[c[0]][0], samples[c[-1]][0]
         cluster_frames = [samples[i][1] for i in c]
-        edge_med = None
         confirmed: list[dict] = []
         if vision_client is not None:
             confirmed = _vision_confirm(vision_client, samples, c)
             report.vision_used = True
         if confirmed:
-            # local evidence cross-check INSIDE THIS CLUSTER: a claimed box is
-            # accepted only where persistent edges exist there (kills repeats
-            # from other clusters and model hallucinations alike)
-            edge_med = _median_edge_map(cluster_frames)
+            # PER-SAMPLE evidence cross-check: a mark may be present in only
+            # part of a cluster (channel marks toggle per source clip while
+            # dHash clusters by scene) — the cluster MEDIAN would wash it out
+            # and reject a true claim. Instead: edges inside the claimed box
+            # are measured on EVERY sample; consecutive hits become sub-spans
+            # (exact presence extent), and a claim with evidence nowhere is a
+            # hallucination and dies.
+            import cv2 as _cv2
+            import numpy as _np
+
+            edge_maps = [
+                _np.asarray(_edge_map(_cv2.cvtColor(f, _cv2.COLOR_BGR2GRAY)))
+                for f in cluster_frames
+            ]
             for item in confirmed:
                 if item["overlay_kind"] not in WATERMARK_KINDS:
                     continue
-                if _box_evidence_ratio(item["box"], edge_med) < 0.05:
+                ratios = [_box_evidence_ratio(item["box"], em) for em in edge_maps]
+                strong = [k for k, r in enumerate(ratios) if r >= 0.04]
+                if not strong:
                     continue
-                _add(
-                    item["label"],
-                    item["overlay_kind"],
-                    item["box"],
-                    t0,
-                    t1,
-                    item["confidence"],
-                    "vision",
-                )
+                for run in _consecutive_runs(strong):
+                    s_t = max(0.0, samples[c[run[0]]][0] - stride_t)
+                    e_t = min(duration, samples[c[run[-1]]][0] + stride_t)
+                    _add(
+                        item["label"],
+                        item["overlay_kind"],
+                        item["box"],
+                        s_t,
+                        e_t,
+                        item["confidence"],
+                        "vision",
+                    )
         else:
             # local heuristic fallback (no key / no vision answer)
             for box in _local_candidates(cluster_frames, w_px, h_px):
@@ -355,6 +392,17 @@ def detect_watermarks(
 
     report.findings = sorted(by_label.values(), key=lambda f: f.t_start_s)
     return report
+
+
+def _consecutive_runs(idx: list[int]) -> list[list[int]]:
+    """[1, 2, 3, 7, 8] -> [[1, 2, 3], [7, 8]]."""
+    runs: list[list[int]] = []
+    for i in idx:
+        if runs and i == runs[-1][-1] + 1:
+            runs[-1].append(i)
+        else:
+            runs.append([i])
+    return runs
 
 
 def findings_to_trajectories(

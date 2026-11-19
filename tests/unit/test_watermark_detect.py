@@ -155,3 +155,19 @@ def test_no_mark_no_findings(tmp_path):
     # The real contract: without any overlay the LOCAL pass must find nothing.
     local = detect_watermarks(video, vision_client=None, max_samples=16)
     assert local.findings == []
+
+
+def test_mark_intermittent_within_cluster_gets_subspan(tmp_path):
+    """THE production bug (2026-11-20): the mark is present in only PART of a
+    cluster (channel marks toggle per source clip while dHash clusters by
+    scene). The old cluster-MEDIAN evidence check washed it out and rejected
+    the vision claim. Per-sample evidence must accept it and bound the span
+    to the samples where the mark actually has edges."""
+    # mark on for the first 2 s of span A only (span A runs 0-2 s total here)
+    video = _make_video(tmp_path, with_mark_spans=[(0.0, 1.0)])
+    fake = _FakeVision((60, 150, 180, 32))
+    report = detect_watermarks(video, vision_client=fake, max_samples=24)
+    assert report.findings, "intermittent-within-cluster mark rejected"
+    f = report.findings[0]
+    assert f.t_start_s < 1.5, f"span must cover the mark-on part: {f.t_start_s}"
+    assert f.t_end_s < 2.6, f"span must not extend past the mark: {f.t_end_s}"
