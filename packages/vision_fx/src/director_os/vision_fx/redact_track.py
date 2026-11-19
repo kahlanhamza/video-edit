@@ -35,6 +35,13 @@ DEFAULT_FPS = 30
 _RAW_GREEN = (0, 255, 0)  # BGR
 _PAD_RED = (0, 0, 255)  # BGR
 
+# whole-frame looks (owner finding 2026-11-20: viewers must be able to tell
+# narrator segments from raw footage at a glance)."narrator" = gray-ish:
+# saturation x0.55, brightness x0.92 — clearly distinct, still readable.
+FRAME_STYLES: dict[str, dict[str, float]] = {
+    "narrator": {"sat": 0.55, "bright": 0.92},
+}
+
 
 class RedactTrackError(RuntimeError):
     pass
@@ -183,6 +190,24 @@ def sparse_motion_vectors(video_path: str | Path, sample_stride: int) -> list[tu
 # ----------------------------------------------------------------- pass 3
 
 
+def _apply_frame_style(frame: np.ndarray, style: str) -> None:
+    """In-place whole-frame look (e.g. the gray narrator filter).
+
+    Applied BEFORE the blur boxes so blurred regions carry the same tint —
+    one uniform look per segment, no extra encode pass.
+    """
+    import cv2
+
+    cfg = FRAME_STYLES.get(style)
+    if not cfg:
+        return
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    s = np.clip(s.astype(np.float32) * cfg["sat"], 0, 255).astype(np.uint8)
+    v = np.clip(v.astype(np.float32) * cfg["bright"], 0, 255).astype(np.uint8)
+    frame[:] = cv2.cvtColor(cv2.merge((h, s, v)), cv2.COLOR_HSV2BGR)
+
+
 def _apply_box_blur(
     frame: np.ndarray,
     box: TrackedBox,
@@ -232,12 +257,17 @@ def render_tracked_redaction(
     n_frames_expected: int | None = None,
     frame_start: int = 0,
     frame_end: int | None = None,
+    frame_style_fn=None,
 ) -> Path:
     """Sequential decode by exact frame index -> per-frame blur -> x264.
 
     `frame_start`/`frame_end` render a SLICE of the video with NO audio
     (chunked/resumable blur passes concat the slices and mux audio later;
-    the full-video call keeps the audio copy law)."""
+    the full-video call keeps the audio copy law).
+
+    `frame_style_fn(frame_idx) -> style | None` (optional) applies a
+    whole-frame look from FRAME_STYLES on the frames it names — the narrator
+    gray filter rides the same pass, no second encode."""
     import cv2
 
     exclude = frozenset(exclude_track_ids)
@@ -305,6 +335,10 @@ def render_tracked_redaction(
                 break
             if frame.shape[1] != w or frame.shape[0] != h:
                 frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+            if frame_style_fn is not None:
+                style = frame_style_fn(idx)
+                if style:
+                    _apply_frame_style(frame, str(style))
             raw_boxes = [
                 (b, tr.track_id)
                 for b, tr in _boxes_by_track(redaction, idx)

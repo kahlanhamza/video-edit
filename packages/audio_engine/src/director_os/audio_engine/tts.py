@@ -52,6 +52,8 @@ def resolve_tts_rate(rate: str | None = None) -> str:
     if not _re.match(r"^[+-]\d{1,2}%$", value):
         raise TtsError(f"invalid TTS rate '{value}' (expected e.g. '+14%')")
     return value
+
+
 ELEVENLABS_DEFAULT_BASE = "https://api.elevenlabs.io"
 # public shared voice (Rachel) — overridable via ELEVENLABS_VOICE_ID
 ELEVENLABS_DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"

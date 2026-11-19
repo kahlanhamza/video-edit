@@ -31,7 +31,22 @@ SOURCE_DUR = 2627.0
 def _script_n(n: int, seed: str) -> str:
     """A narration script with EXACTLY n words (the word-count law fixture)."""
     words = seed.split()
-    filler = "the record shows the camera keeps rolling and every detail lands on the tape".split()
+    filler = [
+        "the",
+        "record",
+        "shows",
+        "the",
+        "camera",
+        "keeps",
+        "rolling",
+        "and",
+        "every",
+        "detail",
+        "lands",
+        "on",
+        "the",
+        "tape",
+    ]
     i = 0
     while len(words) < n:
         words.append(filler[i % len(filler)])

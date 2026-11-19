@@ -52,14 +52,16 @@ def _broll_concat_prelude(
     Returns (extra_input_args, graph_parts) — graph_parts produce `[vbase]`.
     """
     v = spec.video
-    geo = f"scale={v.w}:{v.h}:force_original_aspect_ratio=decrease:flags=lanczos," \
-          f"pad={v.w}:{v.h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={v.fps}"
+    geo = (
+        f"scale={v.w}:{v.h}:force_original_aspect_ratio=decrease:flags=lanczos,"
+        f"pad={v.w}:{v.h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={v.fps}"
+    )
     total = sum(max(0.1, w1 - w0) for w0, w1 in windows)
     cycles = max(1, int(math.ceil(dur / max(0.5, total))))
     cmd: list[str] = []
     graph: list[str] = []
     labels: list[str] = []
-    for i, (w0, w1) in enumerate(windows[1:], start=1):
+    for _i, (w0, w1) in enumerate(windows[1:], start=1):
         cmd += exact_slice_args(max(0.0, w0), max(0.1, w1))
         cmd += ["-i", src_path]
     for i in range(len(windows)):
@@ -82,15 +84,15 @@ def build_segment_cmd(
     dur = spec.source_dur_s
     cmd: list[str] = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
 
-    multi_broll = (
-        spec.kind == "narration"
-        and bool(spec.broll_windows)
-        and len(spec.broll_windows) >= 2
-        and src_path is not None
-    )
+    # mypy narrows Optionals through a local binding (also documents the law:
+    # multi-broll REQUIRES a source path and >= 2 windows by construction)
+    broll_windows: list[tuple[float, float]] = list(spec.broll_windows or [])
+    multi_broll = spec.kind == "narration" and len(broll_windows) >= 2 and src_path is not None
     graph, uses_complex, n_overlay_inputs = compose_filter_complex(spec)
+    extra: list[str] = []
     if multi_broll:
-        extra, prelude = _broll_concat_prelude(spec, src_path, spec.broll_windows, dur)
+        assert src_path is not None
+        extra, prelude = _broll_concat_prelude(spec, src_path, broll_windows, dur)
         graph = ";".join([*prelude, graph.replace("[0:v]", "[vbase]", 1)])
         uses_complex = True
 
@@ -108,14 +110,14 @@ def build_segment_cmd(
             cmd += exact_slice_args(spec.source_start_s, spec.source_start_s + dur)
         else:
             # window 0 rides input 0, sliced exactly as a single-window block
-            w0, w1 = spec.broll_windows[0]
+            w0, w1 = broll_windows[0]
             cmd += exact_slice_args(max(0.0, w0), max(0.1, w1))
         cmd += ["-i", str(src_path)]
         if multi_broll:
             # inputs 1..N-1: the additional b-roll windows (concat prelude consumes them)
             cmd += extra
 
-    n_inputs = 1 + (len(spec.broll_windows) - 1 if multi_broll else 0) + n_overlay_inputs
+    n_inputs = 1 + (len(broll_windows) - 1 if multi_broll else 0) + n_overlay_inputs
     for card in spec.cards:
         cmd += ["-loop", "1", "-i", card.png_path]
     if spec.spotlight_png_path:

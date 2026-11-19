@@ -67,6 +67,87 @@ def test_gap_over_25_not_bridged():
     assert plan.trajectories[0].n_windows == 2
 
 
+def test_declared_stride_bridges_sampled_cadence():
+    """THE flicker fix (owner finding 2026-11-20): a 1.0 s sweep at 30 fps
+    strides 30 frames between real hits — more than the fixed 25 bridge, so
+    every gap used to shatter into 1-frame windows (blur applied/removed
+    within milliseconds). Declaring the stride scales the bridge budget and
+    the plan comes out DENSE across the whole active span."""
+    plan = repair_trajectories(
+        [_track([9, 39, 69])],
+        fps=FPS,
+        frame_w=1920,
+        frame_h=1080,
+        sample_stride_frames=30,
+    )
+    idx = {b.frame_idx for b in plan.trajectories[0].boxes}
+    assert idx == set(range(9 - DEFAULT_LEAD_FRAMES, 69 + DEFAULT_LEAD_FRAMES + 1))
+
+
+def test_short_interpolated_fills_are_kept():
+    """Missed-sample fills from the tracker (interpolated=True) join the plan
+    when the real-to-real gap they fill is <= interp_gap_max_s."""
+    hits = [TrackHit(t_s=9 / FPS, x=500, y=100, w=40, h=40, score=0.9)]
+    for f in range(10, 15):  # one missed sample at stride 5 (0.2 s gap)
+        hits.append(
+            TrackHit(
+                t_s=round(f / FPS, 3),
+                x=500,
+                y=100,
+                w=40,
+                h=40,
+                score=0.9,
+                interpolated=True,
+            )
+        )
+    hits.append(TrackHit(t_s=15 / FPS, x=500, y=100, w=40, h=40, score=0.9))
+    plan = repair_trajectories(
+        [FaceTrack(track_id="person_1", hits=hits)], fps=FPS, frame_w=1920, frame_h=1080
+    )
+    idx = {b.frame_idx for b in plan.trajectories[0].boxes}
+    assert set(range(4, 21)).issubset(idx)
+
+
+def test_long_interpolated_fills_dropped_no_stale_box():
+    """Fills spanning a true absence (> interp_gap_max_s) are discarded — the
+    window must split instead of holding a stale box through an occlusion."""
+    hits = [TrackHit(t_s=9 / FPS, x=500, y=100, w=40, h=40, score=0.9)]
+    for f in range(10, 100):  # 3 s of fill — a real absence
+        hits.append(
+            TrackHit(
+                t_s=round(f / FPS, 3),
+                x=500,
+                y=100,
+                w=40,
+                h=40,
+                score=0.9,
+                interpolated=True,
+            )
+        )
+    hits.append(TrackHit(t_s=100 / FPS, x=500, y=100, w=40, h=40, score=0.9))
+    plan = repair_trajectories(
+        [FaceTrack(track_id="person_1", hits=hits)], fps=FPS, frame_w=1920, frame_h=1080
+    )
+    idx = {b.frame_idx for b in plan.trajectories[0].boxes}
+    assert 40 not in idx and 70 not in idx, "stale fill held across an absence"
+
+
+def test_noise_windows_dropped_with_zero_lead():
+    """With lead_frames=0, isolated 1-frame hits form 1-frame windows —
+    detector noise that must be dropped (min_window_frames default 3)."""
+    plan = repair_trajectories(
+        [_track([100, 140])],
+        fps=FPS,
+        frame_w=1920,
+        frame_h=1080,
+        lead_frames=0,
+        min_window_frames=3,
+    )
+    assert plan.trajectories == [] or all(
+        len({b.frame_idx for b in t.boxes}) >= 3 for t in plan.trajectories
+    )
+
+
 def test_lead_in_and_out_exact():
     plan = repair_trajectories([_track([30, 60])], fps=FPS, frame_w=1920, frame_h=1080)
     idx = _hits_by_frame("person_1", plan)

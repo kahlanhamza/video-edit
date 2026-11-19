@@ -16,7 +16,6 @@ import json
 
 from director_os.agent_runtime.director_session import (
     MacroPlan,
-    PlanNarration,
     PlanRawClip,
     expand_macro_plan,
     narr_est_s,
@@ -25,10 +24,14 @@ from director_os.agent_runtime.director_session import (
     snap_plan_to_speech,
 )
 from director_os.agent_runtime.doc_scale import doc_scale
-from director_os.agent_runtime.plan_invariants import audit_invariants, invariants_ok
+from director_os.agent_runtime.plan_invariants import invariants_ok
 from director_os.otio_engine.contract import CardMeta, NarratorClipMeta, RawClipMeta
 from director_os.otio_engine.renderer import build_segment_cmd
-from director_os.otio_engine.segment_cache import AudioRenderSpec, SegmentRenderSpec, VideoRenderSpec
+from director_os.otio_engine.segment_cache import (
+    AudioRenderSpec,
+    SegmentRenderSpec,
+    VideoRenderSpec,
+)
 from director_os.otio_engine.timeline import (
     ClipSpec,
     GapSpec,
@@ -74,22 +77,32 @@ def test_doc_scale_adapts_to_any_length():
 
 def test_invariants_scale_down_for_a_15_minute_tape():
     # sting + hook + 5 narration blocks + 5 raws spread across a 15-min tape
-    raws = [ClipSpec(
-        name=f"raw{i}",
-        source_start_s=60.0 + i * 140.0,
-        dur_s=25.0,
-        meta=RawClipMeta(asset_id="a"),
-    ) for i in range(5)]
-    narrs = [ClipSpec(
-        name=f"narr{i}",
-        source_start_s=120.0 + i * 140.0,
-        dur_s=22.0,
-        meta=NarratorClipMeta(script_text="y" * 200),
-    ) for i in range(5)]
+    raws = [
+        ClipSpec(
+            name=f"raw{i}",
+            source_start_s=60.0 + i * 140.0,
+            dur_s=25.0,
+            meta=RawClipMeta(asset_id="a"),
+        )
+        for i in range(5)
+    ]
+    narrs = [
+        ClipSpec(
+            name=f"narr{i}",
+            source_start_s=120.0 + i * 140.0,
+            dur_s=22.0,
+            meta=NarratorClipMeta(script_text="y" * 200),
+        )
+        for i in range(5)
+    ]
     master = [
         ClipSpec(name="sting", source_start_s=0.0, dur_s=3.5, meta=RawClipMeta(asset_id="a")),
-        ClipSpec(name="hook", source_start_s=30.0, dur_s=20.0,
-                 meta=NarratorClipMeta(script_text="x" * 200)),
+        ClipSpec(
+            name="hook",
+            source_start_s=30.0,
+            dur_s=20.0,
+            meta=NarratorClipMeta(script_text="x" * 200),
+        ),
     ]
     for n, r in zip(narrs, raws, strict=True):
         master.extend([n, r])
@@ -150,8 +163,12 @@ def test_expand_macro_plan_ignores_inflated_llm_dur_s():
 def _transcript_40s():
     return {
         "segments": [
-            {"speaker": "Officer", "start_s": float(t), "end_s": float(t) + 40.0,
-             "text": f"utterance {t}"}
+            {
+                "speaker": "Officer",
+                "start_s": float(t),
+                "end_s": float(t) + 40.0,
+                "text": f"utterance {t}",
+            }
             for t in range(0, 2600, 60)
         ]
     }
@@ -195,7 +212,10 @@ def test_snap_keeps_silent_action_windows_and_no_transcript_is_a_noop():
         json.dumps(
             {
                 "acts": [
-                    {"name": "Act 1", "blocks": [{"type": "raw", "source_start_s": 2050.0, "dur_s": 10.0}]}
+                    {
+                        "name": "Act 1",
+                        "blocks": [{"type": "raw", "source_start_s": 2050.0, "dur_s": 10.0}],
+                    }
                 ]
             }
         )
@@ -208,7 +228,11 @@ def test_snap_keeps_silent_action_windows_and_no_transcript_is_a_noop():
 
     same = parse_macro_plan(
         json.dumps(
-            {"acts": [{"name": "A", "blocks": [{"type": "raw", "source_start_s": 5.0, "dur_s": 9.0}]}]}
+            {
+                "acts": [
+                    {"name": "A", "blocks": [{"type": "raw", "source_start_s": 5.0, "dur_s": 9.0}]}
+                ]
+            }
         )
     )
     untouched, pieces = snap_plan_to_speech(same, None, 2700.0)
@@ -217,7 +241,6 @@ def test_snap_keeps_silent_action_windows_and_no_transcript_is_a_noop():
 
 # --------------------------------------------------------- card re-anchoring
 def test_cards_reanchor_to_measured_tts_durations():
-    import opentimelineio.opentime as ot_time
 
     from director_os.worker.pipeline import master_spans, retime_cards_after_narration
 
@@ -230,14 +253,21 @@ def test_cards_reanchor_to_measured_tts_durations():
             TrackSpec(
                 name="V1_master",
                 items=[
-                    ClipSpec(name="sting", source_start_s=0.0, dur_s=4.0, meta=RawClipMeta(asset_id="a")),
+                    ClipSpec(
+                        name="sting", source_start_s=0.0, dur_s=4.0, meta=RawClipMeta(asset_id="a")
+                    ),
                     ClipSpec(
                         name="hook",
                         source_start_s=30.0,
                         dur_s=20.0,  # planned; the real TTS is 12s
                         meta=NarratorClipMeta(script_text="hook line"),
                     ),
-                    ClipSpec(name="raw2", source_start_s=100.0, dur_s=30.0, meta=RawClipMeta(asset_id="a")),
+                    ClipSpec(
+                        name="raw2",
+                        source_start_s=100.0,
+                        dur_s=30.0,
+                        meta=RawClipMeta(asset_id="a"),
+                    ),
                 ],
             ),
             TrackSpec(
@@ -282,7 +312,7 @@ def test_cards_reanchor_to_measured_tts_durations():
     t = 0.0
     card_pos = None
     for item in overlay:
-        meta = (item.metadata.get("director_os") or {})
+        meta = item.metadata.get("director_os") or {}
         if meta.get("kind") == "card":
             card_pos = t
         t += item_duration_s(item)
@@ -337,10 +367,18 @@ def test_master_caption_cues_cover_narration_and_raw_speech():
             TrackSpec(
                 name="V1_master",
                 items=[
-                    ClipSpec(name="raw1", source_start_s=100.0, dur_s=10.0,
-                             meta=RawClipMeta(asset_id="a")),
-                    ClipSpec(name="narr1", source_start_s=30.0, dur_s=8.0,
-                             meta=NarratorClipMeta(script_text="the narrator explains the case")),
+                    ClipSpec(
+                        name="raw1",
+                        source_start_s=100.0,
+                        dur_s=10.0,
+                        meta=RawClipMeta(asset_id="a"),
+                    ),
+                    ClipSpec(
+                        name="narr1",
+                        source_start_s=30.0,
+                        dur_s=8.0,
+                        meta=NarratorClipMeta(script_text="the narrator explains the case"),
+                    ),
                 ],
             ),
             TrackSpec(name="V2_overlay_cards", items=[GapSpec(dur_s=18.0)]),
@@ -375,12 +413,14 @@ def test_primary_track_selection_and_watermark_band():
     from director_os.vision_fx.compute.base import FaceTrack, TrackHit
     from director_os.worker.post_fx import _primary_track_id, _watermark_trajectory
 
-    main = FaceTrack(track_id="face_1", hits=[
-        TrackHit(t_s=t, x=400, y=200, w=220, h=260, score=0.9) for t in range(0, 60)
-    ])
-    bystander = FaceTrack(track_id="face_2", hits=[
-        TrackHit(t_s=t, x=20, y=300, w=60, h=60, score=0.6) for t in range(0, 5)
-    ])
+    main = FaceTrack(
+        track_id="face_1",
+        hits=[TrackHit(t_s=t, x=400, y=200, w=220, h=260, score=0.9) for t in range(0, 60)],
+    )
+    bystander = FaceTrack(
+        track_id="face_2",
+        hits=[TrackHit(t_s=t, x=20, y=300, w=60, h=60, score=0.6) for t in range(0, 5)],
+    )
     assert _primary_track_id([bystander, main]) == "face_1"
     assert _primary_track_id([]) is None
 
@@ -396,15 +436,27 @@ def test_selective_keep_uses_the_size_law():
     from director_os.vision_fx.compute.base import FaceTrack, TrackHit
     from director_os.worker.post_fx import _selective_keep_ids
 
-    closeup = FaceTrack(track_id="close", hits=[
-        TrackHit(t_s=t, x=300, y=80, w=360, h=360, score=0.9) for t in range(0, 8)  # 50% height
-    ])
-    far = FaceTrack(track_id="far", hits=[
-        TrackHit(t_s=t, x=20, y=400, w=80, h=90, score=0.6) for t in range(0, 30)  # 12% height
-    ])
-    long_far = FaceTrack(track_id="long_far", hits=[
-        TrackHit(t_s=t, x=600, y=500, w=90, h=80, score=0.6) for t in range(0, 60)  # long but small
-    ])
+    closeup = FaceTrack(
+        track_id="close",
+        hits=[
+            TrackHit(t_s=t, x=300, y=80, w=360, h=360, score=0.9)
+            for t in range(0, 8)  # 50% height
+        ],
+    )
+    far = FaceTrack(
+        track_id="far",
+        hits=[
+            TrackHit(t_s=t, x=20, y=400, w=80, h=90, score=0.6)
+            for t in range(0, 30)  # 12% height
+        ],
+    )
+    long_far = FaceTrack(
+        track_id="long_far",
+        hits=[
+            TrackHit(t_s=t, x=600, y=500, w=90, h=80, score=0.6)
+            for t in range(0, 60)  # long but small
+        ],
+    )
     keep = _selective_keep_ids([closeup, far, long_far], 720)
     assert "close" in keep  # close-up subject stays visible
     assert "far" not in keep and "long_far" not in keep  # far/small always blur

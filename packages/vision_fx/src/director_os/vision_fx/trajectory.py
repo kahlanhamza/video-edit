@@ -6,10 +6,19 @@ DENSE per-frame redaction plan for the whole video, processed with full track
 history BEFORE any rendering:
 
 1. Convert to exact frame indices (CFR source => frame_idx = round(t_s * fps)).
+   Interpolated stride fills from the tracker are KEPT when the gap they
+   fill is short (<= `interp_gap_max_s`, default 1.5 s) — that is exactly
+   what a missed sample looks like. Longer fills are real absences and are
+   dropped (never hold a stale box across an occlusion).
 2. Bridge gaps <= `max_bridge_frames` with linear interpolation; bridged
-   boxes carry +15% size inflation (a bridged face may turn mid-gap).
+   boxes carry +15% size inflation (a bridged face may turn mid-gap). When
+   the caller declares the sweep's `sample_stride_frames`, the bridge scales
+   to 2.5x that stride (a 1.0 s sweep at 30 fps strides 30 frames — the old
+   fixed 25 shattered EVERY gap into 1-frame windows: the millisecond
+   on/off blur flicker the owner reported on 2026-11-20).
 3. Gaps > `max_bridge_frames` SPLIT the track's coverage into windows —
-   never hold a stale box across an unbridgeable hole.
+   never hold a stale box across an unbridgeable hole. Windows shorter than
+   `min_window_frames` (default 3) are dropped as detector noise.
 4. 5-frame lead-in before the first real detection and 5-frame lead-out
    after the last (detection fires late on enters / early on exits).
 5. One-Euro filter per channel (center x/y, w, h) — velocity-aware, no EMA lag.
@@ -30,6 +39,10 @@ DEFAULT_LEAD_FRAMES = 5
 DEFAULT_SCALE_W = 1.35
 DEFAULT_SCALE_H = 1.40
 DEFAULT_GAP_INFLATE = 1.15
+# interpolated stride fills longer than this are treated as real absences
+DEFAULT_INTERP_GAP_MAX_S = 1.5
+# windows shorter than this are detector noise (1-frame flicker guards)
+DEFAULT_MIN_WINDOW_FRAMES = 3
 
 # One-Euro: heavy damping when slow, rides the signal when fast (beta).
 ONE_EURO_MIN_CUTOFF = 1.2
@@ -98,7 +111,10 @@ def repair_trajectories(
     frame_w: int,
     frame_h: int,
     n_frames: int | None = None,
-    max_bridge_frames: int = DEFAULT_MAX_BRIDGE_FRAMES,
+    max_bridge_frames: int | None = None,
+    sample_stride_frames: int | None = None,
+    interp_gap_max_s: float = DEFAULT_INTERP_GAP_MAX_S,
+    min_window_frames: int = DEFAULT_MIN_WINDOW_FRAMES,
     lead_frames: int = DEFAULT_LEAD_FRAMES,
     scale_w: float = DEFAULT_SCALE_W,
     scale_h: float = DEFAULT_SCALE_H,
@@ -106,15 +122,30 @@ def repair_trajectories(
     min_cutoff: float = ONE_EURO_MIN_CUTOFF,
     beta: float = ONE_EURO_BETA,
 ) -> PerFrameRedaction:
-    """FaceTracks -> dense per-frame padded redaction plan (Pass 2)."""
+    """FaceTracks -> dense per-frame padded redaction plan (Pass 2).
+
+    `sample_stride_frames` declares the detection sweep's sampling stride
+    (frames between samples). When given, the bridge budget becomes
+    max(25, 2.5 * stride) so sampled cadences never shatter into 1-frame
+    windows (the blur flicker bug). Without it the fixed 25 stands.
+    """
     if fps <= 0:
         raise ValueError("fps must be positive")
+    if max_bridge_frames is None:
+        max_bridge_frames = (
+            max(DEFAULT_MAX_BRIDGE_FRAMES, int(round(sample_stride_frames * 2.5)))
+            if sample_stride_frames
+            else DEFAULT_MAX_BRIDGE_FRAMES
+        )
     trajectories: list[RedactionTrajectory] = []
     for track in tracks:
-        real = _real_hits_by_frame(track, fps)
+        real = _usable_hits_by_frame(track, fps, interp_gap_max_s)
         if not real:
             continue
         dense = _dense_frames(real, max_bridge_frames, gap_inflate, lead_frames)
+        dense = _drop_short_windows(dense, min_window_frames)
+        if not dense:
+            continue
         smoothed = _one_euro_smooth(dense, min_cutoff, beta)
         padded = [
             _envelope(b, raw, scale_w, scale_h, frame_w, frame_h)
@@ -167,6 +198,53 @@ def tracks_to_per_frame(
 # --------------------------------------------------------------------- steps
 
 
+def _usable_hits_by_frame(track: FaceTrack, fps: float, interp_gap_max_s: float) -> list[dict]:
+    """Real detections + SHORT interpolated stride fills -> frame-keyed dicts.
+
+    The tracker linearly fills missed samples with interpolated=True hits.
+    A fill run whose enclosing real-to-real gap is <= `interp_gap_max_s` is a
+    missed sample (keep it — it is exactly the box repair would interpolate
+    anyway); a longer fill is a true absence (drop it; the window must split).
+    """
+    hits = sorted(track.hits, key=lambda h: h.t_s)
+    out: list[dict] = []
+    i = 0
+    while i < len(hits):
+        h = hits[i]
+        if not h.interpolated:
+            out.append(_hit_dict(h, fps))
+            i += 1
+            continue
+        # run of interpolated hits between real anchors hits[i-1] .. hits[j]
+        j = i
+        while j < len(hits) and hits[j].interpolated:
+            j += 1
+        anchor_prev = hits[i - 1].t_s if i > 0 else 0.0
+        anchor_next = hits[j].t_s if j < len(hits) else None
+        if i == 0 or anchor_next is None:
+            i = j  # leading/trailing fills have no enclosing gap — drop
+            continue
+        gap_s = anchor_next - anchor_prev
+        if gap_s <= interp_gap_max_s:
+            for k in range(i, j):
+                out.append(_hit_dict(hits[k], fps))
+        i = j
+    seen: dict[int, dict] = {}
+    for d in out:
+        seen.setdefault(d["frame_idx"], d)
+    return [seen[k] for k in sorted(seen)]
+
+
+def _hit_dict(h, fps: float) -> dict:
+    return {
+        "frame_idx": int(round(h.t_s * fps)),
+        "x": h.x,
+        "y": h.y,
+        "w": h.w,
+        "h": h.h,
+    }
+
+
 def _real_hits_by_frame(track: FaceTrack, fps: float) -> list[dict]:
     """Real detections -> [{frame_idx, x, y, w, h}] sorted by frame."""
     seen: dict[int, dict] = {}
@@ -176,6 +254,19 @@ def _real_hits_by_frame(track: FaceTrack, fps: float) -> list[dict]:
         fi = int(round(h.t_s * fps))
         seen.setdefault(fi, {"frame_idx": fi, "x": h.x, "y": h.y, "w": h.w, "h": h.h})
     return [seen[k] for k in sorted(seen)]
+
+
+def _drop_short_windows(dense: list[dict], min_window_frames: int) -> list[dict]:
+    """Drop contiguous runs shorter than `min_window_frames` (noise flicker)."""
+    if min_window_frames <= 1 or not dense:
+        return dense
+    runs: list[list[dict]] = [[dense[0]]]
+    for prev, cur in zip(dense, dense[1:], strict=False):
+        if cur["frame_idx"] == prev["frame_idx"] + 1:
+            runs[-1].append(cur)
+        else:
+            runs.append([cur])
+    return [f for run in runs if len(run) >= min_window_frames for f in run]
 
 
 def _dense_frames(
@@ -196,14 +287,20 @@ def _dense_frames(
                 out.append(_interp_frame(prev, cur, frac, bridged=True, inflate=inflate))
     out.append({**real[-1], "bridged": False, "lead": False})
     if lead > 0:
+        # lead-in: frames before the first real detection, clamped at 0.
+        # Emitted in ASCENDING frame order (the historical insert(0, ...) wrote
+        # them reversed — boxes_at()'s binary search and window splitting both
+        # require dense frames sorted by frame_idx).
         first = real[0]
-        last_fi = -1
+        lead_in: list[dict] = []
         for i in range(lead, 0, -1):
             fi = max(0, first["frame_idx"] - i)
-            if fi >= first["frame_idx"] or fi <= last_fi:
-                continue  # clamped onto the first real frame (or an earlier lead) — skip
-            out.insert(0, {**first, "frame_idx": fi, "bridged": False, "lead": True})
-            last_fi = fi
+            if fi >= first["frame_idx"]:
+                break  # clamped onto the first real frame — nothing earlier
+            if lead_in and fi <= lead_in[-1]["frame_idx"]:
+                continue  # clamp collapsed onto an earlier lead frame
+            lead_in.append({**first, "frame_idx": fi, "bridged": False, "lead": True})
+        out[:0] = lead_in
         last = out[-1]
         for i in range(1, lead + 1):
             out.append({**last, "frame_idx": last["frame_idx"] + i, "bridged": False, "lead": True})

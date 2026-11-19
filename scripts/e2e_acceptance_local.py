@@ -44,7 +44,6 @@ class LocalTranscript:
     it into perception_index on first use, re-runs never re-transcribe)."""
 
     def __init__(self, payload: dict):
-        from director_os.perception.transcript import Transcript
 
         self.calls = 0
         self._template = payload
@@ -64,8 +63,7 @@ class LocalTranscript:
             e = float(raw.get("end_s", 0.0))
             if e <= s:
                 e = s + 0.02
-            words.append({"text": text, "start_s": s, "end_s": e,
-                          "speaker": raw.get("speaker")})
+            words.append({"text": text, "start_s": s, "end_s": e, "speaker": raw.get("speaker")})
         segments = []
         for raw in self._template.get("segments") or []:
             text = str(raw.get("text") or "").strip()
@@ -75,8 +73,9 @@ class LocalTranscript:
             e = float(raw.get("end_s", 0.0))
             if e <= s:
                 e = s + 0.05
-            segments.append({"speaker": raw.get("speaker") or "Unknown",
-                             "start_s": s, "end_s": e, "text": text})
+            segments.append(
+                {"speaker": raw.get("speaker") or "Unknown", "start_s": s, "end_s": e, "text": text}
+            )
         t = Transcript(
             asset_id=asset_id,
             language=self._template.get("language", "en"),
@@ -85,8 +84,10 @@ class LocalTranscript:
             segments=segments,
             provider="faster-whisper-local",
         )
-        print(f"  [asr] serving local transcript ({len(t.segments)} segments) "
-              f"for {asset_id[:8]}", flush=True)
+        print(
+            f"  [asr] serving local transcript ({len(t.segments)} segments) for {asset_id[:8]}",
+            flush=True,
+        )
         return t
 
 

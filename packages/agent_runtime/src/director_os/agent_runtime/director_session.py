@@ -49,7 +49,6 @@ from director_os.agent_runtime.doc_scale import (
     WORDS_COLD,
     WORDS_MID,
     WORDS_OUTRO,
-    DocScale,
     doc_scale,
 )
 from director_os.agent_runtime.plan_invariants import (
@@ -289,11 +288,17 @@ template:
    to surface whenever present — never force them into a beat they don't belong
    to. Trim boilerplate (a Miranda reading = intro + waiver, never the full recital).
 
-{NARRATION_PROMPT_LAW.format(
-    words_total_min=scale.words_total_min,
-    cold_lo=WORDS_COLD[0], cold_hi=WORDS_COLD[1],
-    mid_lo=WORDS_MID[0], mid_hi=WORDS_MID[1],
-    outro_lo=WORDS_OUTRO[0], outro_hi=WORDS_OUTRO[1])}
+{
+            NARRATION_PROMPT_LAW.format(
+                words_total_min=scale.words_total_min,
+                cold_lo=WORDS_COLD[0],
+                cold_hi=WORDS_COLD[1],
+                mid_lo=WORDS_MID[0],
+                mid_hi=WORDS_MID[1],
+                outro_lo=WORDS_OUTRO[0],
+                outro_hi=WORDS_OUTRO[1],
+            )
+        }
 
 {HOOK_PROMPT_LAW.format(sting=STING_MAX_S, hook_start=HOOK_MAX_START_S, hook_end=HOOK_MAX_END_S)}
 
@@ -409,7 +414,8 @@ def _clip_pieces(
             merged.append([p0, p1])
     runs = [(a, b) for a, b in merged if b - a >= PIECE_MIN_S]
     if not runs:  # everything tiny: keep the single largest run
-        runs = [max(merged, key=lambda p: p[1] - p[0])]
+        best = max(merged, key=lambda p: p[1] - p[0])
+        runs = [(float(best[0]), float(best[1]))]
     runs = sorted(runs)[:MAX_PIECES_PER_CLIP]
     return [(a, b - a) for a, b in runs if b > a]
 
@@ -456,8 +462,12 @@ def _quotes_block(
     if not transcript:
         return ""
     segments = [
-        (float(s.get("start_s", 0.0)), float(s.get("end_s", 0.0)),
-         str(s.get("speaker") or "?"), str(s.get("text", "")).strip())
+        (
+            float(s.get("start_s", 0.0)),
+            float(s.get("end_s", 0.0)),
+            str(s.get("speaker") or "?"),
+            str(s.get("text", "")).strip(),
+        )
         for s in (transcript.get("segments") or [])
         if str(s.get("text", "")).strip()
     ]
@@ -476,10 +486,11 @@ def _quotes_block(
     seen: set[int] = set()
     for w0, w1 in windows:
         near = [
-            (i, s) for i, s in enumerate(segments)
+            (i, s)
+            for i, s in enumerate(segments)
             if s[0] < w1 + 60.0 and s[1] > w0 - 60.0 and i not in seen
         ]
-        for i, (s0, s1, spk, text) in near[:8]:
+        for i, (s0, _s1, spk, text) in near[:8]:
             if used >= budget_chars:
                 break
             snippet = " ".join(text.split())[:180]
@@ -493,8 +504,7 @@ def _quotes_block(
     return (
         "\n\n## ACTUAL TRANSCRIPT inside/around your selected windows (+/-60s) — "
         "trim tangents, complete punchlines (extend a window to finish the last "
-        "line), and reference these exact words in the narration:\n"
-        + "\n".join(lines)
+        "line), and reference these exact words in the narration:\n" + "\n".join(lines)
     )
 
 
@@ -525,16 +535,16 @@ def refine_plan_quotes(
     ]
     if not windows:
         return plan, ""
-    system = compose_agent_prompt(agent="director_agent", role="director", niche="bodycam_documentary")
+    system = compose_agent_prompt(
+        agent="director_agent", role="director", niche="bodycam_documentary"
+    )
     user = (
         "## Quote-grounded refinement of an accepted documentary plan\n"
         "Here is the ACCEPTED plan JSON. Improve it using the transcript quotes: "
         "trim boring tangents, extend raw windows so the last utterance in a "
         "window finishes (pad lives after), sharpen narration against exact "
         "words, keep the same act structure and count. Return ONLY the revised "
-        "JSON object.\n\n"
-        + plan.model_dump_json()
-        + quote_block
+        "JSON object.\n\n" + plan.model_dump_json() + quote_block
     )
     try:
         text = backend.complete_json(system, user)
@@ -608,7 +618,7 @@ def expand_macro_plan(plan: MacroPlan, source_duration_s: float) -> list[ToolSte
     card_anchors: dict[int, float] = {}
     # the scaffold-consumed sting is the master's first 4s: t starts THERE so
     # every card anchor is a true master-clock position
-    t = first.dur_s if scaffold_consumed else 0.0
+    t = (first.dur_s or 0.0) if scaffold_consumed else 0.0
     for act_i, act in enumerate(plan.acts):
         card_anchors[act_i] = t  # the TRUE start of this act
         blocks = [_as_block(b) for b in (rest if act_i == 0 else act.blocks)]
@@ -647,8 +657,7 @@ def expand_macro_plan(plan: MacroPlan, source_duration_s: float) -> list[ToolSte
                     ]
                 if len(starts) >= 2:
                     args["broll_windows"] = [
-                        [s, round(s + min(blk.est_s / len(starts) + 2.0, 30.0), 2)]
-                        for s in starts
+                        [s, round(s + min(blk.est_s / len(starts) + 2.0, 30.0), 2)] for s in starts
                     ]
                 elif starts:
                     args["broll_source_start_s"] = round(starts[0], 2)
@@ -676,15 +685,15 @@ def expand_macro_plan(plan: MacroPlan, source_duration_s: float) -> list[ToolSte
         for b in act_blocks[: card.at_block]:
             offset += b.est_s if isinstance(b, PlanNarration) else b.dur_s
         start = card_anchors[card.at_act] + offset
-        args: dict[str, Any] = {
+        card_args: dict[str, Any] = {
             "template": card.template,
             "title": card.title,
             "start_s": round(start, 2),
             "dur_s": card.dur_s,
         }
         if card.subtitle:
-            args["subtitle"] = card.subtitle
-        steps.append(ToolStep(tool="cards.add", args=args, checkpoint_note=card.template))
+            card_args["subtitle"] = card.subtitle
+        steps.append(ToolStep(tool="cards.add", args=card_args, checkpoint_note=card.template))
     return steps
 
 
@@ -704,9 +713,7 @@ def director_state_summary(
     def _quote_for(src0: float, src1: float) -> str:
         if not utts:
             return ""
-        inside = [
-            (a, b) for a, b in utts if a < src1 and b > src0
-        ]
+        inside = [(a, b) for a, b in utts if a < src1 and b > src0]
         if not inside:
             return " (no speech)"
         a0, b0 = inside[0]
@@ -743,8 +750,7 @@ def director_state_summary(
                 end if comp.last_source_end_s is None else max(comp.last_source_end_s, end)
             )
             lines.append(
-                f"[{i}] RAW {dur:.1f}s src {src:.1f}-{end:.1f}s act={act}"
-                + _quote_for(src, end)
+                f"[{i}] RAW {dur:.1f}s src {src:.1f}-{end:.1f}s act={act}" + _quote_for(src, end)
             )
     failures = audit_invariants(comp, source_duration_s)
     span = coverage_span(comp, source_duration_s)
@@ -757,7 +763,8 @@ def director_state_summary(
         f"master: {comp.final_duration_s:.1f}s | raw={comp.raw_segment_count} "
         f"narration={comp.narrator_segment_count} coverage={span:.2f}"
         + _targets_suffix(source_duration_s)
-        + f" — {status}\n" + "\n".join(lines[:40])
+        + f" — {status}\n"
+        + "\n".join(lines[:40])
     )
 
 
@@ -846,7 +853,10 @@ class DirectorSession:
                     continue
                 if self.transcript and self.quote_refine:
                     plan, refine_note = refine_plan_quotes(
-                        plan, self.transcript, self.backend, self.source_duration_s,
+                        plan,
+                        self.transcript,
+                        self.backend,
+                        self.source_duration_s,
                         problems_fn=self._plan_problems,
                     )
                     if refine_note:
@@ -877,7 +887,8 @@ class DirectorSession:
         problems: list[str] = []
         if len(plan.acts) < scale.act_min:
             problems.append(
-                f"only {len(plan.acts)} acts — need the Cold Open + {scale.act_min}-{scale.act_max} "
+                f"only {len(plan.acts)} acts — need the Cold Open + "
+                f"{scale.act_min}-{scale.act_max} "
                 "act structure for this source length"
             )
         honest_total = self._honest_total(plan)
@@ -918,9 +929,7 @@ class DirectorSession:
                 )
 
         # --- narration ratio on HONEST durations
-        raw_total = sum(
-            b.dur_s for a in plan.acts for b in a.blocks if isinstance(b, PlanRawClip)
-        )
+        raw_total = sum(b.dur_s for a in plan.acts for b in a.blocks if isinstance(b, PlanRawClip))
         narr_total = sum(b.est_s for b in narr_blocks)
         if narr_total + raw_total > 0:
             ratio = narr_total / (narr_total + raw_total)
@@ -959,11 +968,11 @@ class DirectorSession:
             first_narr_start = 0.0
             found_narr = False
             sting_ok = True
-            for blk in plan.acts[0].blocks:
-                if isinstance(blk, PlanNarration):
+            for cold_blk in plan.acts[0].blocks:
+                if isinstance(cold_blk, PlanNarration):
                     found_narr = True
                     break
-                first_narr_start += blk.dur_s
+                first_narr_start += cold_blk.dur_s
                 if first_narr_start > STING_MAX_S + 0.5:
                     sting_ok = False
                     break
@@ -971,7 +980,8 @@ class DirectorSession:
                 problems.append("plan has no narration in the cold open — the hook is missing")
             elif first_narr_start > HOOK_MAX_START_S:
                 problems.append(
-                    f"first narration starts at {first_narr_start:.1f}s > {HOOK_MAX_START_S:.0f}s — "
+                    f"first narration starts at {first_narr_start:.1f}s > "
+                    f"{HOOK_MAX_START_S:.0f}s — "
                     "open with the hook narration (a ≤4s climax sting may precede it)"
                 )
             elif not sting_ok:

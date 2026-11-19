@@ -37,7 +37,22 @@ SOURCE_DUR = 2627.0
 def _script_n(n: int, seed: str) -> str:
     """A narration script with EXACTLY n words (the word-count law fixture)."""
     words = seed.split()
-    filler = "the record shows the camera keeps rolling and every detail lands on the tape".split()
+    filler = [
+        "the",
+        "record",
+        "shows",
+        "the",
+        "camera",
+        "keeps",
+        "rolling",
+        "and",
+        "every",
+        "detail",
+        "lands",
+        "on",
+        "the",
+        "tape",
+    ]
     i = 0
     while len(words) < n:
         words.append(filler[i % len(filler)])
@@ -52,8 +67,12 @@ FIXTURE_TRANSCRIPT = {
         for t in range(0, 2600, 60)
     ],
     "segments": [
-        {"speaker": "Officer", "start_s": float(t), "end_s": float(t) + 40.0,
-         "text": f"minute {t} dialogue about the case"}
+        {
+            "speaker": "Officer",
+            "start_s": float(t),
+            "end_s": float(t) + 40.0,
+            "text": f"minute {t} dialogue about the case",
+        }
         for t in range(0, 2600, 60)
     ],
 }
@@ -287,8 +306,7 @@ def test_expand_macro_plan_orders_steps_and_computes_card_positions():
     # card_anchors FIX: location_intro lands at the TRUE start of act 1
     # (sting + hook + cold raw), not a full act late
     cold_total = sum(
-        b.est_s if b.__class__.__name__ == "PlanNarration" else b.dur_s
-        for b in plan.acts[0].blocks
+        b.est_s if b.__class__.__name__ == "PlanNarration" else b.dur_s for b in plan.acts[0].blocks
     )
     assert abs(card_steps[0].args["start_s"] - cold_total) < 0.5
 

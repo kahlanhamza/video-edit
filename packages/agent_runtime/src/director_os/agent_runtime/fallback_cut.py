@@ -49,34 +49,70 @@ HOOK_REGION = (0.60, 0.80)  # climax hooks come from later in the video
 # opening bridge of their first member and the closing line of their last).
 ACT_SETS: dict[int, tuple[tuple[str, float, float, str, str], ...]] = {
     3: (
-        ("Act 1: Contact & Investigation", 0.02, 0.38,
-         "Act 1: Arrival & Contact", "Act 2: Investigation & Friction"),
-        ("Act 2: Escalation & Arrest", 0.38, 0.74,
-         "Act 3: Escalation", "Act 4: The Arrest"),
-        ("Act 3: Aftermath & Outcome", 0.74, 1.00,
-         "Act 5: Aftermath & Booking", "Act 6: Verified Outcome"),
+        (
+            "Act 1: Contact & Investigation",
+            0.02,
+            0.38,
+            "Act 1: Arrival & Contact",
+            "Act 2: Investigation & Friction",
+        ),
+        ("Act 2: Escalation & Arrest", 0.38, 0.74, "Act 3: Escalation", "Act 4: The Arrest"),
+        (
+            "Act 3: Aftermath & Outcome",
+            0.74,
+            1.00,
+            "Act 5: Aftermath & Booking",
+            "Act 6: Verified Outcome",
+        ),
     ),
     4: (
-        ("Act 1: Arrival & Contact", 0.02, 0.25,
-         "Act 1: Arrival & Contact", "Act 1: Arrival & Contact"),
-        ("Act 2: Investigation & Friction", 0.25, 0.50,
-         "Act 2: Investigation & Friction", "Act 2: Investigation & Friction"),
-        ("Act 3: Escalation & Arrest", 0.50, 0.74,
-         "Act 3: Escalation", "Act 4: The Arrest"),
-        ("Act 4: Aftermath & Outcome", 0.74, 1.00,
-         "Act 5: Aftermath & Booking", "Act 6: Verified Outcome"),
+        (
+            "Act 1: Arrival & Contact",
+            0.02,
+            0.25,
+            "Act 1: Arrival & Contact",
+            "Act 1: Arrival & Contact",
+        ),
+        (
+            "Act 2: Investigation & Friction",
+            0.25,
+            0.50,
+            "Act 2: Investigation & Friction",
+            "Act 2: Investigation & Friction",
+        ),
+        ("Act 3: Escalation & Arrest", 0.50, 0.74, "Act 3: Escalation", "Act 4: The Arrest"),
+        (
+            "Act 4: Aftermath & Outcome",
+            0.74,
+            1.00,
+            "Act 5: Aftermath & Booking",
+            "Act 6: Verified Outcome",
+        ),
     ),
     5: (
-        ("Act 1: Arrival & Contact", 0.02, 0.15,
-         "Act 1: Arrival & Contact", "Act 1: Arrival & Contact"),
-        ("Act 2: Investigation & Friction", 0.15, 0.38,
-         "Act 2: Investigation & Friction", "Act 2: Investigation & Friction"),
-        ("Act 3: Escalation", 0.38, 0.58,
-         "Act 3: Escalation", "Act 3: Escalation"),
-        ("Act 4: The Arrest", 0.58, 0.80,
-         "Act 4: The Arrest", "Act 4: The Arrest"),
-        ("Act 5: Aftermath & Outcome", 0.80, 1.00,
-         "Act 5: Aftermath & Booking", "Act 6: Verified Outcome"),
+        (
+            "Act 1: Arrival & Contact",
+            0.02,
+            0.15,
+            "Act 1: Arrival & Contact",
+            "Act 1: Arrival & Contact",
+        ),
+        (
+            "Act 2: Investigation & Friction",
+            0.15,
+            0.38,
+            "Act 2: Investigation & Friction",
+            "Act 2: Investigation & Friction",
+        ),
+        ("Act 3: Escalation", 0.38, 0.58, "Act 3: Escalation", "Act 3: Escalation"),
+        ("Act 4: The Arrest", 0.58, 0.80, "Act 4: The Arrest", "Act 4: The Arrest"),
+        (
+            "Act 5: Aftermath & Outcome",
+            0.80,
+            1.00,
+            "Act 5: Aftermath & Booking",
+            "Act 6: Verified Outcome",
+        ),
     ),
 }
 ACT_SETS[6] = tuple(
@@ -294,17 +330,28 @@ def plan_fallback_blocks(
     blocks.append(_Block("raw", sting_start, STING_MAX_S, act="Cold Open"))
     # 2) the hook narration, b-roll riding the climax moment (muted bed)
     hook = _hook_script(case_facts, seeds.get("hook") or seeds.get("Cold Open"))
-    blocks.append(_Block("narration", climax[0], _narr_dur(hook, lo=14.0, hi=26.0), hook, "Cold Open"))
+    blocks.append(
+        _Block("narration", climax[0], _narr_dur(hook, lo=14.0, hi=26.0), hook, "Cold Open")
+    )
     # 3) one more short climax beat, audio on, to ride out of the cold open
     if len(hooks) > 1 and scale.target_lo >= 240.0:
         b_start = max(0.0, hooks[1][0])
-        blocks.append(_Block("raw", b_start, min(24.0, max(10.0, hooks[1][1] - hooks[1][0])), act="Cold Open"))
+        blocks.append(
+            _Block("raw", b_start, min(24.0, max(10.0, hooks[1][1] - hooks[1][0])), act="Cold Open")
+        )
 
     # --- acts: narration bridge LEADS each act, a distinct transition line
     #     CLOSES it (context before footage, momentum after), speech-anchored
     #     raw clips between; the last act's closing line is the outro
     n_acts = len(act_windows)
-    narration_total = _narr_dur(_hook_script(case_facts, (seed_scripts or {}).get("hook") or (seed_scripts or {}).get("Cold Open")), lo=14.0, hi=26.0)
+    narration_total = _narr_dur(
+        _hook_script(
+            case_facts,
+            (seed_scripts or {}).get("hook") or (seed_scripts or {}).get("Cold Open"),
+        ),
+        lo=14.0,
+        hi=26.0,
+    )
     narration_total += sum(
         _narr_dur(seeds.get(bridge_key) or NARRATOR_BRIDGES[bridge_key], lo=14.0, hi=34.0)
         + _narr_dur(TRANSITION_BRIDGES[close_key], lo=12.0, hi=30.0)
@@ -329,9 +376,9 @@ def plan_fallback_blocks(
                 name,
             )
         )
-        act_ranges = _seed_ranges_in(seed_ranges, lo, hi, source_duration_s, max_ranges=clips_per_act) or _top_intervals(
-            intervals, (lo, hi), source_duration_s, clips_per_act
-        )
+        act_ranges = _seed_ranges_in(
+            seed_ranges, lo, hi, source_duration_s, max_ranges=clips_per_act
+        ) or _top_intervals(intervals, (lo, hi), source_duration_s, clips_per_act)
         if act_ranges:
             for a, b in act_ranges:
                 # budget-driven length: the speech anchor justifies the window,
@@ -365,17 +412,17 @@ def plan_fallback_blocks(
     floor = scale.min_final_s
     aim = floor + max(25.0, floor * 0.05)
     for _pass in range(3):
-        total = sum(b.dur_s for b in blocks)
+        total = sum(blk.dur_s for blk in blocks)
         if total >= aim:
             break
-        raws = [b for b in blocks if b.kind == "raw"]
-        raw_sum = sum(b.dur_s for b in raws)
+        raws = [blk for blk in blocks if blk.kind == "raw"]
+        raw_sum = sum(r.dur_s for r in raws)
         if not raws:
             break
         need = aim - total
         factor = min(1.35, (raw_sum + need) / raw_sum)
-        for b in raws:
-            b.dur_s = min(75.0, b.dur_s * factor)
+        for blk in raws:
+            blk.dur_s = min(75.0, blk.dur_s * factor)
     return blocks
 
 
@@ -439,9 +486,7 @@ def build_fallback_documentary(
             # b-roll must FIT the source: a window starting at/after EOF slices
             # zero frames (the acceptance run caught the outro narration at
             # 2627.08s = source end) — clamp the start so the window lands
-            broll_start = max(
-                0.0, min(b.source_start_s, max(0.0, source_duration_s - b.dur_s))
-            )
+            broll_start = max(0.0, min(b.source_start_s, max(0.0, source_duration_s - b.dur_s)))
             master.append(
                 ClipSpec(
                     name=f"narration_{i}",

@@ -23,8 +23,22 @@ from pathlib import Path
 
 def extract_audio(src: Path, dst: Path) -> None:
     subprocess.run(
-        ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-vn", "-ac", "1", "-ar", "16000",
-         "-c:a", "pcm_s16le", str(dst)],
+        [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            str(src),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            str(dst),
+        ],
         check=True,
     )
 
@@ -64,10 +78,24 @@ def main() -> int:
             pass
 
     done_to = max((float(s["end_s"]) for s in segments_out), default=0.0)
-    duration = float(json.loads(
-        subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                        "-of", "json", str(wav)], capture_output=True, text=True)
-        .stdout)["format"]["duration"])
+    duration = float(
+        json.loads(
+            subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "json",
+                    str(wav),
+                ],
+                capture_output=True,
+                text=True,
+            ).stdout
+        )["format"]["duration"]
+    )
     print(f"[asr] {duration / 60:.1f} min of audio, resuming from {done_to:.0f}s", flush=True)
 
     CHUNK = 300.0
@@ -89,30 +117,46 @@ def main() -> int:
             if not text:
                 continue
             segments_out.append(
-                {"speaker": "Unknown", "start_s": round(float(seg.start), 3),
-                 "end_s": round(float(seg.end), 3), "text": text}
+                {
+                    "speaker": "Unknown",
+                    "start_s": round(float(seg.start), 3),
+                    "end_s": round(float(seg.end), 3),
+                    "text": text,
+                }
             )
             for w in seg.words or []:
                 token = (w.word or "").strip()
                 if not token:
                     continue
                 words_out.append(
-                    {"text": token, "start_s": round(float(w.start), 3),
-                     "end_s": round(float(w.end), 3), "speaker": "Unknown"}
+                    {
+                        "text": token,
+                        "start_s": round(float(w.start), 3),
+                        "end_s": round(float(w.end), 3),
+                        "speaker": "Unknown",
+                    }
                 )
             n_seg += 1
         cursor = end
         tmp = out.with_suffix(".tmp.json")
-        tmp.write_text(json.dumps(
-            {"language": "en", "segments": segments_out, "words": words_out}, indent=1))
+        tmp.write_text(
+            json.dumps({"language": "en", "segments": segments_out, "words": words_out}, indent=1)
+        )
         tmp.replace(out)
-        print(f"[asr] {end / 60:5.1f} min done (+{time.time() - t_chunk:.0f}s, "
-              f"{len(segments_out)} segments)", flush=True)
+        print(
+            f"[asr] {end / 60:5.1f} min done (+{time.time() - t_chunk:.0f}s, "
+            f"{len(segments_out)} segments)",
+            flush=True,
+        )
 
-    out.write_text(json.dumps(
-        {"language": "en", "segments": segments_out, "words": words_out}, indent=1))
-    print(f"[asr] COMPLETE: {len(segments_out)} segments / {len(words_out)} words "
-          f"in {time.time() - t0:.0f}s -> {out}", flush=True)
+    out.write_text(
+        json.dumps({"language": "en", "segments": segments_out, "words": words_out}, indent=1)
+    )
+    print(
+        f"[asr] COMPLETE: {len(segments_out)} segments / {len(words_out)} words "
+        f"in {time.time() - t0:.0f}s -> {out}",
+        flush=True,
+    )
     return 0
 
 

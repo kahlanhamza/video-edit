@@ -24,7 +24,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from director_os.agent_runtime.doc_scale import (
-    DOCUMENTARY_MIN_SOURCE_S,
     DocScale,
     doc_scale,
 )
@@ -41,8 +40,8 @@ TAIL_FRACTION = 0.25  # latest allowed clip end must reach into the final 25%
 NARRATION_RATIO_MIN = 0.30
 NARRATION_RATIO_MAX = 0.52
 # HOOK-FIRST LAW (owner rule 2026-11-19 — "think like a real pro editor"):
-HOOK_MAX_START_S = 8.0   # first narration starts ≤ 8s into the master
-HOOK_MAX_END_S = 32.0    # who/what/where/when complete ≤ 32s in
+HOOK_MAX_START_S = 8.0  # first narration starts ≤ 8s into the master
+HOOK_MAX_END_S = 32.0  # who/what/where/when complete ≤ 32s in
 
 
 def _scale_for(source_duration_s: float) -> DocScale:
@@ -159,10 +158,7 @@ def audit_invariants(comp: TimelineComposition, source_duration_s: float) -> lis
         failures.append(
             InvariantFailure(
                 code="narrator_floor",
-                detail=(
-                    f"narrator_segment_count={comp.narrator_segment_count} "
-                    f"< {scale.narr_lo}"
-                ),
+                detail=(f"narrator_segment_count={comp.narrator_segment_count} < {scale.narr_lo}"),
             )
         )
     if scale.is_documentary and comp.final_duration_s > 0:
@@ -201,16 +197,14 @@ def audit_invariants(comp: TimelineComposition, source_duration_s: float) -> lis
 
     # --- HOOK-FIRST LAW: narration ≤8s in, hook done ≤32s in (documentaries)
     if scale.hook_law and comp.narrator_segment_count > 0:
-        if (
-            comp.first_narration_start_s is None
-            or comp.first_narration_start_s > HOOK_MAX_START_S
-        ):
+        first_narr = comp.first_narration_start_s
+        if first_narr is None or first_narr > HOOK_MAX_START_S:
             failures.append(
                 InvariantFailure(
                     code="hook_late",
                     detail=(
                         f"first narration starts at "
-                        f"{comp.first_narration_start_s if comp.first_narration_start_s is not None else -1:.1f}s "
+                        f"{(first_narr if first_narr is not None else -1):.1f}s "
                         f"> {HOOK_MAX_START_S:.0f}s — the hook must open the video "
                         "(a ≤4s climax sting may precede it)"
                     ),
@@ -259,9 +253,7 @@ def audit_retention(
 
     scale = _scale_for(source_duration_s)
     floor = min_final_duration_s if min_final_duration_s is not None else scale.min_final_s
-    min_narr = (
-        min_narrator_segments if min_narrator_segments is not None else scale.narr_lo
-    )
+    min_narr = min_narrator_segments if min_narrator_segments is not None else scale.narr_lo
     min_raw = min_raw_segments if min_raw_segments is not None else scale.raw_min
     min_span = min_coverage_span if min_coverage_span is not None else scale.min_coverage_span
 

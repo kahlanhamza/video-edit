@@ -325,7 +325,6 @@ def retime_narration_to_tts(timeline, narration_clips: list[dict]) -> int:
     (bounded 0.2-3s pad), b-roll window start unchanged. Returns count.
     """
     import opentimelineio.opentime as ot_time
-
     from director_os.otio_engine.compiler import master_track
     from director_os.otio_engine.contract import NarratorClipMeta, parse_clip_meta
     from director_os.otio_engine.timeline import is_gap
@@ -399,7 +398,6 @@ def retime_cards_after_narration(timeline, pre_spans: list[tuple[float, float]])
     """
     import opentimelineio.opentime as ot_time
     import opentimelineio.schema as ot_schema
-
     from director_os.otio_engine.compiler import master_track
     from director_os.otio_engine.timeline import (
         OVERLAY_TRACK,
@@ -2153,6 +2151,8 @@ def run_pipeline(
         raise
 
     shipped = post_fx_report.final_path if post_fx_report else report.final_path
+    if shipped is None:
+        raise PipelineError("render produced no final deliverable path")
     deps.log(f"[pipeline] DONE {shipped} (audit ok)")
     return PipelineResult(
         job_id=job_id,

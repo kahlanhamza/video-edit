@@ -31,8 +31,12 @@ import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from director_os.core.qa_probe import probe
+
+if TYPE_CHECKING:
+    from director_os.vision_fx.trajectory import RedactionTrajectory
 
 # the master clock re-mapping pad: narration stems get a small tail pad so
 # sentence-final words never clip
@@ -185,8 +189,12 @@ def build_master_caption_cues(
                 if m_end - m_start < 0.05:
                     continue
                 spk = str(w.get("speaker") or "Unknown")
-                if run2 and (spk != speaker or m_start - run2[-1][2] > 1.0
-                             or m_end - run2[0][1] > MAX_S or len(run2) >= MAX_WORDS):
+                if run2 and (
+                    spk != speaker
+                    or m_start - run2[-1][2] > 1.0
+                    or m_end - run2[0][1] > MAX_S
+                    or len(run2) >= MAX_WORDS
+                ):
                     _flush_run(run2, speaker)
                     raw_cues += 1
                     run2 = []
@@ -202,7 +210,12 @@ def build_master_caption_cues(
 
 
 def _captions_pass(
-    master: Path, work: Path, timeline, transcript: dict, narration_clips: list[dict], report: PostFxReport
+    master: Path,
+    work: Path,
+    timeline,
+    transcript: dict,
+    narration_clips: list[dict],
+    report: PostFxReport,
 ) -> Path:
     from director_os.subtitles.store import save_cues
 
@@ -300,7 +313,7 @@ def _selective_keep_ids(tracks, frame_h: int) -> set[str]:
     return keep
 
 
-def _watermark_trajectory(n_frames: int, fps: float, w: int, h: int) -> "RedactionTrajectory":
+def _watermark_trajectory(n_frames: int, fps: float, w: int, h: int) -> RedactionTrajectory:
     """Static bottom-right band (baked-in channel watermark) blurred all video."""
     from director_os.vision_fx.trajectory import RedactionTrajectory, TrackedBox
 
@@ -335,15 +348,13 @@ def _blur_pass(master: Path, work: Path, deps, report: PostFxReport) -> Path:
         normalize_cfr,
         render_tracked_redaction,
     )
-    from director_os.vision_fx.trajectory import PerFrameRedaction, repair_trajectories
+    from director_os.vision_fx.trajectory import repair_trajectories
 
     backend = LocalOnnxCpuBackend()
     caps = backend.capabilities()
-    report.blur_backend = (
-        "yolov8n-face" if caps.get("yolo_model") else "yunet-packaged"
-    )
+    report.blur_backend = "yolov8n-face" if caps.get("yolo_model") else "yunet-packaged"
 
-    blur_mode = (os.getenv("BLUR_MODE", "").strip().lower() or "all")
+    blur_mode = os.getenv("BLUR_MODE", "").strip().lower() or "all"
     exclude: set[str] = set()
 
     marks = _markers(work)
@@ -379,8 +390,10 @@ def _blur_pass(master: Path, work: Path, deps, report: PostFxReport) -> Path:
         marks["sweep"].write_text(str(len(tracks)))
         deps.log(f"  [post-fx] blur: {len(tracks)} identity track(s) swept on the master")
 
+    frame_w_px = int(info.width or 0)
+    frame_h_px = int(info.height or 0)
     if blur_mode == "selective" and tracks:
-        keep = _selective_keep_ids(tracks, int(info.height))
+        keep = _selective_keep_ids(tracks, frame_h_px)
         exclude.update(keep)
         report.notes.append(
             f"selective mode: {len(keep)} close-up identity track(s) stay visible "
@@ -388,12 +401,10 @@ def _blur_pass(master: Path, work: Path, deps, report: PostFxReport) -> Path:
         )
 
     plan = repair_trajectories(
-        tracks, fps=fps, frame_w=int(info.width), frame_h=int(info.height), n_frames=n_frames
+        tracks, fps=fps, frame_w=frame_w_px, frame_h=frame_h_px, n_frames=n_frames
     )
     if blur_mode != "off":
-        plan.trajectories.append(
-            _watermark_trajectory(n_frames, fps, int(info.width), int(info.height))
-        )
+        plan.trajectories.append(_watermark_trajectory(n_frames, fps, frame_w_px, frame_h_px))
     report.blur_tracks = len(plan.trajectories)
     report.blur_windows = sum(t.n_windows for t in plan.trajectories)
     audited_tracks = [t for t in tracks if t.track_id not in exclude]
@@ -428,9 +439,23 @@ def _blur_pass(master: Path, work: Path, deps, report: PostFxReport) -> Path:
         lst = work / "blur_chunks.txt"
         lst.write_text("".join(f"file '{p.name}'\n" for p in parts))
         subprocess.run(
-            ["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(lst),
-             "-c", "copy", str(work / "master_blurred.mp4")],
-            check=True, capture_output=True,
+            [
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(lst),
+                "-c",
+                "copy",
+                str(work / "master_blurred.mp4"),
+            ],
+            check=True,
+            capture_output=True,
         )
     return work / "master_blurred.mp4"
 
@@ -440,7 +465,6 @@ def _speech_regions(wav: Path) -> list[tuple[float, float]]:
     """VAD speech spans (silero) — used by the muted-speech rescue gate."""
     try:
         import numpy as np
-
         from director_os.audio_engine.snr import decode_pcm_mono
         from director_os.audio_engine.vad import SileroVad
 
@@ -454,10 +478,19 @@ def _extract_master_audio(master: Path, work: Path) -> Path:
     wav = work / "master_audio.wav"
     _run(
         [
-            "ffmpeg", "-y", "-v", "error",
-            "-i", str(master),
-            "-vn", "-ac", "1", "-ar", "48000",
-            "-c:a", "pcm_s16le",
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            str(master),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "48000",
+            "-c:a",
+            "pcm_s16le",
             str(wav),
         ],
         "master audio extract",
@@ -470,15 +503,38 @@ def _mux_pass(blurred: Path, enhanced_wav: Path, ass: Path, final: Path) -> None
     vf = f"ass='{_escape_ass_path(ass)}'"
     _run(
         [
-            "ffmpeg", "-y", "-v", "error",
-            "-i", str(blurred),
-            "-i", str(enhanced_wav),
-            "-vf", vf,
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
-            "-movflags", "+faststart",
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            str(blurred),
+            "-i",
+            str(enhanced_wav),
+            "-vf",
+            vf,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "22",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-movflags",
+            "+faststart",
             str(final),
         ],
         "post-fx final mux (captions + enhanced audio)",
@@ -514,14 +570,18 @@ def stage_post_fx(
     else:
         ass = _captions_pass(master, work, timeline, transcript, narration_clips or [], report)
         marks["captions"].write_text(str(report.n_caption_cues))
-        deps.log(f"  [post-fx] captions: {report.n_caption_cues} cues ({report.narration_cues} narration / {report.raw_cues} raw) -> {ass.name}")
+        deps.log(
+            f"  [post-fx] captions: {report.n_caption_cues} cues "
+            f"({report.narration_cues} narration / {report.raw_cues} raw) -> {ass.name}"
+        )
     ass = work / "subtitles.ass"
 
     # ---- 2. tracked blur (master only — b-roll covered by construction)
     if marks["blur"].exists():
         blurred = work / "master_blurred.mp4"
-        report.blur_backend = marks["blur"].read_text().split("|")[0]
-        report.blur_tracks = int(marks["blur"].read_text().split("|")[1] or 0)
+        blur_mark = marks["blur"].read_text().split("|")
+        report.blur_backend = blur_mark[0]
+        report.blur_tracks = int(blur_mark[1]) if len(blur_mark) > 1 and blur_mark[1] else 0
         deps.log(f"  [post-fx] blur cached ({report.blur_tracks} tracks via {report.blur_backend})")
     else:
         blurred = _blur_pass(master, work, deps, report)
@@ -552,8 +612,8 @@ def stage_post_fx(
             deps.log(f"  [post-fx] deep-filter unavailable ({e}) — afftdn fallback")
             from director_os.audio_engine.enhance import AfftdnEnhancer
 
-            enhancer = AfftdnEnhancer()
-            result = enhancer.enhance(raw_wav, enhanced)
+            enhancer_fallback: AfftdnEnhancer = AfftdnEnhancer()
+            result = enhancer_fallback.enhance(raw_wav, enhanced)
             report.enhance_engine = result.engine
             report.enhance_neural = result.neural
         # muted-speech rescue gate
@@ -601,7 +661,9 @@ def _measure_snr(wav: Path) -> float | None:
         return None
 
 
-def _speech_keep_ratio(before: list[tuple[float, float]], after: list[tuple[float, float]]) -> float:
+def _speech_keep_ratio(
+    before: list[tuple[float, float]], after: list[tuple[float, float]]
+) -> float:
     """Fraction of before-speech time still detected as speech after enhance."""
     if not before:
         return 1.0
