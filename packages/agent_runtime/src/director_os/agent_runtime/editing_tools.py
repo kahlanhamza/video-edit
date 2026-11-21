@@ -701,7 +701,10 @@ def build_director_registry(toolbox: DirectorToolbox) -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(
         "timeline.trim_clip",
-        "Move a master clip's in-point and duration (source seconds).",
+        "Move a master clip's in-point and duration (source seconds). DESTRUCTIVE: "
+        "this REPLACES the clip's current source range — material outside "
+        "[new_start_s, new_start_s + new_dur_s] is dropped. To remove a span from "
+        "the MIDDLE, split first, then trim each half.",
         _TrimInput,
         lambda **kw: toolbox.trim_clip(**kw),
     )

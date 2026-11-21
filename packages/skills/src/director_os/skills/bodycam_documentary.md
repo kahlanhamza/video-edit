@@ -141,6 +141,8 @@ Laws, in order:
    concrete evidence moment (plate/document/exchange), 2-4 s hold.
    `timeline.set_audio_mode`: silence ONLY under narration b-roll;
    isolate_2bus only when the project has the enhanced 2-bus master.
-6. **Ship = save.** End every session with `timeline.save` (the .otio export is
-   what the owner's compile stage consumes) and then `agent.finish` with a
-   summary that lists: evidence seen, edits applied, QA verdicts, undo events.
+6. **Ship = save, LAST.** `timeline.save` after your FINAL mutation — if you
+   undo or roll back AFTER a save, save AGAIN before finishing (session v2
+   shipped a saved .otio of an already-undone trim). Then `agent.finish` with
+   a summary that lists: evidence seen (with numbers), edits applied, QA
+   verdicts (all four gates, truthfully), undo events.

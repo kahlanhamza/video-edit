@@ -49,7 +49,7 @@ TAG_OVERRIDE = r"{\i1\c&H9C9C9C&\2c&H9C9C9C&}"
 TAG_WORDS = ("unaudible", "mumbling", "whispering", "cross-talk", "panicking")
 MAX_EDITS_PER_CALL = 8
 GAP_MIN_SPAN_S = 1.0  # a VAD speech span this long MUST carry a cue
-LOOP_REPEAT_N = 3  # same plain text 3+ times = hallucination-loop signature
+LOOP_REPEAT_N = 3  # same text tiled back-to-back 3+ = hallucination-loop
 MIN_REASON_LEN = 4
 
 
@@ -284,17 +284,36 @@ def register_workshop_tools(
             }
         )
 
-        # 3. no hallucination loop: same plain text repeated 3+ times
-        counts: dict[str, int] = {}
-        for c in cues:
-            if not _is_tag(c["text"]) and c["text"]:
-                counts[c["text"]] = counts.get(c["text"], 0) + 1
-        loops = {t: n for t, n in counts.items() if n >= LOOP_REPEAT_N}
+        # 3. no hallucination loop: the same plain text tiled BACK-TO-BACK
+        # 3+ times (each cue starting within 2 s of the previous one ending).
+        # Legitimate short interjections ("Okay.") repeat across a runtime —
+        # agent session v2 flagged those falsely; the ASR-loop signature is
+        # TILING, not repetition.
+        plain = sorted(
+            [c for c in cues if not _is_tag(c["text"]) and c["text"]],
+            key=lambda c: c["s"],
+        )
+        loops: list[str] = []
+        run_text: str | None = None
+        run_last_end = -1e9
+        run_n = 0
+        sentinel: dict[str, Any] | None = None
+        for c in [*plain, sentinel]:  # sentinel flushes the final run
+            tiled = c is not None and c["text"] == run_text and c["s"] - run_last_end <= 2.0
+            if tiled:
+                run_n += 1
+                run_last_end = c["e"]
+                continue
+            if run_n >= LOOP_REPEAT_N:
+                loops.append(f"{(run_text or '')[:40]!r} x{run_n} tiled back-to-back")
+            run_text = c["text"] if c else None
+            run_n = 1
+            run_last_end = c["e"] if c else -1e9
         checks.append(
             {
                 "name": "no_loop_text",
                 "ok": not loops,
-                "detail": [f"{t[:40]!r} x{n}" for t, n in list(loops.items())[:5]],
+                "detail": loops[:5],
             }
         )
 
@@ -400,8 +419,8 @@ def register_workshop_tools(
     registry.register(
         "qa.run_caption_checks",
         "The 4 caption-truth gates on the WORK copy: color-vs-speaker, "
-        "owner-windows-tag-only (pass the owner windows), no repeated loop "
-        "text, and VAD gap coverage. Writes qa_caption_work.json; green "
+        "owner-windows-tag-only (pass the owner windows), no back-to-back "
+        "loop text, and VAD gap coverage. Writes qa_caption_work.json; green "
         "means the edit is ready for the owner's re-burn.",
         _OwnerWindow,
         lambda **kw: run_caption_checks(**kw),
