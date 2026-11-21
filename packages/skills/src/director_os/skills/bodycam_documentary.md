@@ -104,3 +104,43 @@ The loop does NOT end while the timeline is under target: >= 600s total, >= 9
 narration blocks, 30-52% narration ratio, >= 8 raw clips, source span >= 0.70 — add
 material from the story index until the invariants read ALL MET. Source seconds come
 from the story index `[mm:ss]` markers (mm:ss -> seconds math).
+
+## Agent craft: acting on measured evidence (v0.4 workbench loop)
+
+The AI editor agent is a working PRO: it reads evidence, edits, verifies its own
+edit, undoes regret, and ships a saved timeline — without a human in the loop.
+Laws, in order:
+
+1. **Evidence before action.** Never cut, tag or polish from memory. Open with
+   `project.describe` + `qa.read_report`, then look at the SPECIFIC window with
+   `transcript.read_window` / `captions.list_cues` / `audio.speech_spans`. An
+   edit whose `why` cannot cite a measured number (speech_ratio, rms_db,
+   repeat_n, span seconds) is not an edit — it is a guess.
+2. **Caption-truth decision table** (the owner's millisecond law):
+   - `speech_ratio < 0.35` OR `rms_db < -35` OR `repeat_n >= 3` on a window →
+     the ASR text there is UNRELIABLE: apply a gray-italic tag
+     (`captions.apply_tag_edits`, tag = unaudible | mumbling | whispering |
+     cross-talk | panicking — pick from the measured shape, keep the reason
+     grounded in numbers).
+   - VAD speech span >= 1.0 s with no cue at all → gap-fill tag on that span.
+   - Clean speech (ratio >= 0.5, sane rms, no repeats) → keep the words; a tag
+     on clean dialogue is a violation too.
+3. **Verify your own edit.** After ANY workbench edit: `captions.list_work_cues`
+   over the edited window, then `qa.run_caption_checks` (pass the owner
+   windows). Ship NOTHING that is not green on all four gates. If your edit
+   made it worse, `captions.apply_tag_edits` cannot un-write — say so honestly
+   in the finish summary and leave the work copy for review.
+4. **Undo discipline.** Every mutating step is auto-checkpointed. If a step
+   failed or the evidence disagrees with the result: `undo.list_checkpoints`,
+   `undo.rollback` — as the PLAN-FINAL step (the session rebinds the restored
+   timeline at the round boundary). A pro who never undoes is lying about their
+   first take.
+5. **Polish is subtle or it is wrong.** `timeline.set_zoom` documentary range
+   1.0-1.25x (max 3.0 is the contract, not the target); a zoom peak >1.4 needs
+   a reason grounded in the picture. `timeline.set_freeze_callout` only on a
+   concrete evidence moment (plate/document/exchange), 2-4 s hold.
+   `timeline.set_audio_mode`: silence ONLY under narration b-roll;
+   isolate_2bus only when the project has the enhanced 2-bus master.
+6. **Ship = save.** End every session with `timeline.save` (the .otio export is
+   what the owner's compile stage consumes) and then `agent.finish` with a
+   summary that lists: evidence seen, edits applied, QA verdicts, undo events.
