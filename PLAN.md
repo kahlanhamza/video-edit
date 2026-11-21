@@ -1,6 +1,15 @@
 # Project Blueprint: Autonomous Multimodal Video Editing & Documentary Platform ("DirectorOS")
 
 > **Status:** Architecture RFC / Master Implementation Plan (v1.0)  
+> **Session log 2026-11-21:** caption-truth v4 shipped on the real Eustis master
+> (QA 11/11 green: officer/suspect color audit 0 mismatches, no
+> speech-without-caption, hallucination loops replaced by gray `*unaudible*`
+> tags) — `scripts/caption_v4.py` + `scripts/qa_v4.py`. The AI editor agent ran
+> its FIRST native Gemini function-calling session against the accepted cut
+> (4/4 tools green through the Modal fleet egress; read surface now a package
+> module `agent_runtime.inspection_tools` with 19 hermetic tests). CI reds from
+> the scripts sweep fixed forward (ruff 49 → green, gates: lint/mypy/pytest
+> 718+).
 > **Target Domain:** Long-form Documentary, Commentary & Police Bodycam Post-Production (12–20 min 16:9, scalable to Shorts/Multi-Niche)  
 > **Core Principle:** Durable Cloud State + Multimodal Perception + Native Agentic Tool Execution + `OpenTimelineIO` Backbone + Human-in-the-Loop Studio
 
