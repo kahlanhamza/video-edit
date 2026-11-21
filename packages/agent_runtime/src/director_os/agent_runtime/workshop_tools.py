@@ -340,6 +340,36 @@ def register_workshop_tools(
             }
         )
 
+        # 5. a tag over CLEAN speech is a violation too (skill v0.5 law):
+        # tagging evidence-backed clean dialogue mutes real words. A tag cue
+        # fully inside a clean event (has_words, speech_ratio >= 0.5, rms >
+        # -35 dB, repeat_n < 3) means the agent over-tagged.
+        clean_viol: list[str] = []
+        for c in cues:
+            if not _is_tag(c["text"]):
+                continue
+            for ev in evidence:
+                if float(ev["e"]) - float(ev["s"]) < 0.3:
+                    continue
+                clean = (
+                    bool(ev.get("has_words"))
+                    and float(ev.get("speech_ratio", 0.0)) >= 0.5
+                    and float(ev.get("rms_db", -99.0)) > -35.0
+                    and int(ev.get("repeat_n", 0)) < 3
+                )
+                if clean and c["s"] >= ev["s"] - 0.05 and c["e"] <= ev["e"] + 0.05:
+                    clean_viol.append(
+                        f"[{c['s']:.1f}-{c['e']:.1f}]s tag over CLEAN speech "
+                        f"{ev['s']:.1f}-{ev['e']:.1f}s (ratio {ev.get('speech_ratio')})"
+                    )
+        checks.append(
+            {
+                "name": "no_tags_on_clean_speech",
+                "ok": not clean_viol,
+                "detail": clean_viol[:5],
+            }
+        )
+
         report = {
             "target": str(work_ass),
             "checks": checks,
@@ -419,10 +449,12 @@ def register_workshop_tools(
     )
     registry.register(
         "qa.run_caption_checks",
-        "The 4 caption-truth gates on the WORK copy: color-vs-speaker, "
+        "The 5 caption-truth gates on the WORK copy: color-vs-speaker, "
         "owner-windows-tag-only (pass the owner windows), no back-to-back "
-        "loop text, and VAD gap coverage. Writes qa_caption_work.json; green "
-        "means the edit is ready for the owner's re-burn.",
+        "loop text, VAD gap coverage, and no-tags-on-clean-speech (tagging "
+        "evidence-backed clean dialogue is a violation too). Writes "
+        "qa_caption_work.json; green means the edit is ready for the "
+        "owner's re-burn.",
         _OwnerWindow,
         lambda **kw: run_caption_checks(**kw),
     )

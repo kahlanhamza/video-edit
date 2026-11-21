@@ -322,6 +322,50 @@ def test_qa_requires_vad_cache(env):
         _dispatch(env, "qa.run_caption_checks")
 
 
+def test_qa_catches_tag_over_clean_speech(env):
+    """Skill v0.5 law: a tag over evidence-backed CLEAN dialogue is a
+    violation too (it mutes real words). Found by the agent evals harness."""
+    _dispatch(env, "captions.init_work_copy")
+    # tag the CLEAN officer cue (ratio 0.94, rms -21, repeat 1) -> red
+    _dispatch(
+        env,
+        "captions.apply_tag_edits",
+        {
+            "edits": [
+                {
+                    "start_s": 10.0,
+                    "end_s": 12.5,
+                    "tag": "unaudible",
+                    "reason": "wrong: clean speech tagged",
+                },
+            ]
+        },
+    )
+    report = _dispatch(env, "qa.run_caption_checks")
+    by_name = {c["name"]: c for c in report["checks"]}
+    assert by_name["no_tags_on_clean_speech"]["ok"] is False
+    assert "CLEAN speech" in by_name["no_tags_on_clean_speech"]["detail"][0]
+    assert report["green"] is False
+    # the unreliable window (13-15 s, has_words False) stays legal
+    _dispatch(
+        env,
+        "captions.apply_tag_edits",
+        {
+            "edits": [
+                {
+                    "start_s": 18.0,
+                    "end_s": 19.5,
+                    "tag": "mumbling",
+                    "reason": "no evidence event: unattributed murmur",
+                },
+            ]
+        },
+    )
+    report = _dispatch(env, "qa.run_caption_checks")
+    by_name = {c["name"]: c for c in report["checks"]}
+    assert by_name["no_tags_on_clean_speech"]["ok"] is False  # the first tag persists
+
+
 # ---------------------------------------------------------------- undo + save
 def test_undo_list_and_rollback_rebind(env):
     store, tl = env["store"], env["timeline"]
