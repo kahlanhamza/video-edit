@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import opentimelineio.schema as ot_schema
+from director_os.agent_runtime.editing_tools import ToolOperationError
 from director_os.agent_runtime.registry import ToolRegistry
 from director_os.otio_engine.timeline import MASTER_TRACK, track_by_name
 from pydantic import BaseModel, Field, model_validator
@@ -41,10 +42,6 @@ REG_TIMELINE: list[Any] = []
 
 TAG_WORDS = ("unaudible", "mumbling", "whispering", "cross-talk", "panicking")
 _WINDOW_MAX_S = 120.0  # context-protection clamp for window queries
-
-
-class ToolOperationError(RuntimeError):
-    """Semantic rejection: args parse but the operation is impossible."""
 
 
 def _work(work_dir: Path, name: str) -> Path:

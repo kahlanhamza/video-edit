@@ -73,6 +73,7 @@ ignore = ["SIM108", "B008"]
 "scripts/postfx_v3.py" = ["E501"]
 "scripts/caption_v4.py" = ["E501"]
 "tests/unit/test_inspection_tools.py" = ["E501"]
+"tests/unit/test_workshop_tools.py" = ["E501"]
 "scripts/tts_norm.py" = ["E501"]
 
 [tool.mypy]

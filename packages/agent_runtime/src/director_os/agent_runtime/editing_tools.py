@@ -15,12 +15,14 @@ Tools mutate the bound OpenTimelineIO timeline in place. Durability comes from
 from __future__ import annotations
 
 import copy
-from typing import Any
+from typing import Any, Literal
 
 import opentimelineio.opentime as ot_time
 import opentimelineio.schema as ot_schema
 from director_os.agent_runtime.registry import ToolRegistry
+from director_os.core.models import ZoomKeyframe
 from director_os.otio_engine.contract import (
+    FreezeCallout,
     NarratorClipMeta,
     RawClipMeta,
     attach,
@@ -474,6 +476,116 @@ class DirectorToolbox:
             ),
         }
 
+    # ------------------------------------------------------------ clip polish
+    def set_zoom_keyframes(self, item_index: int, keyframes: list[list[float]]) -> dict[str, Any]:
+        """Replace the punch-in zoom curve on a raw clip (pro polish).
+
+        Keyframes are [t_s, zoom_factor] pairs in CLIP-LOCAL seconds; the
+        compiler ramps zoom between them (1.0 = no zoom). Replaces any
+        existing curve — pass [] to clear. Subtle moves only: the documentary
+        range is 1.0-1.25; 3.0 is the hard contract ceiling.
+        """
+        clip = _master_clip(self.timeline, item_index)
+        meta = clip.metadata.get("director_os")
+        if not meta or meta.get("kind") != "raw":
+            raise ToolOperationError(f"clip {item_index} is not a raw clip")
+        dur = item_duration_s(clip)
+        clean: list[dict[str, float]] = []
+        for i, kf in enumerate(keyframes):
+            if len(kf) != 2:
+                raise ToolOperationError(f"keyframe {i} must be [t_s, zoom_factor]")
+            try:
+                model = ZoomKeyframe.model_validate({"t_s": kf[0], "zoom_factor": kf[1]})
+            except ValidationError as e:
+                raise ToolOperationError(f"invalid keyframe {kf}: {e}") from e
+            if model.t_s > dur + 1e-9:
+                raise ToolOperationError(
+                    f"keyframe {i} t_s {model.t_s}s outside clip 0..{dur:.2f}s"
+                )
+            clean.append({"t_s": round(model.t_s, 3), "zoom_factor": round(model.zoom_factor, 3)})
+        clean.sort(key=lambda k: k["t_s"])
+        meta["zoom_keyframes"] = clean
+        peak = max((k["zoom_factor"] for k in clean), default=1.0)
+        return {
+            "ok": True,
+            "detail": (
+                f"zoom curve on clip {item_index}: {len(clean)} keyframes, peak {peak:.2f}x"
+            ),
+        }
+
+    def set_freeze_callout(
+        self,
+        item_index: int,
+        at_local_s: float,
+        hold_s: float = 3.0,
+        dim_alpha: float = 0.45,
+        spotlight_bbox: list[int] | None = None,
+    ) -> dict[str, Any]:
+        """Freeze-frame evidence highlight on a raw clip (pro polish).
+
+        At `at_local_s` (clip-local seconds) the picture freezes for `hold_s`
+        while audio keeps running; dim_alpha darkens the background.
+        spotlight_bbox [x, y, w, h] (RAW canvas pixels) keeps one region
+        bright — e.g. a plate or a document. hold_s=0 clears the callout.
+        """
+        clip = _master_clip(self.timeline, item_index)
+        meta = clip.metadata.get("director_os")
+        if not meta or meta.get("kind") != "raw":
+            raise ToolOperationError(f"clip {item_index} is not a raw clip")
+        dur = item_duration_s(clip)
+        if hold_s == 0.0:
+            had = meta.get("freeze_callout") is not None
+            meta["freeze_callout"] = None
+            detail = (
+                f"freeze callout cleared on clip {item_index}"
+                if had
+                else f"clip {item_index} had no freeze callout"
+            )
+            return {"ok": True, "detail": detail}
+        if at_local_s >= dur:
+            raise ToolOperationError(f"at_local_s {at_local_s:.2f}s outside clip 0..{dur:.2f}s")
+        bbox: dict[str, int] | None = None
+        if spotlight_bbox is not None:
+            _validate_bbox(spotlight_bbox, self.w, self.h)
+            bbox = dict(zip(("x", "y", "w", "h"), spotlight_bbox, strict=True))
+        try:
+            model = FreezeCallout.model_validate(
+                {
+                    "freeze_at_s": at_local_s,
+                    "hold_s": hold_s,
+                    "dim_alpha": dim_alpha,
+                    "spotlight_bbox": bbox,
+                }
+            )
+        except ValidationError as e:
+            raise ToolOperationError(f"invalid freeze callout: {e}") from e
+        meta["freeze_callout"] = model.model_dump()
+        detail = (
+            f"freeze callout on clip {item_index} at {at_local_s:.2f}s "
+            f"hold {model.hold_s:.1f}s dim {model.dim_alpha:.2f}"
+        )
+        if bbox:
+            detail += f" spotlight {spotlight_bbox}"
+        return {"ok": True, "detail": detail}
+
+    def set_audio_mode(self, item_index: int, mode: str) -> dict[str, Any]:
+        """Set a raw clip's audio treatment (the metadata contract's modes).
+
+        loudnorm_48k = leveled broadcast speech; isolate_2bus = neural
+        speech-isolation mix (the enhanced 2-bus master WAV must exist at
+        compile time); silence = mute (b-roll under narration). Narration
+        clips are audio-silent by contract — their TTS rides the stem.
+        """
+        clip = _master_clip(self.timeline, item_index)
+        meta = clip.metadata.get("director_os")
+        if not meta or meta.get("kind") != "raw":
+            raise ToolOperationError(f"clip {item_index} is not a raw clip")
+        if mode not in ("loudnorm_48k", "isolate_2bus", "silence"):
+            raise ToolOperationError("mode must be loudnorm_48k | isolate_2bus | silence")
+        old = meta.get("audio_mode", "loudnorm_48k")
+        meta["audio_mode"] = mode
+        return {"ok": True, "detail": f"clip {item_index} audio_mode {old} -> {mode}"}
+
     # ------------------------------------------------------------ overlay cards
     def add_card(
         self,
@@ -666,6 +778,30 @@ def build_director_registry(toolbox: DirectorToolbox) -> ToolRegistry:
         _CardInput,
         lambda **kw: toolbox.add_card(**kw),
     )
+    reg.register(
+        "timeline.set_zoom",
+        "Replace a raw clip's punch-in zoom curve: [t_s, zoom_factor] pairs in "
+        "clip-local seconds (1.0 = none; documentary range 1.0-1.25). Pass [] "
+        "to clear.",
+        _ZoomInput,
+        lambda **kw: toolbox.set_zoom_keyframes(**kw),
+    )
+    reg.register(
+        "timeline.set_freeze_callout",
+        "Freeze-frame evidence highlight: freeze at a clip-local time for "
+        "hold_s with dim_alpha darkening; spotlight_bbox [x, y, w, h] keeps "
+        "one region bright (plate/document). hold_s=0 clears.",
+        _FreezeInput,
+        lambda **kw: toolbox.set_freeze_callout(**kw),
+    )
+    reg.register(
+        "timeline.set_audio_mode",
+        "Set a raw clip's audio treatment: loudnorm_48k (leveled speech), "
+        "isolate_2bus (neural speech isolation; needs the enhanced 2-bus WAV "
+        "at compile), silence (mute under narration).",
+        _AudioModeInput,
+        lambda **kw: toolbox.set_audio_mode(**kw),
+    )
     return reg
 
 
@@ -745,3 +881,21 @@ class _SwitchCameraInput(BaseModel):
     angle_offset_s: float = 0.0
     angle_drift_ppm: float = 0.0
     current_offset_s: float = 0.0
+
+
+class _ZoomInput(BaseModel):
+    item_index: int = Field(ge=0)
+    keyframes: list[list[float]] = Field(default_factory=list, max_length=8)
+
+
+class _FreezeInput(BaseModel):
+    item_index: int = Field(ge=0)
+    at_local_s: float = Field(ge=0.0)
+    hold_s: float = Field(default=3.0, ge=0.0, le=15.0)
+    dim_alpha: float = Field(default=0.45, ge=0.0, le=0.9)
+    spotlight_bbox: list[int] | None = None
+
+
+class _AudioModeInput(BaseModel):
+    item_index: int = Field(ge=0)
+    mode: Literal["loudnorm_48k", "isolate_2bus", "silence"]
