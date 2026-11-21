@@ -298,17 +298,18 @@ def register_workshop_tools(
         run_last_end = -1e9
         run_n = 0
         sentinel: dict[str, Any] | None = None
-        for c in [*plain, sentinel]:  # sentinel flushes the final run
-            tiled = c is not None and c["text"] == run_text and c["s"] - run_last_end <= 2.0
-            if tiled:
+        for cur in [*plain, sentinel]:  # sentinel flushes the final run
+            # inline condition (not a precomputed bool) so mypy keeps the
+            # None-narrowing for the branch body
+            if cur is not None and cur["text"] == run_text and cur["s"] - run_last_end <= 2.0:
                 run_n += 1
-                run_last_end = c["e"]
+                run_last_end = cur["e"]
                 continue
             if run_n >= LOOP_REPEAT_N:
                 loops.append(f"{(run_text or '')[:40]!r} x{run_n} tiled back-to-back")
-            run_text = c["text"] if c else None
+            run_text = cur["text"] if cur else None
             run_n = 1
-            run_last_end = c["e"] if c else -1e9
+            run_last_end = cur["e"] if cur else -1e9
         checks.append(
             {
                 "name": "no_loop_text",
