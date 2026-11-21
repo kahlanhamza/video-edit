@@ -262,6 +262,17 @@ def test_timeline_list_items(reg: ToolRegistry) -> None:
     assert clip["source_out_s"] == 6.25 and clip["start_s"] == 2.0
 
 
+def test_timeline_get_item(reg: ToolRegistry) -> None:
+    it.REG_TIMELINE.clear()
+    it.REG_TIMELINE.append(_make_timeline())
+    clip = reg.dispatch("timeline.get_item", {"item_index": 1})
+    assert clip["kind"] == "raw"
+    assert clip["meta"]["kind"] == "raw"
+    assert clip["meta"]["asset_id"] == "a0"
+    with pytest.raises(it.ToolOperationError):
+        reg.dispatch("timeline.get_item", {"item_index": 5})
+
+
 def test_timeline_unbound(reg: ToolRegistry) -> None:
     it.REG_TIMELINE.clear()
     with pytest.raises(it.ToolOperationError):

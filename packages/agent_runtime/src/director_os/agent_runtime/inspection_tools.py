@@ -158,6 +158,10 @@ class _Finish(BaseModel):
     summary: str = Field(min_length=4, max_length=4000)
 
 
+class _Index(BaseModel):
+    item_index: int = Field(ge=0)
+
+
 # ---------------------------------------------------------------- tools
 def register_inspection_tools(registry: ToolRegistry, work_dir: Path) -> None:
     """Register the read-only evidence surface for one project's artifacts."""
@@ -263,6 +267,22 @@ def register_inspection_tools(registry: ToolRegistry, work_dir: Path) -> None:
         }
 
     def timeline_list_items() -> dict[str, Any]:
+        items = _master_inventory()
+        return {
+            "n_items": len(items),
+            "items": items,
+            "total_s": items[-1]["start_s"] + items[-1]["dur_s"] if items else 0.0,
+        }
+
+    def timeline_get_item(item_index: int) -> dict[str, Any]:
+        items = _master_inventory()
+        if not 0 <= item_index < len(items):
+            raise ToolOperationError(
+                f"item_index {item_index} out of range (master has {len(items)} items)"
+            )
+        return items[item_index]
+
+    def _master_inventory() -> list[dict[str, Any]]:
         if not REG_TIMELINE:
             raise ToolOperationError("no working timeline bound")
         tl = REG_TIMELINE[0]
@@ -298,6 +318,7 @@ def register_inspection_tools(registry: ToolRegistry, work_dir: Path) -> None:
                         "source_in_s": src_in,
                         "source_out_s": src_out,
                         "script": text,
+                        "meta": raw,
                     }
                 )
             else:
@@ -305,7 +326,7 @@ def register_inspection_tools(registry: ToolRegistry, work_dir: Path) -> None:
                     {"index": i, "kind": "gap", "start_s": round(t, 3), "dur_s": round(dur, 3)}
                 )
             t += dur
-        return {"n_items": len(items), "items": items, "total_s": round(t, 3)}
+        return items
 
     def agent_finish(summary: str) -> dict[str, Any]:
         marker = work_dir / "agent_finish.json"
@@ -365,6 +386,13 @@ def register_inspection_tools(registry: ToolRegistry, work_dir: Path) -> None:
         "narration/gap, start, duration, source range, script text).",
         _Empty,
         lambda: timeline_list_items(),
+    )
+    registry.register(
+        "timeline.get_item",
+        "Full detail of ONE master-track item by index (source range, "
+        "narration script, blur regions, audio mode) — read before mutating.",
+        _Index,
+        lambda **kw: timeline_get_item(**kw),
     )
     registry.register(
         "agent.finish",
