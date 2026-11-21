@@ -195,7 +195,9 @@ def test_s_to_ts_format():
 
 
 # ------------------------------------------------------------------ gates
-def test_evidence_backed_tag_passes_all_gates(registry, workbench):
+def test_evidence_backed_tag_passes_all_gates(registry):
+    """The canonical five gates: color-vs-speaker, owner tag-only, no loop
+    tiling, gap coverage, no-tags-on-clean-speech (remote contract)."""
     registry.dispatch("captions.init_work_copy", {})
     registry.dispatch(
         "captions.apply_tag_edits",
@@ -205,7 +207,6 @@ def test_evidence_backed_tag_passes_all_gates(registry, workbench):
                     "start_s": 20.0,
                     "end_s": 24.0,
                     "tag": "unaudible",
-                    "kind": "event",
                     "reason": "speech_ratio 0.22, rms -42dB, repeat 4 = ASR loop",
                 }
             ]
@@ -215,15 +216,17 @@ def test_evidence_backed_tag_passes_all_gates(registry, workbench):
     assert report["green"], report
     names = {c["name"] for c in report["checks"]}
     assert {
+        "caption_color_vs_speaker",
+        "owner_windows_tag_only",
+        "no_loop_text",
         "speech_gap_coverage",
         "no_tags_on_clean_speech",
-        "owner_windows_tagged",
-        "work_copy_isolated",
-        "tag_reason_present",
     } <= names
 
 
 def test_tag_on_clean_speech_is_red(registry):
+    """A tag that REPLACED clean caption text trips the gate; a gap fill over
+    cueless speech is legal (the owner's gap-fill law)."""
     registry.dispatch("captions.init_work_copy", {})
     registry.dispatch(
         "captions.apply_tag_edits",
@@ -233,7 +236,6 @@ def test_tag_on_clean_speech_is_red(registry):
                     "start_s": 10.0,
                     "end_s": 12.5,
                     "tag": "unaudible",
-                    "kind": "event",
                     "reason": "wrong: clean speech",
                 }
             ]
@@ -245,9 +247,9 @@ def test_tag_on_clean_speech_is_red(registry):
     assert not report["green"]
 
 
-def test_gap_fill_inserts_only_residual(registry):
+def test_gap_fill_inserts_cue_for_uncaptioned_speech(registry):
     registry.dispatch("captions.init_work_copy", {})
-    # 20-24 s has NO cue: the tag inserts a gap-fill cue
+    # 20-24 s has NO cue: the edit inserts one tag cue covering the window
     registry.dispatch(
         "captions.apply_tag_edits",
         {
@@ -256,38 +258,28 @@ def test_gap_fill_inserts_only_residual(registry):
                     "start_s": 20.0,
                     "end_s": 24.0,
                     "tag": "unaudible",
-                    "kind": "gap_fill",
                     "reason": "speech with no caption",
                 }
             ]
         },
     )
-    work = (registry._tools["captions.list_work_cues"].fn)()
-    tags = [c for c in work["cues"] if c["style"] == "Tag"]
-    assert len(tags) == 1 and abs(tags[0]["start_s"] - 20.0) < 0.01
+    work = registry.dispatch("captions.list_work_cues", {"start_s": 19.0, "end_s": 25.0})
+    assert work["n_tag_cues"] == 1
+    tag_cue = next(c for c in work["cues"] if c["text"].startswith("*"))
+    assert tag_cue["s"] <= 20.0 + 1e-6 and tag_cue["e"] >= 24.0 - 1e-6
 
 
-def test_reinit_resets_edit_epoch(registry):
+def test_reinit_restores_shipped_captions(registry):
+    """Re-initializing re-copies the shipped source — the work copy is the only
+    truth, so a discarded pass cannot haunt the gates."""
     registry.dispatch("captions.init_work_copy", {})
     registry.dispatch(
         "captions.apply_tag_edits",
-        {
-            "edits": [
-                {
-                    "start_s": 20.0,
-                    "end_s": 24.0,
-                    "tag": "unaudible",
-                    "kind": "event",
-                    "reason": "first pass",
-                }
-            ]
-        },
+        {"edits": [{"start_s": 20.0, "end_s": 24.0, "tag": "unaudible", "reason": "first pass"}]},
     )
-    out = registry.dispatch("captions.init_work_copy", {})
-    assert "edit log reset" in out["detail"]
-    report = registry.dispatch("qa.run_caption_checks", {"owner_windows": []})
-    clean = next(c for c in report["checks"] if c["name"] == "no_tags_on_clean_speech")
-    assert clean["ok"]  # the discarded epoch's windows cannot haunt the gates
+    registry.dispatch("captions.init_work_copy", {})
+    work = registry.dispatch("captions.list_work_cues", {"start_s": 19.0, "end_s": 25.0})
+    assert work["n_tag_cues"] == 0
 
 
 # ------------------------------------------------------------------- critic

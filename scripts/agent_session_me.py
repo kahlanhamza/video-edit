@@ -69,13 +69,15 @@ class MeBackend:
     def __init__(self, round_no: int):
         self.round = round_no
         self.last_usage = {"tokens_in": 0, "tokens_out": 0}  # human brain: no tokens
-        self.llm_log: list[dict] = [{
-            "model": "operator (in-session reasoning)",
-            "role": "director",
-            "prompt_chars": 0,
-            "response_chars": 0,
-            "latency_s": 0.0,
-        }]
+        self.llm_log: list[dict] = [
+            {
+                "model": "operator (in-session reasoning)",
+                "role": "director",
+                "prompt_chars": 0,
+                "response_chars": 0,
+                "latency_s": 0.0,
+            }
+        ]
 
     def record_results(self, steps: list[ToolStep], results: list[str]) -> None:
         pass  # results are persisted by the runner
@@ -91,11 +93,13 @@ class MeBackend:
         steps = []
         for st in (data.get("steps") or [])[:8]:
             if isinstance(st, dict) and st.get("tool"):
-                steps.append(ToolStep(
-                    tool=str(st["tool"]),
-                    args=st.get("args") or {},
-                    checkpoint_note=str(st.get("why", ""))[:300],
-                ))
+                steps.append(
+                    ToolStep(
+                        tool=str(st["tool"]),
+                        args=st.get("args") or {},
+                        checkpoint_note=str(st.get("why", ""))[:300],
+                    )
+                )
         return steps
 
 
@@ -160,8 +164,10 @@ def run_round(round_no: int) -> int:
         "wall_s": round(time.monotonic() - t0, 2),
     }
     (RUN / f"round_state_{round_no}.json").write_text(json.dumps(state, indent=1))
-    print(f"round {round_no}: {[(s.tool, s.ok) for s in run.steps]} "
-          f"ok={run.ok} rollback={run.rolled_back_to} ({state['wall_s']}s)")
+    print(
+        f"round {round_no}: {[(s.tool, s.ok) for s in run.steps]} "
+        f"ok={run.ok} rollback={run.rolled_back_to} ({state['wall_s']}s)"
+    )
     return 0 if run.ok else 1
 
 
@@ -203,17 +209,26 @@ def report() -> int:
     }
     (RUN / "run_report.json").write_text(json.dumps(report, indent=1))
     OUT.mkdir(parents=True, exist_ok=True)
-    for f in ("run_report.json", "working.otio", "captions_work.ass",
-              "qa_caption_work.json", "caption_edits_applied.json",
-              "timeline_saved.otio", "caption_evidence.json", "vad_spans_cache.json"):
+    for f in (
+        "run_report.json",
+        "working.otio",
+        "captions_work.ass",
+        "qa_caption_work.json",
+        "caption_edits_applied.json",
+        "timeline_saved.otio",
+        "caption_evidence.json",
+        "vad_spans_cache.json",
+    ):
         src = RUN / f
         if src.exists():
             shutil.copyfile(src, OUT / f)
     sess = RUN / "session" / "session_state.json"
     if sess.exists():
         shutil.copyfile(sess, OUT / "session_state.json")
-    print(f"report: rounds={report['rounds']} steps={steps_ok}/{steps_total} "
-          f"critic={report['critic_verdict']} versions={report['durable_versions']}")
+    print(
+        f"report: rounds={report['rounds']} steps={steps_ok}/{steps_total} "
+        f"critic={report['critic_verdict']} versions={report['durable_versions']}"
+    )
     return 0 if report["critic_green"] else 1
 
 
