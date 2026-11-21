@@ -74,3 +74,27 @@ dry runs use `InMemoryYouTubePublisher` behind the same protocol.
 
 **Consequences:** no token-scope surprises in CI; publishing is auditable
 (`projects.youtube_draft_id`) and reversible before the human step.
+
+## ADR-0011 — No A2A, no MCP for the editing loop; typed in-process registry stays (2026-11-21)
+
+**Context:** the owner's research document proposed MCP (agent↔tool) and A2A
+(agent↔agent) as the plug standard. Primary-source verification this session
+(a2a-protocol.org "A2A and MCP" topic; the MCP Foundation-transfer post on
+blog.modelcontextprotocol.io, 2025-12-09; the Anthropic multi-agent post)
+shows: A2A is for cross-org/cross-framework agent-to-agent work ("horizontal"),
+MCP is for deepening ONE agent's tool reach ("vertical"). Anthropic's own
+multi-agent economics (~15× tokens, 90.2% win only on breadth-first research
+evals) do not pay off for sequential, interdependent cuts.
+
+**Decision:** keep the editor loop SINGLE-agent over the typed in-process
+35-tool registry. Adopt only the *patterns* the pro bridges proved:
+davinci-mcp's verified read-back receipts + honest-absence semantics
+("not established", never "passed"), 2-step consent for destructive ops
+(already: checkpoint-before-execute + undo + publish gate), craft rules as
+loadable knowledge (skill file), deterministic critic as a tool
+(`qa.self_audit`). Revisit MCP only when an external system (Resolve,
+Premiere) must be driven directly.
+
+**Consequences:** no protocol tax, no token explosion; the registry schema
+remains the single contract; an MCP facade over the same registry is a
+mechanical follow-up if ever needed.
