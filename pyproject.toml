@@ -72,6 +72,7 @@ ignore = ["SIM108", "B008"]
 # passed acceptance, so line-length is relaxed for these files only.
 "scripts/postfx_v3.py" = ["E501"]
 "scripts/caption_v4.py" = ["E501"]
+"tests/unit/test_inspection_tools.py" = ["E501"]
 "scripts/tts_norm.py" = ["E501"]
 
 [tool.mypy]
