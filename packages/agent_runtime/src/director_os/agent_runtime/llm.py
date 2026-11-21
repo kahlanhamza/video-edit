@@ -369,20 +369,24 @@ class GeminiRestBackend:
             if not call:
                 continue
             name = call.get("name", "")
-            if name in self.registry.names():
-                meta: dict[str, Any] = {}
-                if part.get("thoughtSignature"):
-                    meta["thoughtSignature"] = part["thoughtSignature"]
-                if call.get("id"):
-                    meta["call_id"] = call["id"]
-                steps.append(
-                    ToolStep(
-                        tool=name,
-                        args=call.get("args") or {},
-                        checkpoint_note=f"{self.provider}:{self.model} proposal",
-                        provider_meta=meta or None,
-                    )
+            # FAIL-CLOSED WITH FEEDBACK (Google "Secure AI Agents" law): a
+            # hallucinated tool name is NOT silently dropped — it becomes a
+            # step the registry rejects with the known-tool list, and the
+            # executor feeds that error back through record_results so the
+            # model learns the real toolbox in the next round.
+            meta: dict[str, Any] = {}
+            if part.get("thoughtSignature"):
+                meta["thoughtSignature"] = part["thoughtSignature"]
+            if call.get("id"):
+                meta["call_id"] = call["id"]
+            steps.append(
+                ToolStep(
+                    tool=name,
+                    args=call.get("args") or {},
+                    checkpoint_note=f"{self.provider}:{self.model} proposal",
+                    provider_meta=meta or None,
                 )
+            )
             if len(steps) >= MAX_STEPS_PER_PROPOSAL:
                 break
         return steps
@@ -620,13 +624,14 @@ class OpenAICompatBackend:
         elif msg.get("content"):
             self._history.append({"role": "assistant", "content": str(msg["content"])[:2000]})
         steps: list[ToolStep] = []
-        known = self.registry.names()
         for call in msg.get("tool_calls") or []:
             fn = call.get("function", {})
             # un-mangle the wire name back to the canonical dotted form
             name = str(fn.get("name", "")).replace("__", ".")
-            if name not in known:
+            if not name:
                 continue
+            # fail-closed with feedback: unknown names reach the registry and
+            # are rejected with the known-tool list (never silently dropped)
             try:
                 args = json.loads(fn.get("arguments") or "{}")
             except json.JSONDecodeError:

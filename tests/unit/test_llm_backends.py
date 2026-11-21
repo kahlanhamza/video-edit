@@ -84,6 +84,28 @@ GEMINI_OK = {
     "usageMetadata": {"promptTokenCount": 120, "candidatesTokenCount": 34},
 }
 
+# known-tool-only response: the planner feed / record_results / 401 tests
+# need a plan that EXECUTES (no hallucinated call aborts + rolls back)
+GEMINI_PLAIN = {
+    "candidates": [
+        {
+            "content": {
+                "parts": [
+                    {
+                        "thoughtSignature": "sig-opaque-abc123",
+                        "functionCall": {
+                            "id": "call_1",
+                            "name": "timeline.split_clip",
+                            "args": {"item_index": 0, "at_local_s": 1.5},
+                        },
+                    },
+                ]
+            }
+        }
+    ],
+    "usageMetadata": {"promptTokenCount": 120, "candidatesTokenCount": 34},
+}
+
 OPENAI_OK = {
     "choices": [
         {
@@ -125,13 +147,15 @@ def test_gemini_backend_parses_function_calls_and_usage():
     assert "parametersJsonSchema" in decls[0]
     assert "parameters" not in decls[0]
     assert seen["body"]["systemInstruction"]["parts"][0]["text"]
-    # unknown tool dropped; known one mapped with provider metadata
-    assert [s.tool for s in steps] == ["timeline.split_clip"]
+    # fail-closed WITH feedback: the hallucinated call is kept as a step
+    # (the registry rejects it with the known list; never silently dropped)
+    assert [s.tool for s in steps] == ["timeline.split_clip", "made_up_tool"]
     assert steps[0].args == {"item_index": 0, "at_local_s": 1.5}
     assert steps[0].provider_meta == {
         "thoughtSignature": "sig-opaque-abc123",
         "call_id": "call_1",
     }
+    assert steps[1].args == {}
     assert be.last_usage == {"tokens_in": 120, "tokens_out": 34}
 
 
@@ -193,7 +217,7 @@ def test_gemini_record_results_appends_function_response():
 
     def handler(request: httpx.Request) -> httpx.Response:
         bodies.append(json.loads(request.content.decode()))
-        return httpx.Response(200, json=GEMINI_OK)
+        return httpx.Response(200, json=GEMINI_PLAIN)
 
     be = GeminiRestBackend("k", "m", mini_registry(), transport=httpx.MockTransport(handler))
     steps = be.propose("state", "director")
@@ -228,7 +252,7 @@ def test_gemini_401_access_token_type_unsupported_falls_back_to_key_param():
                     }
                 },
             )
-        return httpx.Response(200, json=GEMINI_OK)
+        return httpx.Response(200, json=GEMINI_PLAIN)
 
     be = GeminiRestBackend("k-ai", "m", mini_registry(), transport=httpx.MockTransport(handler))
     steps = be.propose("s", "director")
@@ -247,7 +271,7 @@ def test_planner_executor_feeds_results_to_gemini_backend(tmp_path):
 
     def handler(request: httpx.Request) -> httpx.Response:
         bodies.append(json.loads(request.content.decode()))
-        return httpx.Response(200, json=GEMINI_OK)
+        return httpx.Response(200, json=GEMINI_PLAIN)
 
     from director_os.agent_runtime.checkpoint import CheckpointStore
     from director_os.core.db import init_models, make_engine, make_session_factory
@@ -293,10 +317,54 @@ def test_openai_compat_backend_parses_tool_calls():
         transport=httpx.MockTransport(handler),
     )
     steps = be.propose("state", "director")
-    assert [s.tool for s in steps] == ["timeline.split_clip"]
+    assert [s.tool for s in steps] == ["timeline.split_clip", "made_up_tool"]
     assert steps[0].args["at_local_s"] == 1.5
     assert steps[0].provider_meta is None
     assert be.last_usage == {"tokens_in": 90, "tokens_out": 21}
+
+
+def test_unknown_tool_fails_closed_with_feedback(tmp_path):
+    """Google 'Secure AI Agents' law: an unknown tool is NEVER silently
+    dropped — the registry rejects it with the known-tool list, the plan
+    rolls back, and the error feeds back through record_results so the next
+    proposal learns the real toolbox."""
+
+    bodies: list[dict] = []
+    hallucinated = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {"functionCall": {"name": "timeline.explode_clip", "args": {}}},
+                    ]
+                }
+            }
+        ]
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content.decode()))
+        return httpx.Response(200, json=hallucinated)
+
+    from director_os.agent_runtime.checkpoint import CheckpointStore
+    from director_os.core.db import init_models, make_engine, make_session_factory
+
+    be = GeminiRestBackend("k", "m", mini_registry(), transport=httpx.MockTransport(handler))
+    engine = make_engine(f"sqlite:///{tmp_path}/fail.db")
+    init_models(engine)
+    store = CheckpointStore(make_session_factory(engine))
+    executor = PlannerExecutor(mini_registry(), store, "p-fail")
+    run = executor.run(be, __import__("opentimelineio").schema.Timeline(name="t"))
+
+    assert run.ok is False
+    assert run.rolled_back_to is not None
+    assert "unknown tool" in run.steps[0].detail
+    assert "known:" in run.steps[0].detail
+    # the next propose replays the error into the conversation (feedback loop)
+    be.record_results(run.steps, [run.steps[0].detail])
+    be.propose("state two", "director")
+    fr = bodies[1]["contents"][2]["parts"][0]["functionResponse"]
+    assert "unknown tool" in fr["response"]["result"]
 
 
 def test_backend_raises_on_http_error():
