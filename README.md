@@ -116,6 +116,15 @@ Protocol decision (ADR-0011): no MCP, no A2A for the editing loop — the
 typed in-process registry IS the contract; A2A is horizontal cross-org
 plumbing, MCP is worth revisiting only when an external NLE must be driven.
 
+Research provenance lives in the repo so no session re-derives it:
+`docs/research/agent-research-dossier.md` (every load-bearing claim from the
+owner's research doc re-verified against primary sources — Anthropic
+engineering posts, a2a-protocol.org, the MCP→AAIF transfer, EditDuet
+arXiv:2509.10761, OWASP, Google/OpenAI agent-security guidance — with the
+corrections recorded) and `docs/research/skills-mining.md` (the owner's
+128-link skill inventory preserved and fit-filtered: adopted / mine /
+already-built / watch / out-of-scope).
+
 Agent evals (`scripts/agent_evals.py`, 6 hermetic scenarios) score every
 agent version on the same test set — evidence-before-action, fail-closed
 feedback, the tag law both ways, critic damage detection, memory resume,
