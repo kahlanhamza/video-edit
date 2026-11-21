@@ -29,7 +29,7 @@ Director Studio (Next.js 16, M3)  →  FastAPI gateway + Celery/Redis orchestrat
 | `packages/audio_engine` | FFmpeg audio chains (48 kHz lock, exact slicing, ducking, speech-aware trims) |
 | `packages/subtitles` | difflib word alignment, 2-row speaker-colored `.ass` builder |
 | `packages/vision_fx` | Glass graphic cards, blur/redaction filter chains |
-| `packages/agent_runtime` | Typed tool registry (native function-calling engine): 15 timeline mutations + 9 evidence reads + 7 workshop actions — the AI editor's full 31-tool surface |
+| `packages/agent_runtime` | Typed tool registry (native function-calling engine): 15 timeline mutations + 9 evidence reads + 7 workshop actions + 3 session-memory + 1 deterministic critic — the AI editor's full 35-tool surface |
 | `packages/perception`, `packages/skills` | M2/M4 — perception index + niche playbooks |
 | `apps/api`, `apps/worker` | FastAPI gateway + Celery workers |
 | `apps/cli` | `director` command line entrypoint |
@@ -72,7 +72,7 @@ Every R&D bug is a CI test — see `tests/unit/test_g1..g8`:
 
 ## The AI editor agent — a working pro, not a script
 
-The agent runtime gives one LLM loop a **complete editor's toolbox** (31 typed,
+The agent runtime gives one LLM loop a **complete editor's toolbox** (35 typed,
 Pydantic-validated tools) plus the craft rules of the niche skill, and lets it
 act on its own:
 
@@ -87,30 +87,52 @@ act on its own:
   `set_audio_mode` loudnorm/isolate-2bus/silence), cards.
 - **Act on the deliverable (7)** — the caption workbench:
   `captions.init_work_copy` → `apply_tag_edits` (gray-italic tags, gap-fill)
-  → `list_work_cues` → `qa.run_caption_checks` (color-vs-speaker,
-  owner-window tag law, loop-text, VAD gap coverage) → `undo.list_checkpoints`
-  / `undo.rollback` (durable, plan-terminal) → `timeline.save` (.otio for
-  compile).
+  → `list_work_cues` → `qa.run_caption_checks` (5 caption-truth gates:
+  color-vs-speaker, owner-window tag law, loop-text, VAD gap coverage,
+  no-tags-on-clean-speech) → `undo.list_checkpoints` / `undo.rollback`
+  (durable, plan-terminal) → `timeline.save` (.otio for compile).
+- **Remember (3)** — `session.plan` / `session.notes` / `session.status`:
+  progress files ARE the memory (Anthropic long-running-harness pattern);
+  a killed sandbox session resumes in ONE orientation call.
+- **Answer to the critic (1)** — `qa.self_audit`: structural integrity, zoom
+  subtle-law, plan invariants, the session's own QA verdict, the master's
+  gates. Honest-absence semantics (adapted from davinci-mcp): a check that
+  never ran reports `not established`, never `passed`.
 
 Laws that make it safe to run unsupervised: every mutating step is
-checkpointed BEFORE execution and auto-rolled-back on failure; workbench edits
-land in a session workspace (shipped artifacts are never touched in place);
-the agent must run its own QA gates before recommending a re-burn; and the
-skill playbook (`packages/skills/bodycam_documentary.md` v0.4 "agent craft"
-section) binds the decision table — evidence before action, measured numbers
-in every `why`, subtle polish, ship = save.
+checkpointed BEFORE execution and auto-rolled-back on failure; hallucinated
+tool names fail closed WITH feedback (the registry rejects with the
+known-tool list and the error replays into the conversation — never
+silently dropped); workbench edits land in a session workspace (shipped
+artifacts are never touched in place); the session cannot end without a
+`qa.self_audit` verdict; and the skill playbook
+(`packages/skills/bodycam_documentary.md` v0.5) binds the decision table —
+evidence before action, caption-truth decision table, industry-verified
+craft constants (Netflix caption laws, measured silence-cut thresholds,
+punch-in law, provenance lawbook), verify-your-own-edit, undo discipline,
+session memory, ship = save.
 
-Live proof: `agent_session_v1/v2` run the real PlannerExecutor loop with
-native Gemini function calling on a working copy of the accepted Eustis cut —
-evidence reads, caption-truth tag edits with self-QA, measured polish moves,
-checkpointed timeline saves (see STATUS.md session log).
+Protocol decision (ADR-0011): no MCP, no A2A for the editing loop — the
+typed in-process registry IS the contract; A2A is horizontal cross-org
+plumbing, MCP is worth revisiting only when an external NLE must be driven.
+
+Agent evals (`scripts/agent_evals.py`, 6 hermetic scenarios) score every
+agent version on the same test set — evidence-before-action, fail-closed
+feedback, the tag law both ways, critic damage detection, memory resume,
+undo discipline. The harness found a real gate gap on its first run (the
+5th caption gate), which is the tool-evaluation loop working as intended.
+
+Live proof: `agent_session_v1/v2/v3` run the real PlannerExecutor loop —
+v3 with native Gemini function calling on a working copy of the accepted
+Eustis cut: memory reads + evidence reads in one 6-call round, quota-429
+degradation handled, critic floor GREEN (see STATUS.md session log).
 
 ## Status
 
 | Milestone | Scope | State |
 | --- | --- | --- |
 | M1 | Modular core engine + OTIO + segment caching | **closed** — 1080p demo (42s, 48kHz stereo), parallel segment fleet, ffprobe-validated cache (zero-change re-render: 4/4 hits, 0.1s) |
-| M2 | Native agentic tool runtime + durable orchestration | **core landed** — 31 typed tools (cut/trim/split/move/narrate/blur/cards/multi-cam zoom·freeze·audio-mode mutations, evidence reads, caption-workbench actions with self-QA + undo + save), checkpoint/rollback store, planner-executor with auto-rollback, durable 5-stage pipeline (crash resume, ASR never re-run), Gladia ASR, shot boundaries + audio events, edge-tts `generate_tts`, SKILL.md prompt injection, SSE job progress, YouTube Private-Draft publisher + Human Review Gate |
+| M2 | Native agentic tool runtime + durable orchestration | **core landed** — 35 typed tools (cut/trim/split/move/narrate/blur/cards/multi-cam zoom·freeze·audio-mode mutations, evidence reads, caption-workbench actions with 5 self-QA gates + undo + save, session memory, deterministic critic), checkpoint/rollback store, planner-executor with auto-rollback + fail-closed tool feedback, durable 5-stage pipeline (crash resume, ASR never re-run), Gladia ASR, shot boundaries + audio events, edge-tts `generate_tts`, SKILL.md prompt injection, SSE job progress, YouTube Private-Draft publisher + Human Review Gate |
 | M3 | Director Studio Next.js UI | **closed + acceptance-verified** — cases, live SSE pipeline progress, timeline versions, checkpoint-first dispatch with rollback, **proxy scrub player (480p) + mouse-drawn blur canvas + editable subtitle grid**, Human Review Gate publish (Next.js 15, `apps/web`). M3 acceptance was executed live in a real browser: a blur box drawn over the frame corner survived to the next render (cache-invalidation A/B + pixel proof) and an edited cue re-aligned via difflib without drift (see `docs/m3_acceptance/` evidence) |
 | M4 | Multimodal vision + Modal serverless GPU | **4-job vision stack landed, real-footage proven** — (1) CPU: YuNet face sweep + frame-quality pre-filter (dark/blur scoring); (2) VLM: 2-tier Gemini (`gemini-3.5-flash-lite` contact-sheet indexing / `gemini-3.8-flash` Frames-on-Demand QA) with **Modal-egress fallback for geo-blocked regions** (auto-retry, transient-503 backoff); (3) GPU fleet: `deploy/modal/redact_gpu.py` — YOLOv8-face + license-plate + ByteTrack persistent IDs → time-binned tracked `BlurRegion`s (modal free tier needs a payment method for T4; CPU-mode works today), YuNet fallback when fleet down; (4) AXON overlay OCR → intro card auto-population. Renderer: `enable='between(t,..)'` time-windowed blur (per-segment source→local translation) — pixel-verified on real footage (var 2.6 blurred vs 295.5 sharp). Full e2e on real Eustis FL bodycam: auto face blur + burned ASR subtitles delivered |
 | M5 | Cloud deployment + multi-channel hardening | **scaffolding landed** — compose healthchecks/restart policies, cost dashboard endpoint (durations + tokens), multi-channel publish fan-out with honest `not_configured` states, `.env.example`, **kill-mid-encode crash-recovery drill executable** |
