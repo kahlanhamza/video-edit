@@ -25,6 +25,7 @@ import asyncio
 import base64
 import re as _re
 import subprocess
+import sys as _sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -41,6 +42,29 @@ DEFAULT_VOICE = "en-US-GuyNeural"
 # TTS_RATE env ("+0%" .. "+30%"); the rate rides the TTS cache key so a
 # change re-synthesizes exactly the affected clips.
 DEFAULT_TTS_RATE = "+14%"
+# TTS front-end normalization law (owner directive 2026-11-21): the voice
+# must SPEAK what a human narrator would say for ANY content. The editor AI
+# agent (scripts/tts_norm.py, LLM-driven, validator-guarded, cached) rewrites
+# the line before synthesis; when the agent is unreachable the raw line is
+# spoken as written — normalization upgrades the voice, it never blocks it.
+TTS_NORMALIZE = __import__("os").getenv("TTS_NORMALIZE", "1") == "1"
+
+
+def agent_normalize(text: str) -> str:
+    """Speak-form rewrite via the editor AI agent (fail-open)."""
+    if not TTS_NORMALIZE or not text or not text.strip():
+        return text
+    try:
+        scripts_dir = Path(__import__("os").getenv(
+            "DIRECTOR_SCRIPTS_DIR", "/home/z/my-project/scripts"
+        ))
+        if str(scripts_dir) not in _sys.path:
+            _sys.path.insert(0, str(scripts_dir))
+        from tts_norm import normalize as _norm
+
+        return _norm(text)
+    except Exception:  # noqa: BLE001
+        return text
 
 
 def resolve_tts_rate(rate: str | None = None) -> str:
@@ -308,6 +332,7 @@ def generate_tts_cached(
     text = text.strip()
     if not text:
         raise TtsError("refusing to synthesize empty narration text")
+    text = agent_normalize(text)  # spoken form is the cache identity
     backend = backend or build_tts_backend()
     provider = str(getattr(backend, "provider", "unknown"))
     model_id = str(getattr(backend, "model_id", ""))
