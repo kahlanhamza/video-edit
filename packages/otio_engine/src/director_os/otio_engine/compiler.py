@@ -8,6 +8,7 @@ for the cache.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,6 +44,19 @@ from director_os.vision_fx.spotlight import render_spotlight_overlay
 
 class TimelineCompileError(RuntimeError):
     pass
+
+
+def render_duration_s(dur_s: float, fps: float | int) -> float:
+    """Frame-truth duration: what ffmpeg actually produces for a slice.
+
+    ffmpeg emits frames while PTS < end, so a 7.9845 s slice @30 fps renders
+    ceil(239.535) = 240 frames = 8.000 s. Expectations (cache admission,
+    QA drift, DAG total) must ride the SAME quantization or a long concat
+    accumulates half-frame rounding into multi-second drift (caught live on
+    the 2627 s Eustis master: 4.92 s over 329 segments). Source slices stay
+    exact — only the expectation is quantized to the render grid.
+    """
+    return math.ceil(round(dur_s * fps, 6)) / float(fps)
 
 
 @dataclass
@@ -265,7 +279,7 @@ def compile_timeline(
                 spec=spec,
                 src_path=str(src) if src else None,
                 out_path=cache.path_for(key),
-                dur_s=dur,
+                dur_s=render_duration_s(dur, video.fps),
             )
         )
         t_master += dur

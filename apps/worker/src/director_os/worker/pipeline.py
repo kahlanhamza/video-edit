@@ -2094,9 +2094,12 @@ def run_pipeline(
                 deps.log(f"  [post-fx] FAILED ({e}) — QA audits the un-post-fx'd master")
 
         _update_job(deps.sessions(), job_id, JobStage.qa, 90.0)
+        # expected duration = the DAG's frame-quantized total (what ffmpeg truly
+        # renders), NOT the raw OTIO sum — unquantized sums accumulate per-segment
+        # frame rounding and fail QA on long cuts (live: 4.92 s over 329 segments)
         audit = stage_qa(
             final_for_qa,
-            dag_total_dur(timeline),
+            report.total_dur_s,
             job_id,
             project_id,
             deps,
