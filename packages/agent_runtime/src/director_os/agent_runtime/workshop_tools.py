@@ -340,13 +340,25 @@ def register_workshop_tools(
             }
         )
 
-        # 5. a tag over CLEAN speech is a violation too (skill v0.5 law):
-        # tagging evidence-backed clean dialogue mutes real words. A tag cue
-        # fully inside a clean event (has_words, speech_ratio >= 0.5, rms >
-        # -35 dB, repeat_n < 3) means the agent over-tagged.
+        # 5. a tag over CLEAN speech is a violation too (skill v0.5 law) —
+        # but ONLY when the tag REPLACED real caption text. A gap-fill tag
+        # (the source captions had NO cue there) is legal by the owner's gap
+        # law regardless of event stats: without ASR words there is nothing
+        # to caption, so VAD speech gets the gray tag even on "clean" audio.
+        # The replacement test reads the SHIPPED source captions, so a tag
+        # the v4 pipeline gap-filled never trips this gate.
+        source_cues = _parse_cues(source_ass) if source_ass.exists() else []
         clean_viol: list[str] = []
         for c in cues:
             if not _is_tag(c["text"]):
+                continue
+            span = max(c["e"] - c["s"], 1e-6)
+            replaced_text = any(
+                not _is_tag(sc["text"])
+                and min(c["e"], sc["e"]) - max(c["s"], sc["s"]) >= 0.5 * span
+                for sc in source_cues
+            )
+            if not replaced_text:
                 continue
             for ev in evidence:
                 if float(ev["e"]) - float(ev["s"]) < 0.3:
@@ -359,7 +371,7 @@ def register_workshop_tools(
                 )
                 if clean and c["s"] >= ev["s"] - 0.05 and c["e"] <= ev["e"] + 0.05:
                     clean_viol.append(
-                        f"[{c['s']:.1f}-{c['e']:.1f}]s tag over CLEAN speech "
+                        f"[{c['s']:.1f}-{c['e']:.1f}]s tag REPLACED text over CLEAN speech "
                         f"{ev['s']:.1f}-{ev['e']:.1f}s (ratio {ev.get('speech_ratio')})"
                     )
         checks.append(
