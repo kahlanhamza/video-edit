@@ -359,3 +359,27 @@ def test_ass_ts_formatting():
     assert _ass_ts(609.4) == "0:10:09.40"
     assert _ass_ts(0) == "0:00:00.00"
     assert _ass_ts(3723.126) == "1:02:03.13"  # centisecond rounding, ASS-style
+
+
+def test_color_check_skips_boundary_straddles(env):
+    """Agent session v2 regression: diarization spans overlap neighboring
+    cues at boundaries (a 16 s Narrator span, 0.2 s boundary artifacts).
+    Only cues FULLY inside one event may be judged — straddles are skipped."""
+    _dispatch(env, "captions.init_work_copy")
+    evidence = json.loads((env["v3"] / "caption_evidence.json").read_text())
+    evidence.append(
+        {
+            "id": 3,
+            "role": "Narrator",
+            "has_words": True,
+            "s": 12.8,
+            "e": 29.1,
+            "text": "long narrator span",
+            "speech_ratio": 0.9,
+            "rms_db": -19.0,
+        }
+    )
+    (env["v3"] / "caption_evidence.json").write_text(json.dumps(evidence))
+    report = _dispatch(env, "qa.run_caption_checks")
+    by_name = {c["name"]: c for c in report["checks"]}
+    assert by_name["caption_color_vs_speaker"]["ok"] is True, by_name["detail"]

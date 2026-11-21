@@ -330,7 +330,9 @@ def register_inspection_tools(registry: ToolRegistry, work_dir: Path) -> None:
         marker.write_text(
             json.dumps({"summary": summary.strip(), "finished_at": time.time()}, indent=1)
         )
-        return {"detail": f"session complete — {summary.strip()[:140]}"}
+        # the FULL summary rides the tool result — the audit log is the only
+        # record some sessions leave (140 chars cut a real session's report)
+        return {"detail": f"session complete — {summary.strip()[:1000]}"}
 
     registry.register(
         "project.describe",
