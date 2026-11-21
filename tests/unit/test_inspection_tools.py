@@ -8,6 +8,7 @@ fixtures written into a tmp work dir, and the VAD compute path is monkeypatched
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import opentimelineio.opentime as ot_time
@@ -191,7 +192,11 @@ def test_speech_spans_compute_path(reg: ToolRegistry, work: Path, monkeypatch) -
     assert len(calls) == 1
 
 
-def test_speech_spans_no_engine_no_cache(reg: ToolRegistry) -> None:
+def test_speech_spans_no_engine_no_cache(reg: ToolRegistry, monkeypatch) -> None:
+    # simulate "no VAD engine" INDEPENDENT of the venv: the compute path
+    # imports the sandbox vad_evidence module; a None sys.modules entry makes
+    # that import raise regardless of whether webrtcvad is installed.
+    monkeypatch.setitem(sys.modules, "vad_evidence", None)
     with pytest.raises(it.ToolOperationError):
         reg.dispatch("audio.speech_spans", {"start_s": 0.0, "end_s": 5.0})
 

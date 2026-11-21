@@ -131,10 +131,14 @@ feedback, the tag law both ways, critic damage detection, memory resume,
 undo discipline. The harness found a real gate gap on its first run (the
 5th caption gate), which is the tool-evaluation loop working as intended.
 
-Live proof: `agent_session_v1/v2/v3` run the real PlannerExecutor loop —
-v3 with native Gemini function calling on a working copy of the accepted
-Eustis cut: memory reads + evidence reads in one 6-call round, quota-429
-degradation handled, critic floor GREEN (see STATUS.md session log).
+Live proof: `agent_session_v1/v2/v3/v4` run the real PlannerExecutor loop on
+a working copy of the accepted Eustis cut. v4 is the rate-limit-proof
+session: probe chain (Gemini primary → fallbacks → CLI bridge), mid-run 429
+rotation with history reset, consecutive-failure stop rule that never kills
+a fail→fix pair. Eight live runs completed the full workbench protocol —
+evidence reads, evidence-backed tag edits, all five caption gates, critic
+GREEN, session memory, timeline.save — across model rotations and capacity
+exhaustion (see STATUS.md session log).
 
 ## Status
 

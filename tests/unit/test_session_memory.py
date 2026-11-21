@@ -66,7 +66,7 @@ def test_notes_append_read_and_cap(work: Path) -> None:
     reg = _registry(work)
     for i in range(45):
         reg.dispatch("session.notes", {"action": "append", "text": f"note {i}"})
-    read = reg.dispatch("session.notes", {"action": "read"})
+    read = reg.dispatch("session.notes", {"action": "read", "text": ""})
     assert len(read["notes"]) == 10  # read returns the last 10
     st = json.loads((work / "session_state.json").read_text())
     assert len(st["notes"]) == 40  # cap keeps the most recent 40

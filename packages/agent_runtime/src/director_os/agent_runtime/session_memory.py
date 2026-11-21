@@ -76,7 +76,11 @@ class _PlanSet(BaseModel):
 
 class _Note(BaseModel):
     action: Literal["append", "read"] = "append"
-    text: str = Field(default="", max_length=MAX_NOTE_LEN)
+    text: str = Field(
+        max_length=MAX_NOTE_LEN,
+        description="REQUIRED for action=append: the note body (non-empty). "
+        "Ignored for action=read — pass an empty string.",
+    )
 
 
 # ---------------------------------------------------------------- tools
@@ -174,9 +178,9 @@ def register_session_memory_tools(registry: ToolRegistry, work_dir: Path) -> Non
     registry.register(
         "session.notes",
         "Append a timestamped note (facts learned from evidence, decisions "
-        "made, blockers hit) or read the last notes. Notes ARE the memory "
-        "between sessions — record anything the next session must not "
-        "re-derive.",
+        "made, blockers hit) or read the last notes. text is REQUIRED and "
+        "non-empty when appending. Notes ARE the memory between sessions — "
+        "record anything the next session must not re-derive.",
         _Note,
         lambda **kw: session_notes(**kw),
     )
