@@ -74,16 +74,16 @@ SHIP_PACK = Path("/home/z/my-project/download/eustis_acceptance_ship_pack")
 SHIPPED_FINAL = SHIP_PACK / "final_720p.mp4"
 
 FPS = 30
-BLUR_CHUNK_FRAMES = 3600          # 120 s per pass-2 chunk
-SWEEP_SAMPLE_S = 0.25             # pass-2 detection cadence
+BLUR_CHUNK_FRAMES = 3600  # 120 s per pass-2 chunk
+SWEEP_SAMPLE_S = 0.25  # pass-2 detection cadence
 SWEEP_CONF = 0.15
 SWEEP_IMGSZ = 960
-SWEEP_SEG_S = 120.0               # sweep segment length (resumable)
-MIN_HITS = 2                      # real detections required to keep a track
-LEAD_FRAMES = 8                   # 0.27 s lead-in/out per window
-BRIDGE_STRIDE_FRAMES = 8          # round(30 * 0.25)
+SWEEP_SEG_S = 120.0  # sweep segment length (resumable)
+MIN_HITS = 2  # real detections required to keep a track
+LEAD_FRAMES = 8  # 0.27 s lead-in/out per window
+BRIDGE_STRIDE_FRAMES = 8  # round(30 * 0.25)
 
-BURN_CHUNK_S = 80.0               # flash-fix burn chunks (sized for the sandbox 10-min process window)
+BURN_CHUNK_S = 80.0  # flash-fix burn chunks (sized for the sandbox process window)
 REDACT_FACES = os.environ.get("REDACT_FACES", "1") == "1"
 
 CAPTION_FONTSIZE = 40
@@ -119,18 +119,39 @@ def _sh(cmd: list[str], what: str) -> None:
 
 
 def probe_dur(path: Path) -> float:
-    return float(subprocess.check_output([
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", str(path),
-    ]).decode().strip())
+    return float(
+        subprocess.check_output(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ]
+        )
+        .decode()
+        .strip()
+    )
 
 
 def probe_vstream(path: Path):
-    out = subprocess.check_output([
-        "ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,avg_frame_rate,nb_frames",
-        "-of", "json", str(path),
-    ]).decode()
+    out = subprocess.check_output(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,avg_frame_rate,nb_frames",
+            "-of",
+            "json",
+            str(path),
+        ]
+    ).decode()
     st = json.loads(out)["streams"][0]
     num, den = st["avg_frame_rate"].split("/")
     fps = float(num) / float(den) if float(den) else FPS
@@ -150,18 +171,51 @@ def phase_copy_src() -> None:
         raise SystemExit("no pass-1 blur chunks found")
     lst = V3 / "base_chunks.txt"
     lst.write_text("".join(f"file '{c}'\n" for c in chunks))
-    _sh(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(lst),
-         "-c", "copy", "-an", str(base)], "base concat")
+    _sh(
+        [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(lst),
+            "-c",
+            "copy",
+            "-an",
+            str(base),
+        ],
+        "base concat",
+    )
     # audio: the shipped final's audio track is the accepted 2-bus mix — reuse
     # it bit-exactly (AAC stream copy; no re-encode, zero audio risk)
     aud = V3 / "audio_src.m4a"
     if not aud.exists():
-        _sh(["ffmpeg", "-y", "-v", "error", "-i", str(SHIPPED_FINAL),
-             "-map", "0:a:0", "-c:a", "copy", str(aud)], "audio extract")
+        _sh(
+            [
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-i",
+                str(SHIPPED_FINAL),
+                "-map",
+                "0:a:0",
+                "-c:a",
+                "copy",
+                str(aud),
+            ],
+            "audio extract",
+        )
     w, h, fps, nfr = probe_vstream(base)
     (V3 / "copy_src.done").write_text(f"{w}x{h}@{fps:.2f} n={nfr}")
-    log(f"base_v3: {w}x{h} {fps:.2f}fps {probe_dur(base):.2f}s "
-        f"({len(chunks)} chunks) + audio {probe_dur(aud):.2f}s")
+    log(
+        f"base_v3: {w}x{h} {fps:.2f}fps {probe_dur(base):.2f}s "
+        f"({len(chunks)} chunks) + audio {probe_dur(aud):.2f}s"
+    )
 
 
 def _base() -> Path:
@@ -183,11 +237,24 @@ def _yolo_detector():
 
 def _decode_segment(video: Path, t0: float, t1: float):
     """ffmpeg rawvideo pipe -> (frame_idx, bgr) for [t0, t1)."""
-    import cv2
 
     w, h, _fps, _n = probe_vstream(video)
-    cmd = ["ffmpeg", "-v", "error", "-ss", f"{t0:.3f}", "-t", f"{t1 - t0:.3f}",
-           "-i", str(video), "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+    cmd = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-ss",
+        f"{t0:.3f}",
+        "-t",
+        f"{t1 - t0:.3f}",
+        "-i",
+        str(video),
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-",
+    ]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     f0 = int(round(t0 * FPS))
     idx = f0
@@ -215,8 +282,10 @@ def phase_sweep2_seg(ci: int) -> None:
     t1 = min(dur, t0 + SWEEP_SEG_S)
     if t0 >= dur:
         raise SystemExit(f"segment {ci} beyond video end ({dur:.1f}s)")
-    log(f"sweep2 seg {ci}: decoding [{t0:.0f}s -> {t1:.0f}s] (expect "
-        f"{int((t1 - t0) / SWEEP_SAMPLE_S)} samples)")
+    log(
+        f"sweep2 seg {ci}: decoding [{t0:.0f}s -> {t1:.0f}s] (expect "
+        f"{int((t1 - t0) / SWEEP_SAMPLE_S)} samples)"
+    )
     det = _yolo_detector()
     frame_stride = max(1, int(round(FPS * SWEEP_SAMPLE_S)))
     prev_gray = prev_pts = None
@@ -239,8 +308,9 @@ def phase_sweep2_seg(ci: int) -> None:
                 motions.append((0.0, 0.0))
         else:
             motions.append((0.0, 0.0))
-        pts = cv2.goodFeaturesToTrack(gray, maxCorners=200, qualityLevel=0.01,
-                                      minDistance=8, blockSize=7)
+        pts = cv2.goodFeaturesToTrack(
+            gray, maxCorners=200, qualityLevel=0.01, minDistance=8, blockSize=7
+        )
         prev_gray, prev_pts = gray, pts
         hits = det.detect(frame)
         flipped = cv2.flip(frame, 1)
@@ -252,8 +322,10 @@ def phase_sweep2_seg(ci: int) -> None:
         ts.append(round(idx / FPS, 3))
         n_samples += 1
         if n_samples % 80 == 0:
-            log(f"  seg {ci}: {n_samples} samples @ {idx / FPS:.0f}s "
-                f"({_time.time() - _t0:.0f}s elapsed)")
+            log(
+                f"  seg {ci}: {n_samples} samples @ {idx / FPS:.0f}s "
+                f"({_time.time() - _t0:.0f}s elapsed)"
+            )
     out.write_text(json.dumps({"dets": dets, "ts": ts, "motions": motions}))
     n = sum(len(d) for d in dets)
     log(f"sweep2 seg {ci}: {len(dets)} samples, {n} raw hits")
@@ -290,7 +362,11 @@ def phase_sweep2_done() -> None:
         tt.append(t)
         mm.append(tuple(m))
     tracks = track_and_interpolate(
-        dd, tt, gmc_vectors=mm, track_buffer=60, min_hits=MIN_HITS,
+        dd,
+        tt,
+        gmc_vectors=mm,
+        track_buffer=60,
+        min_hits=MIN_HITS,
     )
     keep = []
     for t in tracks:
@@ -300,10 +376,15 @@ def phase_sweep2_done() -> None:
             continue
         keep.append(t)
     out.write_text(json.dumps([t.model_dump(mode="json") for t in keep]))
-    spans = sorted((h["hits"][0]["t_s"], h["hits"][-1]["t_s"])
-                   for h in (t.model_dump(mode="json") for t in keep) if h["hits"])
-    log(f"sweep2: {len(keep)} tracks (min_hits={MIN_HITS}); "
-        f"first spans {[(round(a,1), round(b,1)) for a,b in spans[:6]]}")
+    spans = sorted(
+        (h["hits"][0]["t_s"], h["hits"][-1]["t_s"])
+        for h in (t.model_dump(mode="json") for t in keep)
+        if h["hits"]
+    )
+    log(
+        f"sweep2: {len(keep)} tracks (min_hits={MIN_HITS}); "
+        f"first spans {[(round(a, 1), round(b, 1)) for a, b in spans[:6]]}"
+    )
 
 
 # --------------------------------------------------------------------- plan2
@@ -316,11 +397,17 @@ def phase_plan2() -> None:
     w, h, fps, nfr = probe_vstream(video)
     if nfr <= 0:
         nfr = int(round(probe_dur(video) * fps))
-    tracks = [FaceTrack.model_validate(t) for t in
-              json.loads((V3 / "face_tracks2.json").read_text())]
+    tracks = [
+        FaceTrack.model_validate(t) for t in json.loads((V3 / "face_tracks2.json").read_text())
+    ]
     plan = repair_trajectories(
-        tracks, fps=fps, frame_w=w, frame_h=h, n_frames=nfr,
-        sample_stride_frames=BRIDGE_STRIDE_FRAMES, lead_frames=LEAD_FRAMES,
+        tracks,
+        fps=fps,
+        frame_w=w,
+        frame_h=h,
+        n_frames=nfr,
+        sample_stride_frames=BRIDGE_STRIDE_FRAMES,
+        lead_frames=LEAD_FRAMES,
         min_window_frames=2,
     )
     if not REDACT_FACES:
@@ -338,7 +425,7 @@ def phase_plan2() -> None:
     problems = []
     for tr in plan.trajectories:
         idx = [b.frame_idx for b in tr.boxes]
-        for a, b in zip(idx, idx[1:]):
+        for a, b in zip(idx, idx[1:], strict=False):
             if 1 < b - a <= budget:
                 problems.append(f"{tr.track_id}: {b - a}-frame hole at {a}")
                 break
@@ -350,8 +437,10 @@ def phase_plan2() -> None:
     if leaks:
         raise SystemExit(f"PASS-2 REDACTION LEAK: {len(leaks)} raw detections uncovered")
     total_boxes = sum(len(t.boxes) for t in plan.trajectories)
-    log(f"plan2: {len(plan.trajectories)} trajectories, {total_boxes} dense boxes, "
-        f"dense + zero-leak, {nfr} frames")
+    log(
+        f"plan2: {len(plan.trajectories)} trajectories, {total_boxes} dense boxes, "
+        f"dense + zero-leak, {nfr} frames"
+    )
 
 
 def _plan2():
@@ -375,9 +464,15 @@ def phase_chunk2(ci: int) -> None:
         return
     f0, f1 = ci * BLUR_CHUNK_FRAMES, min((ci + 1) * BLUR_CHUNK_FRAMES, plan.n_frames)
     render_tracked_redaction(
-        _base(), plan, part,
-        mode="gauss", sigma=24, crf=18, preset="veryfast",
-        frame_start=f0, frame_end=f1,
+        _base(),
+        plan,
+        part,
+        mode="gauss",
+        sigma=24,
+        crf=18,
+        preset="veryfast",
+        frame_start=f0,
+        frame_end=f1,
     )
     mark.write_text(str(f1 - f0))
     log(f"chunk2 {ci + 1}/{n_chunks} rendered ({f1 - f0} frames)")
@@ -395,8 +490,24 @@ def phase_concat2() -> None:
     out = V3 / "master_v3_blurred.mp4"
     lst = V3 / "p2_chunks.txt"
     lst.write_text("".join(f"file '{p.name}'\n" for p in parts))
-    _sh(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
-         "-i", str(lst), "-c", "copy", str(out)], "pass-2 concat")
+    _sh(
+        [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(lst),
+            "-c",
+            "copy",
+            str(out),
+        ],
+        "pass-2 concat",
+    )
     log(f"master_v3_blurred: {probe_dur(out):.2f}s, {out.stat().st_size / 1e6:.1f} MB")
 
 
@@ -429,7 +540,7 @@ def phase_wm() -> None:
         ok, f = cap.read()
         if ok:
             x, y, w, h = canon
-            crop = f[y:y + h, x:x + w]
+            crop = f[y : y + h, x : x + w]
             g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
             if float(g.std()) > 18:  # text present (not already blurred)
                 tmpl = g
@@ -514,27 +625,34 @@ def _align_words(new_text: str, orig_words: list[dict]) -> list[dict]:
         total = max(0.35, sum(w["e"] - w["s"] for w in orig_words) or 1.0)
         weights = [max(2, len(t)) for t in tokens]
         sw, cur, res = sum(weights), orig_words[0]["s"] if orig_words else 0.0, []
-        for t, wt in zip(tokens, weights):
+        for t, wt in zip(tokens, weights, strict=False):
             d = total * (wt / sw)
             res.append({"w": t, "s": cur, "e": cur + d})
             cur += d
         return res
-    sm = difflib.SequenceMatcher(None, [_norm_tok(w["w"]) for w in orig_words],
-                                 [_norm_tok(t) for t in tokens], autojunk=False)
+    sm = difflib.SequenceMatcher(
+        None,
+        [_norm_tok(w["w"]) for w in orig_words],
+        [_norm_tok(t) for t in tokens],
+        autojunk=False,
+    )
     timed: list[dict | None] = [None] * len(tokens)
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == "equal":
             for k in range(j2 - j1):
                 ow = orig_words[i1 + k]
-                timed[j1 + k] = {"w": tokens[j1 + k], "s": ow["s"],
-                                 "e": max(ow["e"], ow["s"] + 0.06)}
+                timed[j1 + k] = {
+                    "w": tokens[j1 + k],
+                    "s": ow["s"],
+                    "e": max(ow["e"], ow["s"] + 0.06),
+                }
         elif tag == "replace" and i2 > i1:
             t0 = orig_words[i1]["s"]
             t1 = max(orig_words[i2 - 1]["e"], t0 + 0.14)
             sub = tokens[j1:j2]
             weights = [max(2, len(x)) for x in sub]
             sw, cur = sum(weights), t0
-            for k, (tok, wt) in enumerate(zip(sub, weights)):
+            for k, (tok, wt) in enumerate(zip(sub, weights, strict=False)):
                 d = (t1 - t0) * (wt / sw)
                 timed[j1 + k] = {"w": tok, "s": cur, "e": cur + d}
                 cur += d
@@ -569,8 +687,7 @@ def _align_words(new_text: str, orig_words: list[dict]) -> list[dict]:
                 pe = max(span_s, ns - 0.18 * (je - j))
             step = max(0.12 * (je - j), ns - pe) / (je - j)
             for k in range(j, je):
-                timed[k] = {"w": tokens[k], "s": pe + (k - j) * step,
-                            "e": pe + (k - j + 1) * step}
+                timed[k] = {"w": tokens[k], "s": pe + (k - j) * step, "e": pe + (k - j + 1) * step}
         j += 1
     return [t for t in timed if t is not None]
 
@@ -612,9 +729,15 @@ def phase_captions() -> None:
         text = " ".join(w["w"] for w in words).strip()
         if not text:
             continue
-        utts.append({"id": i, "role": ev.get("role", "?"),
-                     "t": round(words[0]["s"], 2),
-                     "n_words": len(words), "text": text})
+        utts.append(
+            {
+                "id": i,
+                "role": ev.get("role", "?"),
+                "t": round(words[0]["s"], 2),
+                "n_words": len(words),
+                "text": text,
+            }
+        )
 
     # resume-aware: corr_path holds progress after EVERY batch (a failed batch
     # never re-bills the earlier ones); a partial file is continued, not trusted
@@ -629,11 +752,14 @@ def phase_captions() -> None:
         B = 26
         nb = math.ceil(len(utts) / B)
         for bi, i in enumerate(range(0, len(todo), B), 1):
-            batch = todo[i:i + B]
+            batch = todo[i : i + B]
             lines = "\n".join(
-                json.dumps({"id": u["id"], "role": u["role"], "t": u["t"],
-                            "text": u["text"]}, ensure_ascii=False)
-                for u in batch)
+                json.dumps(
+                    {"id": u["id"], "role": u["role"], "t": u["t"], "text": u["text"]},
+                    ensure_ascii=False,
+                )
+                for u in batch
+            )
             prompt = f"""Proofread raw ASR captions for a police bodycam documentary.
 Case facts: {json.dumps(CASE_FACTS, ensure_ascii=False)}
 
@@ -656,9 +782,7 @@ Lines:
                 clean = (fx.get("clean_text") or "").strip()
                 if clean and clean != u["text"]:
                     n_edits += 1
-                fixes.append({"id": u["id"],
-                              "clean_text": clean,
-                              "tag": fx.get("tag")})
+                fixes.append({"id": u["id"], "clean_text": clean, "tag": fx.get("tag")})
             corr_path.write_text(json.dumps(fixes))
             log(f"  batch {bi}/{nb} done ({n_edits} edits, {len(fixes)}/{len(utts)} total)")
         log(f"proofread: {len(fixes)} utterances")
@@ -674,22 +798,20 @@ Lines:
         clean = fx.get("clean_text") or ""
         words = ev["words"]
         if tag or not clean:
-            corrected_events.append({"role": ev.get("role", "?"), "words": words,
-                                     "tag": tag or "inaudible"})
+            corrected_events.append(
+                {"role": ev.get("role", "?"), "words": words, "tag": tag or "inaudible"}
+            )
             inaud += 1
             continue
         if clean == u["text"]:
-            corrected_events.append({"role": ev.get("role", "?"), "words": words,
-                                     "tag": None})
+            corrected_events.append({"role": ev.get("role", "?"), "words": words, "tag": None})
             continue
         new_words = _align_words(clean, words)
         if new_words:
             changed += 1
-            corrected_events.append({"role": ev.get("role", "?"), "words": new_words,
-                                     "tag": None})
+            corrected_events.append({"role": ev.get("role", "?"), "words": new_words, "tag": None})
         else:
-            corrected_events.append({"role": ev.get("role", "?"), "words": words,
-                                     "tag": None})
+            corrected_events.append({"role": ev.get("role", "?"), "words": words, "tag": None})
     log(f"corrections applied: {changed} utterances rewritten, {inaud} tagged")
 
     # ---- chunking into caption cues (<=5 words / <=27 chars, same law as v1)
@@ -708,8 +830,11 @@ Lines:
                 raw_chunks.append((uid, style, cur))
                 cur = []
             cur.append(w)
-            if len(cur) >= 5 or sum(len(x["w"]) + 1 for x in cur) >= 27 \
-                    or (w["w"][-1] in ",.?!" and len(cur) >= 3):
+            if (
+                len(cur) >= 5
+                or sum(len(x["w"]) + 1 for x in cur) >= 27
+                or (w["w"][-1] in ",.?!" and len(cur) >= 3)
+            ):
                 raw_chunks.append((uid, style, cur))
                 cur = []
         if cur:
@@ -718,7 +843,7 @@ Lines:
 
     # ---- two-lane overlap placement (v1 law, kept)
     placed, last_idx = [], [None, None]
-    for uid, style, c in raw_chunks:
+    for _uid, style, c in raw_chunks:
         s = c[0]["s"]
         e = max(c[-1]["e"] + 0.06, s + 0.30)
         l0 = placed[last_idx[0]] if last_idx[0] is not None else None
@@ -785,19 +910,21 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         body = " ".join(k_parts)
         if c[0]["w"].startswith("*") and c[0]["w"].endswith("*"):
             body = "{\\i1\\c&H9C9C9C&}" + body + "{\\i0\\c&HFFFFFF&}"
-        ass_lines.append(f"Dialogue: 0,{fmt_ass(s)},{fmt_ass(e)},{st},,0,0,{mv},,"
-                         f"{{\\fad(40,30)}}{body}")
+        ass_lines.append(
+            f"Dialogue: 0,{fmt_ass(s)},{fmt_ass(e)},{st},,0,0,{mv},,{{\\fad(40,30)}}{body}"
+        )
         plain = " ".join(w["w"] for w in c)
         srt_lines.append(f"{i}\n{fmt_srt(s)} --> {fmt_srt(e)}\n{plain}\n")
 
-    (V3 / "subtitles_v3.ass").write_text(ass_header + "\n".join(ass_lines) + "\n",
-                                         encoding="utf-8")
+    (V3 / "subtitles_v3.ass").write_text(ass_header + "\n".join(ass_lines) + "\n", encoding="utf-8")
     (V3 / "captions_v3.srt").write_text("\n".join(srt_lines), encoding="utf-8")
     styles = {}
     for it in placed:
         styles[it["style"]] = styles.get(it["style"], 0) + 1
-    log(f"captions: {len(placed)} cues -> {styles} "
-        f"({sum(1 for i in placed if i['c'][0]['w'].startswith('*'))} inaudible)")
+    log(
+        f"captions: {len(placed)} cues -> {styles} "
+        f"({sum(1 for i in placed if i['c'][0]['w'].startswith('*'))} inaudible)"
+    )
 
 
 # --------------------------------------------------------------------- cards
@@ -832,10 +959,13 @@ def phase_cards() -> None:
 
     bold_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
     reg_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-    ACCENTS = {"location_intro": (220, 45, 45), "evidence_fact": (56, 189, 248),
-               "case_outcome": (245, 185, 50)}
+    ACCENTS = {
+        "location_intro": (220, 45, 45),
+        "evidence_fact": (56, 189, 248),
+        "case_outcome": (245, 185, 50),
+    }
     W, H = 1280, 720
-    MAX_TEXT_W = 470       # max text width inside the card
+    MAX_TEXT_W = 470  # max text width inside the card
     MAX_BOX_W = 620
     PAD_Y, GAP = 14, 6
     probe = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
@@ -872,14 +1002,24 @@ def phase_cards() -> None:
         )
         bw = int(min(MAX_BOX_W, max(322, content_w + 78)))
         text_x = 58
-        box_h = int(PAD_Y + 18 + 4 + len(t_lines) * int(title_px * 1.3)
-                    + ((GAP + len(s_lines) * int(sub_px * 1.35)) if s_lines else 0)
-                    + PAD_Y)
+        box_h = int(
+            PAD_Y
+            + 18
+            + 4
+            + len(t_lines) * int(title_px * 1.3)
+            + ((GAP + len(s_lines) * int(sub_px * 1.35)) if s_lines else 0)
+            + PAD_Y
+        )
 
         img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
-        d.rounded_rectangle([38, 34, 38 + bw, 34 + box_h], radius=10,
-                            fill=(14, 17, 24, 225), outline=(255, 255, 255, 45), width=1)
+        d.rounded_rectangle(
+            [38, 34, 38 + bw, 34 + box_h],
+            radius=10,
+            fill=(14, 17, 24, 225),
+            outline=(255, 255, 255, 45),
+            width=1,
+        )
         d.rounded_rectangle([38, 34, 45, 34 + box_h], radius=4, fill=accent + (255,))
         y = 34 + PAD_Y
         d.text((text_x, y), head, font=f_head, fill=accent + (255,))
@@ -896,8 +1036,13 @@ def phase_cards() -> None:
             box_h = y - 34 + 2
             img2 = Image.new("RGBA", (W, H), (0, 0, 0, 0))
             d = ImageDraw.Draw(img2)
-            d.rounded_rectangle([38, 34, 38 + bw, 34 + box_h], radius=10,
-                                fill=(14, 17, 24, 225), outline=(255, 255, 255, 45), width=1)
+            d.rounded_rectangle(
+                [38, 34, 38 + bw, 34 + box_h],
+                radius=10,
+                fill=(14, 17, 24, 225),
+                outline=(255, 255, 255, 45),
+                width=1,
+            )
             d.rounded_rectangle([38, 34, 45, 34 + box_h], radius=4, fill=accent + (255,))
             y = 34 + PAD_Y
             d.text((text_x, y), head, font=f_head, fill=accent + (255,))
@@ -913,10 +1058,11 @@ def phase_cards() -> None:
             img = img2
         p = V3 / f"card_v3_{ci}.png"
         img.save(p)
-        card_meta.append({"png": p.name, "template": c["template"],
-                          "box": [38, 34, bw, box_h]})
-        log(f"card {ci} [{c['template']}]: {bw}x{box_h}px content-fit "
-            f"(title {title_px}px/{len(t_lines)}L, sub {sub_px}px/{len(s_lines)}L)")
+        card_meta.append({"png": p.name, "template": c["template"], "box": [38, 34, bw, box_h]})
+        log(
+            f"card {ci} [{c['template']}]: {bw}x{box_h}px content-fit "
+            f"(title {title_px}px/{len(t_lines)}L, sub {sub_px}px/{len(s_lines)}L)"
+        )
 
     def act_first_nar_time(act: str):
         for b in part_bounds:
@@ -925,13 +1071,13 @@ def phase_cards() -> None:
         return None
 
     card_times = []
-    for m, c in zip(card_meta, plan.get("cards", [])):
+    for m, c in zip(card_meta, plan.get("cards", []), strict=False):
         t = act_first_nar_time(c.get("near_act", ""))
         if t is None:
             t = max(0.0, total_dur - 32.0)
         card_times.append([m["png"], round(float(t), 2)])
-    json.dump({"card_times": card_times, "total_dur": total_dur},
-              open(V3 / "cards_meta_v3.json", "w"))
+    with open(V3 / "cards_meta_v3.json", "w") as fh:
+        json.dump({"card_times": card_times, "total_dur": total_dur}, fh)
     log(f"cards: {len(card_times)} content-fit card(s)")
 
 
@@ -948,8 +1094,10 @@ def _chunk_ass_v3(ci: int, cues_path: Path) -> Path:
     t0 = ci * BURN_CHUNK_S
     dur = BURN_CHUNK_S
     head = text.split("[Events]")[0]
-    out_lines = [head + "[Events]\nFormat: Layer, Start, End, Style, Name, "
-                        "MarginL, MarginR, MarginV, Effect, Text\n"]
+    out_lines = [
+        head + "[Events]\nFormat: Layer, Start, End, Style, Name, "
+        "MarginL, MarginR, MarginV, Effect, Text\n"
+    ]
 
     def to_sec(ts: str) -> float:
         h, m, s = ts.split(":")
@@ -969,10 +1117,10 @@ def _chunk_ass_v3(ci: int, cues_path: Path) -> Path:
         parts = ln.split(",", 9)
         # Dialogue: <layer>,<start>,<end>,<style>,<name>,<ml>,<mr>,<mv>,<fx>,<text>
         s_sec, e_sec = to_sec(parts[1]), to_sec(parts[2])
-        if e_sec <= t0 + 0.005:          # fully before this chunk -> DROP
+        if e_sec <= t0 + 0.005:  # fully before this chunk -> DROP
             n_drop += 1
             continue
-        if s_sec >= t0 + dur:            # fully after -> DROP
+        if s_sec >= t0 + dur:  # fully after -> DROP
             n_drop += 1
             continue
         local_s = max(0.0, s_sec - t0)
@@ -1025,9 +1173,11 @@ def phase_burn(ci: int) -> None:
         bx, by = max(0, bx - 2), max(0, by - 2)
         bw = min(1280 - bx, bw + 4)
         bh = min(720 - by, bh + 4)
-        blur_fc += (f"{cur_v}split=2[bgw][wmw];"
-                    f"[wmw]crop={bw}:{bh}:{bx}:{by},gblur=sigma=20[wmb];"
-                    f"[bgw][wmb]overlay={bx}:{by}:shortest=1[v0];")
+        blur_fc += (
+            f"{cur_v}split=2[bgw][wmw];"
+            f"[wmw]crop={bw}:{bh}:{bx}:{by},gblur=sigma=20[wmb];"
+            f"[bgw][wmb]overlay={bx}:{by}:shortest=1[v0];"
+        )
         cur_v = "[v0]"
         wm_note = f"continuous box ({bx},{by},{bw},{bh})"
     else:
@@ -1050,23 +1200,49 @@ def phase_burn(ci: int) -> None:
         # 4 PNGs at 30 fps through rgba fades — the burn ran at <4 fps and
         # blew the process window). Static lower-third pop-on/off is the
         # documentary standard; alpha fades buy nothing here.
-        fc += (f"[{idx}:v]format=rgba[c{idx}];"
-               f"{prev}[c{idx}]overlay=0:0:eof_action=repeat:"
-               f"enable='between(t,{max(0.0, lt0):.2f},{t_end:.2f})'[v{idx}];")
+        fc += (
+            f"[{idx}:v]format=rgba[c{idx}];"
+            f"{prev}[c{idx}]overlay=0:0:eof_action=repeat:"
+            f"enable='between(t,{max(0.0, lt0):.2f},{t_end:.2f})'[v{idx}];"
+        )
         prev = f"[v{idx}]"
     fc += f"{prev}format=yuv420p[vout]"
 
-    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{t0:.3f}",
-           "-t", f"{dur:.3f}", "-i", str(src)]
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{t0:.3f}",
+        "-t",
+        f"{dur:.3f}",
+        "-i",
+        str(src),
+    ]
     for png, _i in inputs:
         cmd += ["-i", str(png)]
-    cmd += ["-filter_complex", fc, "-map", "[vout]", "-an",
-            "-c:v", "libx264", "-preset", "superfast", "-crf", "20",
-            "-pix_fmt", "yuv420p", "-t", f"{dur:.3f}", str(part)]
+    cmd += [
+        "-filter_complex",
+        fc,
+        "-map",
+        "[vout]",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "superfast",
+        "-crf",
+        "20",
+        "-pix_fmt",
+        "yuv420p",
+        "-t",
+        f"{dur:.3f}",
+        str(part),
+    ]
     subprocess.run(cmd, check=True)
     mark.write_text("ok")
-    log(f"burn chunk {ci + 1}/{n_chunks} done ({dur:.1f}s, {wm_note}, "
-        f"{len(inputs)} cards)")
+    log(f"burn chunk {ci + 1}/{n_chunks} done ({dur:.1f}s, {wm_note}, {len(inputs)} cards)")
 
 
 def phase_burnconcat() -> None:
@@ -1080,15 +1256,34 @@ def phase_burnconcat() -> None:
         parts.append(part)
     lst = V3 / "burn_v3_chunks.txt"
     lst.write_text("".join(f"file '{p.name}'\n" for p in parts))
-    _sh(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
-         "-i", str(lst), "-c", "copy", "-movflags", "+faststart",
-         str(V3 / "master_v3_burned.mp4")], "burn concat")
-    log(f"master_v3_burned: {probe_dur(V3 / 'master_v3_burned.mp4'):.2f}s, "
-        f"{(V3 / 'master_v3_burned.mp4').stat().st_size / 1e6:.1f} MB")
+    _sh(
+        [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(lst),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(V3 / "master_v3_burned.mp4"),
+        ],
+        "burn concat",
+    )
+    log(
+        f"master_v3_burned: {probe_dur(V3 / 'master_v3_burned.mp4'):.2f}s, "
+        f"{(V3 / 'master_v3_burned.mp4').stat().st_size / 1e6:.1f} MB"
+    )
 
 
 # ------------------------------------------------------------------- voice
-VOICE_SPAN = (628.92, 657.65)     # Outro narration span on the master clock
+VOICE_SPAN = (628.92, 657.65)  # Outro narration span on the master clock
 
 
 def _tts_normalize(text: str) -> str:
@@ -1132,8 +1327,7 @@ def phase_voice() -> None:
     ev = None
     for e in events:
         ws = e.get("words") or []
-        if ws and abs(ws[0]["s"] - span[0]) < 0.5 and "0.391" in \
-                " ".join(w["w"] for w in ws):
+        if ws and abs(ws[0]["s"] - span[0]) < 0.5 and "0.391" in " ".join(w["w"] for w in ws):
             ev = e
     if ev is None:
         log("outro narration event with 0.391 token not found — voice skipped")
@@ -1151,9 +1345,11 @@ def phase_voice() -> None:
         log(f"normalized: ...{speak[-180:]}")
 
         async def synth():
-            voices = [("en-US-BrianNeural-Fastest", "+0%"),
-                      ("en-US-BrianNeural-Fastest", "+4%"),
-                      ("en-US-BrianNeural-Fastest", "+8%")]
+            voices = [
+                ("en-US-BrianNeural-Fastest", "+0%"),
+                ("en-US-BrianNeural-Fastest", "+4%"),
+                ("en-US-BrianNeural-Fastest", "+8%"),
+            ]
             for voice, rate in voices:
                 out = V3 / f"tts_try_{rate.strip('+')}.mp3"
                 words = []
@@ -1163,9 +1359,13 @@ def phase_voice() -> None:
                         if chunk["type"] == "audio":
                             f.write(chunk["data"])
                         elif chunk["type"] == "WordBoundary":
-                            words.append({"w": chunk["text"],
-                                          "s": chunk["offset"] / 1e7,
-                                          "e": (chunk["offset"] + chunk["duration"]) / 1e7})
+                            words.append(
+                                {
+                                    "w": chunk["text"],
+                                    "s": chunk["offset"] / 1e7,
+                                    "e": (chunk["offset"] + chunk["duration"]) / 1e7,
+                                }
+                            )
                 d = probe_dur(out)
                 log(f"  {voice} {rate}: {d:.2f}s for {span[1] - span[0]:.1f}s span")
                 if d <= (span[1] - span[0]) + 0.6:
@@ -1175,18 +1375,35 @@ def phase_voice() -> None:
         out, words, d = asyncio.run(synth())
         span_dur = span[1] - span[0]
         tempo = min(1.15, max(0.85, d / span_dur))
-        _sh(["ffmpeg", "-y", "-v", "error", "-i", str(out),
-             "-af", f"atempo={tempo:.4f},apad", "-t", f"{span_dur:.3f}",
-             "-ar", "48000", "-ac", "1", str(wav)], "tts fit")
+        _sh(
+            [
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-i",
+                str(out),
+                "-af",
+                f"atempo={tempo:.4f},apad",
+                "-t",
+                f"{span_dur:.3f}",
+                "-ar",
+                "48000",
+                "-ac",
+                "1",
+                str(wav),
+            ],
+            "tts fit",
+        )
         for w in words:
             w["s"] = round(span[0] + w["s"] / tempo, 3)
             w["e"] = round(span[0] + w["e"] / tempo, 3)
-        words_json.write_text(json.dumps({"span": list(span), "tempo": tempo,
-                                          "words": words}, indent=1))
+        words_json.write_text(
+            json.dumps({"span": list(span), "tempo": tempo, "words": words}, indent=1)
+        )
         log(f"voice: fitted at tempo x{tempo:.3f}, {len(words)} word boundaries")
     except Exception as e:  # noqa: BLE001
-        (V3 / "voice_skipped.json").write_text(
-            json.dumps({"reason": str(e)[:400]}, indent=1))
+        (V3 / "voice_skipped.json").write_text(json.dumps({"reason": str(e)[:400]}, indent=1))
         log(f"voice patch SKIPPED ({str(e)[:200]}) — audio passes through unpatched")
 
 
@@ -1207,31 +1424,78 @@ def phase_mux() -> None:
             wav = V3 / "narration_outro_fixed.wav"
             a0, a1 = span
             # crossfade 40 ms on the left edge to avoid any seam pop
-            _sh(["ffmpeg", "-y", "-v", "error", "-i", str(V3 / "audio_src.m4a"),
-                 "-i", str(wav), "-filter_complex",
-                 "[0:a]atrim=0:{:.3f},asetpts=PTS-STARTPTS[base0];"
-                 "[0:a]atrim={:.3f},asetpts=PTS-STARTPTS[tail];"
-                 "[1:a]aformat=sample_rates=48000:channel_layouts=stereo,afade=t=in:st=0:d=0.04[nar];"
-                 "[base0][nar]acrossfade=d=0.04:c1=tri:c2=tri[head];"
-                 "[head][tail]concat=n=2:v=0:a=1[out]".format(a0, a1),
-                 "-map", "[out]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-                 "-ac", "2", str(patched)], "audio patch")
+            _sh(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-v",
+                    "error",
+                    "-i",
+                    str(V3 / "audio_src.m4a"),
+                    "-i",
+                    str(wav),
+                    "-filter_complex",
+                    f"[0:a]atrim=0:{a0:.3f},asetpts=PTS-STARTPTS[base0];"
+                    f"[0:a]atrim={a1:.3f},asetpts=PTS-STARTPTS[tail];"
+                    "[1:a]aformat=sample_rates=48000:channel_layouts=stereo,afade=t=in:st=0:d=0.04[nar];"
+                    "[base0][nar]acrossfade=d=0.04:c1=tri:c2=tri[head];"
+                    "[head][tail]concat=n=2:v=0:a=1[out]",
+                    "-map",
+                    "[out]",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-ar",
+                    "48000",
+                    "-ac",
+                    "2",
+                    str(patched),
+                ],
+                "audio patch",
+            )
             log(f"audio: outro narration replaced at {a0:.2f}-{a1:.2f}s")
         else:
             import shutil
+
             shutil.copyfile(V3 / "audio_src.m4a", patched)
             log("audio: passed through unpatched (no voice span)")
     final = V3 / "master_postfx_v3.mp4"
-    _sh(["ffmpeg", "-y", "-v", "error", "-i", str(burned), "-i", str(patched),
-         "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
-         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
-         "-movflags", "+faststart", str(final)], "final mux")
+    _sh(
+        [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            str(burned),
+            "-i",
+            str(patched),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-movflags",
+            "+faststart",
+            str(final),
+        ],
+        "final mux",
+    )
     d_v = probe_dur(burned)
     d_f = probe_dur(final)
     if abs(d_f - d_v) > 1.0:
         raise SystemExit(f"duration drifted {abs(d_f - d_v):.2f}s — refusing to ship")
-    log(f"muxed: master_postfx_v3.mp4 {d_f:.2f}s, "
-        f"{final.stat().st_size / 1e6:.1f} MB")
+    log(f"muxed: master_postfx_v3.mp4 {d_f:.2f}s, {final.stat().st_size / 1e6:.1f} MB")
 
 
 # ---------------------------------------------------------------------- qa
@@ -1251,12 +1515,13 @@ def _text_mass(frame, band="center") -> float:
 
     h, w = frame.shape[:2]
     if band == "center":
-        roi = frame[int(h * 0.18):int(h * 0.72), int(w * 0.12):int(w * 0.88)]
+        roi = frame[int(h * 0.18) : int(h * 0.72), int(w * 0.12) : int(w * 0.88)]
     else:  # caption band
-        roi = frame[h - 170:h - 8, 40:w - 40]
+        roi = frame[h - 170 : h - 8, 40 : w - 40]
     b, g, r = roi[:, :, 0].astype(int), roi[:, :, 1].astype(int), roi[:, :, 2].astype(int)
-    glyph = (((b > 200) & (g > 200) & (r > 200))
-             | ((r > 200) & (g > 120) & (b < 160))).astype(np.uint8)
+    glyph = (((b > 200) & (g > 200) & (r > 200)) | ((r > 200) & (g > 120) & (b < 160))).astype(
+        np.uint8
+    )
     dark = ((b < 60) & (g < 60) & (r < 60)).astype(np.uint8)
     dark_near = cv2.dilate(dark, np.ones((5, 5), np.uint8))
     return float(((glyph > 0) & (dark_near > 0)).sum())
@@ -1270,7 +1535,6 @@ def _lap(img) -> float:
 
 
 def phase_qa() -> None:
-    import cv2
 
     final = V3 / "master_postfx_v3.mp4"
     base = _base()
@@ -1286,17 +1550,24 @@ def phase_qa() -> None:
 
     info_d = probe_dur(final)
     # ---- 1. duration law
-    check("duration", abs(info_d - probe_dur(base)) <= 1.0,
-          f"final {info_d:.2f}s vs base {probe_dur(base):.2f}s")
+    check(
+        "duration",
+        abs(info_d - probe_dur(base)) <= 1.0,
+        f"final {info_d:.2f}s vs base {probe_dur(base):.2f}s",
+    )
 
     # ---- 2. FLASH REGRESSION: no caption-mass spike at any burn boundary
     n_chunks = max(1, -(-int(info_d * 1000) // int(BURN_CHUNK_S * 1000)))
     bounds = [ci * BURN_CHUNK_S for ci in range(1, n_chunks)]
     spikes = []
     for b in bounds:
-        base_mass = np.median([_text_mass(f, "center")
-                               for t in np.arange(b - 2.0, b - 0.6, 0.2)
-                               if (f := _grab(final, t)) is not None])
+        base_mass = np.median(
+            [
+                _text_mass(f, "center")
+                for t in np.arange(b - 2.0, b - 0.6, 0.2)
+                if (f := _grab(final, t)) is not None
+            ]
+        )
         worst = 0.0
         for t in np.arange(b - 0.15, b + 0.45, 1 / 30):
             f = _grab(final, t)
@@ -1306,9 +1577,12 @@ def phase_qa() -> None:
             worst = max(worst, m / max(1.0, base_mass))
         if worst > 4.0:
             spikes.append((round(b, 1), round(worst, 1)))
-    check("no_paragraph_flash", not spikes,
-          f"boundaries {bounds} worst mass ratio "
-          f"{max((s[1] for s in spikes), default=0.0):.1f}x (<4.0 required)")
+    check(
+        "no_paragraph_flash",
+        not spikes,
+        f"boundaries {bounds} worst mass ratio "
+        f"{max((s[1] for s in spikes), default=0.0):.1f}x (<4.0 required)",
+    )
 
     # ---- 3. face redaction coverage at the measured leak (t~199-203)
     ok202 = True
@@ -1328,16 +1602,18 @@ def phase_qa() -> None:
         bx = max(boxes, key=lambda b: b.w * b.h)
         x, y, w, h = bx.x, bx.y, bx.w, bx.h
         ix, iy, iw, ih = x + w // 4, y + h // 4, max(4, w // 2), max(4, h // 2)
-        v0 = max(_lap(fb[iy:iy + ih, ix:ix + iw]), 1e-6)
-        v1 = max(_lap(ff[iy:iy + ih, ix:ix + iw]), 1e-6)
+        v0 = max(_lap(fb[iy : iy + ih, ix : ix + iw]), 1e-6)
+        v1 = max(_lap(ff[iy : iy + ih, ix : ix + iw]), 1e-6)
         ratios.append(f"t={t}: x{v0 / v1:.1f} v1={v1:.0f}")
         # the law is the FINAL is blurred. A sharp base (the 199-202s leak)
         # shows as a collapse ratio; an already-blurred base shows as v1 < 40.
         ok202 = ok202 and (v1 < 40.0 or v0 / v1 >= 2.0)
-    check("face_leak_202s_blurred",
-          (ok202 and len(ratios) == 4) if REDACT_FACES else True,
-          "; ".join(ratios) or ("REDACT_FACES=0 — policy off" if not REDACT_FACES
-                                else "frames missing"))
+    check(
+        "face_leak_202s_blurred",
+        (ok202 and len(ratios) == 4) if REDACT_FACES else True,
+        "; ".join(ratios)
+        or ("REDACT_FACES=0 — policy off" if not REDACT_FACES else "frames missing"),
+    )
 
     # ---- 4. pass-2 blur sample check over the plan (spread sample, policy-aware)
     plan = _plan2()
@@ -1347,8 +1623,9 @@ def phase_qa() -> None:
         worst = (99.0, -1)
         worst_abs = (0.0, -1.0)
         n_tr = len(plan.trajectories)
-        sample_ids = ([int(i * (n_tr - 1) / 11) for i in range(12)]
-                      if n_tr > 1 else ([0] if n_tr else []))
+        sample_ids = (
+            [int(i * (n_tr - 1) / 11) for i in range(12)] if n_tr > 1 else ([0] if n_tr else [])
+        )
         for ti in sample_ids:
             tr = plan.trajectories[ti]
             mid = tr.boxes[len(tr.boxes) // 2]
@@ -1358,8 +1635,8 @@ def phase_qa() -> None:
                 continue
             x, y, w, h = mid.x, mid.y, mid.w, mid.h
             ix, iy, iw, ih = x + w // 4, y + h // 4, max(4, w // 2), max(4, h // 2)
-            v0 = max(_lap(fb[iy:iy + ih, ix:ix + iw]), 1e-6)
-            v1 = max(_lap(ff[iy:iy + ih, ix:ix + iw]), 1e-6)
+            v0 = max(_lap(fb[iy : iy + ih, ix : ix + iw]), 1e-6)
+            v1 = max(_lap(ff[iy : iy + ih, ix : ix + iw]), 1e-6)
             if v1 > worst_abs[0]:
                 worst_abs = (v1, t)
             if v0 / v1 < worst[0]:
@@ -1368,10 +1645,12 @@ def phase_qa() -> None:
         # so a base/final ratio of 1.0 there is EXPECTED, not a failure. The
         # law: the final region must be blurred — absolute Laplacian collapse
         # (<40) or a real collapse ratio vs a sharp base (>=1.8).
-        check("pass2_blur_effective",
-              (not sample_ids) or worst_abs[0] < 40.0 or worst[0] >= 1.8,
-              f"max final inner var {worst_abs[0]:.0f} @ {worst_abs[1]:.1f}s, "
-              f"worst base/final x{worst[0]:.2f} over {len(sample_ids)} tracks")
+        check(
+            "pass2_blur_effective",
+            (not sample_ids) or worst_abs[0] < 40.0 or worst[0] >= 1.8,
+            f"max final inner var {worst_abs[0]:.0f} @ {worst_abs[1]:.1f}s, "
+            f"worst base/final x{worst[0]:.2f} over {len(sample_ids)} tracks",
+        )
 
     # ---- 5. watermark: the mark is baked at a fixed position for the whole
     #         video (span sweep + visual gap verification at 205/225/390s)
@@ -1383,36 +1662,60 @@ def phase_qa() -> None:
         arr = np.array([sp["box"] for sp in wm])
         bx, by, bw, bh = [int(v) for v in np.median(arr, axis=0)]
         bx, by, bw, bh = max(0, bx - 2), max(0, by - 2), bw + 4, bh + 4
-        times = (list(np.arange(15.0, max(16.0, info_d - 3.0), 30.0))
-                 + [203.5, 205.0, 225.0, 390.0, 400.0])
+        times = list(np.arange(15.0, max(16.0, info_d - 3.0), 30.0)) + [
+            203.5,
+            205.0,
+            225.0,
+            390.0,
+            400.0,
+        ]
         rs, abs_vars = [], []
         for t in sorted({round(float(x), 2) for x in times}):
             fb, ff = _grab(base, t), _grab(final, t)
             if fb is None or ff is None:
                 continue
-            v0 = _lap(fb[by:by + bh, bx:bx + bw])
-            v1 = _lap(ff[by:by + bh, bx:bx + bw])
+            v0 = _lap(fb[by : by + bh, bx : bx + bw])
+            v1 = _lap(ff[by : by + bh, bx : bx + bw])
             abs_vars.append(v1)
             if v0 >= 60:
                 rs.append(v0 / max(v1, 1e-6))
         worst_abs = max(abs_vars, default=0.0)
         wm_ok = bool(rs) and min(rs) >= 2.0 and worst_abs < 60.0
-        wm_notes.append(f"continuous exact box ({bx},{by},{bw},{bh}): "
-                        f"{len(rs)}/{len(abs_vars)} sharp-base samples, "
-                        f"min collapse x{min(rs, default=0.0):.1f} (>=2.0), "
-                        f"worst final var {worst_abs:.0f} (<60)")
+        wm_notes.append(
+            f"continuous exact box ({bx},{by},{bw},{bh}): "
+            f"{len(rs)}/{len(abs_vars)} sharp-base samples, "
+            f"min collapse x{min(rs, default=0.0):.1f} (>=2.0), "
+            f"worst final var {worst_abs:.0f} (<60)"
+        )
     check("watermark_exact_pixels", wm_ok, "; ".join(wm_notes) or "no spans")
 
     # ---- 6. captions present + inaudible tags + audio present
     srt = (V3 / "captions_v3.srt").read_text()
     n_cues = srt.count(" --> ")
     n_inaud = len(re.findall(r"\*(?:inaudible|mumbling|cross-talk)\*", srt))
-    a_dur = float(subprocess.check_output(
-        ["ffprobe", "-v", "error", "-select_streams", "a:0",
-         "-show_entries", "stream=duration", "-of", "csv=p=0", str(final)]
-    ).decode().strip())
-    check("captions_and_audio", n_cues >= 200 and abs(a_dur - info_d) <= 0.1,
-          f"{n_cues} cues ({n_inaud} inaudible-tagged), audio {a_dur:.2f}s")
+    a_dur = float(
+        subprocess.check_output(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=duration",
+                "-of",
+                "csv=p=0",
+                str(final),
+            ]
+        )
+        .decode()
+        .strip()
+    )
+    check(
+        "captions_and_audio",
+        n_cues >= 200 and abs(a_dur - info_d) <= 0.1,
+        f"{n_cues} cues ({n_inaud} inaudible-tagged), audio {a_dur:.2f}s",
+    )
 
     failed = [c for c in checks if not c["ok"]]
     log(f"QA: {len(checks) - len(failed)}/{len(checks)} green")
@@ -1429,10 +1732,13 @@ def phase_ship() -> None:
         raise SystemExit("mux first")
     shutil.copyfile(final, SHIP_PACK / "final_720p.mp4")
     shutil.copyfile(V3 / "captions_v3.srt", SHIP_PACK / "captions.srt")
-    shutil.copyfile(V3 / "subtitles_v3.ass",
-                    Path("/home/z/my-project/download/eustis_acceptance_postfx_captions.ass"))
-    shutil.copyfile(V3 / "captions_v3.srt",
-                    Path("/home/z/my-project/download/eustis_acceptance_captions.srt"))
+    shutil.copyfile(
+        V3 / "subtitles_v3.ass",
+        Path("/home/z/my-project/download/eustis_acceptance_postfx_captions.ass"),
+    )
+    shutil.copyfile(
+        V3 / "captions_v3.srt", Path("/home/z/my-project/download/eustis_acceptance_captions.srt")
+    )
     meta_p = SHIP_PACK / "metadata.json"
     if meta_p.exists():
         import hashlib
@@ -1443,25 +1749,26 @@ def phase_ship() -> None:
         meta["verification"]["duration_s"] = round(probe_dur(final), 1)
         meta["post_fx_v3"] = {
             "face_redaction": "pass-2 YOLOv8n-face dense sweep (0.25s, conf 0.15, "
-                              "flip-augmented) over the assembled base; entry-gap "
-                              "leak at ~200s closed; REDACT_FACES=1 policy flag",
+            "flip-augmented) over the assembled base; entry-gap "
+            "leak at ~200s closed; REDACT_FACES=1 policy flag",
             "flash_fix": "chunk ASS drops pre-boundary cues (was: clamp-to-0.05 "
-                         "stacked ~250 cues into a 2-frame paragraph at 330s)",
-            "cards": "content-fit: PIL-measured wrap + font shrink + box grows "
-                     "to content",
+            "stacked ~250 cues into a 2-frame paragraph at 330s)",
+            "cards": "content-fit: PIL-measured wrap + font shrink + box grows to content",
             "captions": "LLM proofread (case-facts, profanity mask, garble -> "
-                        "*inaudible*/*mumbling*/*cross-talk*) re-aligned onto "
-                        "original word timestamps; typography +4px",
+            "*inaudible*/*mumbling*/*cross-talk*) re-aligned onto "
+            "original word timestamps; typography +4px",
             "watermark": "mark baked at one fixed position (span sweep + "
-                         "visual gap verification) -> ONE continuous exact-"
-                         "pixel box blur, no scenery band, no flicker",
+            "visual gap verification) -> ONE continuous exact-"
+            "pixel box blur, no scenery band, no flicker",
             "voice": "Outro re-voiced with TTS unit normalization "
-                     "(0.391g/210L -> '0.391 grams per 210 liters'), "
-                     "span-fitted, word timings locked",
+            "(0.391g/210L -> '0.391 grams per 210 liters'), "
+            "span-fitted, word timings locked",
         }
         meta_p.write_text(json.dumps(meta, indent=2))
-    log(f"shipped: {SHIP_PACK / 'final_720p.mp4'} "
-        f"({(SHIP_PACK / 'final_720p.mp4').stat().st_size / 1e6:.1f} MB)")
+    log(
+        f"shipped: {SHIP_PACK / 'final_720p.mp4'} "
+        f"({(SHIP_PACK / 'final_720p.mp4').stat().st_size / 1e6:.1f} MB)"
+    )
 
 
 PHASES = {

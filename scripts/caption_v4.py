@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import json
 import math
-import subprocess
 import sys
 from pathlib import Path
 
@@ -50,11 +49,22 @@ import numpy as np
 sys.path.insert(0, "/home/z/my-project/scripts")
 sys.path.insert(0, "/home/z/my-project/scripts")
 
-from postfx_v3 import (BURN_CHUNK_S, CAPTION_FONTSIZE, CAPTION_MARGIN_V,
-                       CASE_FACTS, FONT, SHIP_PACK, V3, WORK, _align_words,
-                       _llm_json_array, _norm_tok, _sh, log, probe_dur)
-
 import vad_evidence
+from postfx_v3 import (
+    BURN_CHUNK_S,
+    CAPTION_FONTSIZE,
+    CAPTION_MARGIN_V,
+    CASE_FACTS,
+    FONT,
+    SHIP_PACK,
+    V3,
+    WORK,
+    _align_words,
+    _llm_json_array,
+    _sh,
+    log,
+    probe_dur,
+)
 from vad_evidence import SR
 
 V4 = V3  # artifacts live beside v3 (names carry the _v4 suffix)
@@ -66,17 +76,21 @@ SRT_V4 = V4 / "captions_v4.srt"
 # where the voice is NOT audible enough for captions, and the ASR words are
 # fabricated. Any-case pipeline: extend this table per case after review.
 OWNER_WINDOWS = [
-    {"start": 609.40, "end": 628.90, "tag": "unaudible",
-     "note": "officer murmurs, not audible; ASR loop 'people want to stop'"},
+    {
+        "start": 609.40,
+        "end": 628.90,
+        "tag": "unaudible",
+        "note": "officer murmurs, not audible; ASR loop 'people want to stop'",
+    },
 ]
 
 TAG_WORDS = ("unaudible", "mumbling", "whispering", "cross-talk", "panicking")
-TAG_GRAY = "&H9C9C9C&"          # BGR of the agreed dim gray, same as v3
-RUN_MAX_S = 4.0                 # merged tag run chunk length
-GAP_TAG_MAX_S = 3.5             # gap-fill tag chunk length
-GAP_MIN_S = 0.45                # minimum uncovered speech span worth a cue
-COVERAGE_PAD = 0.30             # clearance required around existing cues
-FLIP_CAP = 0.15                 # max share of dialogue events to re-color
+TAG_GRAY = "&H9C9C9C&"  # BGR of the agreed dim gray, same as v3
+RUN_MAX_S = 4.0  # merged tag run chunk length
+GAP_TAG_MAX_S = 3.5  # gap-fill tag chunk length
+GAP_MIN_S = 0.45  # minimum uncovered speech span worth a cue
+COVERAGE_PAD = 0.30  # clearance required around existing cues
+FLIP_CAP = 0.15  # max share of dialogue events to re-color
 
 
 # ----------------------------------------------------------------- evidence
@@ -104,16 +118,15 @@ def _rule_constraint(ev: dict) -> str | None:
     if _in_owner_window(ev):
         return "must_tag:owner_window"
     if ev["speech_ratio"] < 0.15:
-        return "must_tag:silence"          # words on (near-)silence = fabricated
+        return "must_tag:silence"  # words on (near-)silence = fabricated
     if ev["repeat_n"] >= 3 and ev["speech_ratio"] < 0.5:
-        return "must_tag:loop"             # ASR repetition loop
+        return "must_tag:loop"  # ASR repetition loop
     return None
 
 
 def phase_decide() -> None:
     evs = _load_evidence()
-    dialogue = [e for e in evs if e.get("has_words")
-                and not e["role"].lower().startswith("narr")]
+    dialogue = [e for e in evs if e.get("has_words") and not e["role"].lower().startswith("narr")]
 
     # v3 proofread text is reused as the LLM's starting point (it already
     # fixed names/units); here we judge FIT + truthfulness, not spelling.
@@ -125,46 +138,66 @@ def phase_decide() -> None:
     if DECISIONS.exists():
         for d in json.loads(DECISIONS.read_text()):
             decisions[d["id"]] = d
-    todo = [e for e in dialogue if e["id"] not in decisions
-            or decisions[e["id"]].get("batch_done") is not True]
+    todo = [
+        e
+        for e in dialogue
+        if e["id"] not in decisions or decisions[e["id"]].get("batch_done") is not True
+    ]
     log(f"decide: {len(dialogue)} dialogue events, {len(todo)} to judge")
 
     # narrator events pass through untouched (our own script audio)
     for e in evs:
-        if e.get("has_words") and e["role"].lower().startswith("narr") \
-                and e["id"] not in decisions:
-            decisions[e["id"]] = {"id": e["id"], "action": "keep",
-                                  "locked": "narrator", "batch_done": True}
+        if e.get("has_words") and e["role"].lower().startswith("narr") and e["id"] not in decisions:
+            decisions[e["id"]] = {
+                "id": e["id"],
+                "action": "keep",
+                "locked": "narrator",
+                "batch_done": True,
+            }
     dlg_by_id = {e["id"]: e for e in dialogue}
     order = [e["id"] for e in dialogue]
 
     B = 24
     nb = math.ceil(len(todo) / B)
     for bi, i in enumerate(range(0, len(todo), B), 1):
-        batch = todo[i:i + B]
+        batch = todo[i : i + B]
         lines = []
-        for k, e in enumerate(batch):
+        for _k, e in enumerate(batch):
             prev_d = next_d = {"role": "-", "text": "-"}
             for j in range(order.index(e["id"]) - 1, -1, -1):
                 if order[j] in dlg_by_id:
-                    prev_d = {"role": dlg_by_id[order[j]]["role"],
-                              "text": dlg_by_id[order[j]]["text"][:70]}
+                    prev_d = {
+                        "role": dlg_by_id[order[j]]["role"],
+                        "text": dlg_by_id[order[j]]["text"][:70],
+                    }
                     break
             for j in range(order.index(e["id"]) + 1, len(order)):
                 if order[j] in dlg_by_id:
-                    next_d = {"role": dlg_by_id[order[j]]["role"],
-                              "text": dlg_by_id[order[j]]["text"][:70]}
+                    next_d = {
+                        "role": dlg_by_id[order[j]]["role"],
+                        "text": dlg_by_id[order[j]]["text"][:70],
+                    }
                     break
-            lines.append(json.dumps({
-                "id": e["id"], "role": e["role"],
-                "t": round(e["s"], 1),
-                "text": (v3_fix.get(e["id"]) or e["text"]),
-                "prev": prev_d, "next": next_d,
-                "evidence": {"speech_ratio": e["speech_ratio"],
-                             "rms_db": e["rms_db"], "repeat_n": e["repeat_n"],
-                             "stretch_s_per_word": e["stretch"]},
-                "constraint": _rule_constraint(e) or "free",
-            }, ensure_ascii=False))
+            lines.append(
+                json.dumps(
+                    {
+                        "id": e["id"],
+                        "role": e["role"],
+                        "t": round(e["s"], 1),
+                        "text": (v3_fix.get(e["id"]) or e["text"]),
+                        "prev": prev_d,
+                        "next": next_d,
+                        "evidence": {
+                            "speech_ratio": e["speech_ratio"],
+                            "rms_db": e["rms_db"],
+                            "repeat_n": e["repeat_n"],
+                            "stretch_s_per_word": e["stretch"],
+                        },
+                        "constraint": _rule_constraint(e) or "free",
+                    },
+                    ensure_ascii=False,
+                )
+            )
         prompt = f"""You are the caption supervisor of a police bodycam documentary.
 Case: {json.dumps(CASE_FACTS, ensure_ascii=False)}
 
@@ -220,9 +253,14 @@ Lines:
                 tag = None
             # enforcement: measured rules outrank the LLM
             if constraint:
-                d = {"id": e["id"], "action": "tag",
-                     "tag": tag or "unaudible", "locked": constraint,
-                     "role": e["role"], "batch_done": True}
+                d = {
+                    "id": e["id"],
+                    "action": "tag",
+                    "tag": tag or "unaudible",
+                    "locked": constraint,
+                    "role": e["role"],
+                    "batch_done": True,
+                }
             else:
                 if action not in ("keep", "correct", "tag"):
                     action = "keep"
@@ -230,21 +268,28 @@ Lines:
                     action = "tag"
                 if action == "tag" and not tag:
                     tag = "unaudible"
-                d = {"id": e["id"], "action": action,
-                     "clean_text": clean if action == "correct" else "",
-                     "tag": tag if action == "tag" else None,
-                     "locked": "llm", "role": e["role"], "batch_done": True}
+                d = {
+                    "id": e["id"],
+                    "action": action,
+                    "clean_text": clean if action == "correct" else "",
+                    "tag": tag if action == "tag" else None,
+                    "locked": "llm",
+                    "role": e["role"],
+                    "batch_done": True,
+                }
             # role audit: flips only on clearly audible speech, with a reason
             flip_to = (fx.get("flip_to") or "").strip().capitalize()
-            if (not constraint and flip_to in ("Officer", "Suspect")
-                    and flip_to != e["role"]
-                    and e["speech_ratio"] >= 0.5
-                    and (fx.get("flip_reason") or "").strip()):
+            if (
+                not constraint
+                and flip_to in ("Officer", "Suspect")
+                and flip_to != e["role"]
+                and e["speech_ratio"] >= 0.5
+                and (fx.get("flip_reason") or "").strip()
+            ):
                 d["role"] = flip_to
                 d["flip_reason"] = fx["flip_reason"].strip()[:120]
             decisions[e["id"]] = d
-        DECISIONS.write_text(json.dumps(
-            [decisions[k] for k in sorted(decisions)], indent=1))
+        DECISIONS.write_text(json.dumps([decisions[k] for k in sorted(decisions)], indent=1))
         log(f"  decide batch {bi}/{nb} done ({len(decisions)} total)")
 
     # global flip guard: too many flips = systematic error -> drop all flips
@@ -255,14 +300,15 @@ Lines:
             orig = next(e["role"] for e in dialogue if e["id"] == d["id"])
             d["role"] = orig
             d["dropped_flip"] = d.pop("flip_reason", "")
-        DECISIONS.write_text(json.dumps(
-            [decisions[k] for k in sorted(decisions)], indent=1))
+        DECISIONS.write_text(json.dumps([decisions[k] for k in sorted(decisions)], indent=1))
     n_act = {"keep": 0, "correct": 0, "tag": 0}
     for d in decisions.values():
-        if d.get("batch_done") and not d["locked"] == "narrator":
+        if d.get("batch_done") and d["locked"] != "narrator":
             n_act[d["action"]] = n_act.get(d["action"], 0) + 1
-    log(f"decide: keep={n_act['keep']} correct={n_act['correct']} "
-        f"tag={n_act['tag']} flips={len([d for d in decisions.values() if d.get('flip_reason')])}")
+    log(
+        f"decide: keep={n_act['keep']} correct={n_act['correct']} "
+        f"tag={n_act['tag']} flips={len([d for d in decisions.values() if d.get('flip_reason')])}"
+    )
 
 
 # ------------------------------------------------------------------ captions
@@ -287,8 +333,9 @@ def _fmt_srt(sec: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def _vad_extent(flags: np.ndarray, frame: int, s: float, e: float,
-                cap: float) -> tuple[float, float]:
+def _vad_extent(
+    flags: np.ndarray, frame: int, s: float, e: float, cap: float
+) -> tuple[float, float]:
     """Trim [s, e] to the VAD-positive extent, clamped to [0.5, cap] s.
 
     The tag starts at the first voiced frame (so it sits on the actual
@@ -321,8 +368,10 @@ def phase_captions() -> None:
     decisions = {d["id"]: d for d in json.loads(DECISIONS.read_text())}
     pcm, flags, frame, rms = _vad()
     # v3-accepted text (no-op corrections must fall back to keep, not tag)
-    v3_fix = {f["id"]: (f.get("clean_text") or "").strip()
-              for f in json.loads((V4 / "proofread_v3.json").read_text())}
+    v3_fix = {
+        f["id"]: (f.get("clean_text") or "").strip()
+        for f in json.loads((V4 / "proofread_v3.json").read_text())
+    }
 
     corrected_events = []
     for ev in evs:
@@ -337,19 +386,28 @@ def phase_captions() -> None:
         #    (sr >= 0.35) — never invented over faint audio
         orig_text = " ".join(w["w"] for w in ev["words"]).strip()
         accepted_text = (v3_fix.get(ev["id"]) or orig_text).strip()
-        if d["action"] == "correct" and d.get("clean_text", "").strip() in \
-                (accepted_text, orig_text):
-            d = {**d, "action": "keep"}   # no-op correction
-        elif d["action"] == "tag" and ev["speech_ratio"] >= 0.8 \
-                and not _in_owner_window(ev):
-            log(f"  guard: ev{ev['id']} tag downgraded to keep "
-                f"(sr={ev['speech_ratio']:.2f} clearly audible)")
+        if d["action"] == "correct" and d.get("clean_text", "").strip() in (
+            accepted_text,
+            orig_text,
+        ):
+            d = {**d, "action": "keep"}  # no-op correction
+        elif d["action"] == "tag" and ev["speech_ratio"] >= 0.8 and not _in_owner_window(ev):
+            log(
+                f"  guard: ev{ev['id']} tag downgraded to keep "
+                f"(sr={ev['speech_ratio']:.2f} clearly audible)"
+            )
             d = {**d, "action": "keep", "downgraded": "clear-speech-tag"}
         elif d["action"] == "correct" and ev["speech_ratio"] < 0.35:
-            log(f"  guard: ev{ev['id']} correct downgraded to tag "
-                f"(sr={ev['speech_ratio']:.2f} too faint to invent words)")
-            d = {**d, "action": "tag", "tag": d.get("tag") or "unaudible",
-                 "downgraded": "faint-speech-correct"}
+            log(
+                f"  guard: ev{ev['id']} correct downgraded to tag "
+                f"(sr={ev['speech_ratio']:.2f} too faint to invent words)"
+            )
+            d = {
+                **d,
+                "action": "tag",
+                "tag": d.get("tag") or "unaudible",
+                "downgraded": "faint-speech-correct",
+            }
         if d["action"] == "tag":
             win = _in_owner_window(ev)
             if win:
@@ -362,65 +420,82 @@ def phase_captions() -> None:
                     e2 = min(max(e2, s2 + 0.5), win["end"])
             else:
                 s2, e2 = _vad_extent(flags, frame, ev["s"], ev["e"], RUN_MAX_S)
-            corrected_events.append({"role": role,
-                                     "tag": win["tag"] if win else (d.get("tag") or "unaudible"),
-                                     "s": s2, "e": e2, "id": ev["id"]})
+            corrected_events.append(
+                {
+                    "role": role,
+                    "tag": win["tag"] if win else (d.get("tag") or "unaudible"),
+                    "s": s2,
+                    "e": e2,
+                    "id": ev["id"],
+                }
+            )
         elif d["action"] == "correct" and d.get("clean_text"):
             new_words = _align_words(d["clean_text"], ev["words"])
-            corrected_events.append({"role": role,
-                                     "words": new_words or ev["words"],
-                                     "tag": None, "id": ev["id"]})
+            corrected_events.append(
+                {"role": role, "words": new_words or ev["words"], "tag": None, "id": ev["id"]}
+            )
         else:
             # keep — but keep the ACCEPTED v3 proofread text, not raw ASR:
             # the accepted cut shipped the proofread wording, so v4 must
             # inherit it verbatim (word-locked onto the same timestamps)
             accepted = v3_fix.get(ev["id"]) or orig_text
             accepted_words = _align_words(accepted, ev["words"]) or ev["words"]
-            corrected_events.append({"role": role, "words": accepted_words,
-                                     "tag": None, "id": ev["id"]})
+            corrected_events.append(
+                {"role": role, "words": accepted_words, "tag": None, "id": ev["id"]}
+            )
 
     # ---- merge adjacent same-word tag events into runs, then chunk <=4 s
     tag_runs = []
     for ce in corrected_events:
         if ce.get("tag"):
-            if tag_runs and ce["tag"] == tag_runs[-1]["tag"] \
-                    and ce["s"] - tag_runs[-1]["e"] < 1.0:
+            if tag_runs and ce["tag"] == tag_runs[-1]["tag"] and ce["s"] - tag_runs[-1]["e"] < 1.0:
                 tag_runs[-1]["e"] = max(tag_runs[-1]["e"], ce["e"])
                 tag_runs[-1]["ids"].append(ce["id"])
             else:
-                tag_runs.append({"tag": ce["tag"], "s": ce["s"], "e": ce["e"],
-                                 "role": ce["role"], "ids": [ce["id"]]})
+                tag_runs.append(
+                    {
+                        "tag": ce["tag"],
+                        "s": ce["s"],
+                        "e": ce["e"],
+                        "role": ce["role"],
+                        "ids": [ce["id"]],
+                    }
+                )
     tag_cues = []
     for run in tag_runs:
         for cs, ce in _tag_chunks(run["s"], run["e"], RUN_MAX_S):
-            tag_cues.append({"style": run["role"].capitalize(), "tag": run["tag"],
-                             "s": cs, "e": ce})
+            tag_cues.append(
+                {"style": run["role"].capitalize(), "tag": run["tag"], "s": cs, "e": ce}
+            )
 
     # ---- chunk non-tag events into cues (v3 law: <=5 words / <=27 chars)
     raw_chunks = []
     for ce in corrected_events:
         if ce.get("tag"):
             continue
-        style = "Narrator" if ce["role"].lower().startswith("narr") \
-            else ce["role"].capitalize()
+        style = "Narrator" if ce["role"].lower().startswith("narr") else ce["role"].capitalize()
         cur = []
         for w in ce["words"]:
             if cur and w["s"] - cur[-1]["e"] > 1.0:
                 raw_chunks.append((style, cur))
                 cur = []
             cur.append(w)
-            if len(cur) >= 5 or sum(len(x["w"]) + 1 for x in cur) >= 27 \
-                    or (w["w"][-1] in ",.?!" and len(cur) >= 3):
+            if (
+                len(cur) >= 5
+                or sum(len(x["w"]) + 1 for x in cur) >= 27
+                or (w["w"][-1] in ",.?!" and len(cur) >= 3)
+            ):
                 raw_chunks.append((style, cur))
                 cur = []
         if cur:
             raw_chunks.append((style, cur))
 
     # ---- two-lane overlap placement (v3 law) over event cues + tag cues
-    cand = [(tc["s"], tc["e"], tc["style"], {"w": f"*{tc['tag']}*"}, None)
-            for tc in tag_cues]
-    cand += [(c[0]["s"], max(c[-1]["e"] + 0.06, c[0]["s"] + 0.30), style,
-              None, c) for style, c in raw_chunks]
+    cand = [(tc["s"], tc["e"], tc["style"], {"w": f"*{tc['tag']}*"}, None) for tc in tag_cues]
+    cand += [
+        (c[0]["s"], max(c[-1]["e"] + 0.06, c[0]["s"] + 0.30), style, None, c)
+        for style, c in raw_chunks
+    ]
     cand.sort(key=lambda x: x[0])
 
     placed, last_idx = [], [None, None]
@@ -443,21 +518,27 @@ def phase_captions() -> None:
                 else:
                     s = l0["s"] + 0.25
                     e = max(e, s + 0.25)
-        placed.append({"s": s, "e": e, "style": style, "mv": mv,
-                       "c": c, "tag": tagw["w"] if tagw else None})
+        placed.append(
+            {"s": s, "e": e, "style": style, "mv": mv, "c": c, "tag": tagw["w"] if tagw else None}
+        )
         last_idx[lane] = len(placed) - 1
 
     # ---- VAD gap-fill: speech with NO caption coverage -> *unaudible* cues
     gap_fills = []
     spans = vad_evidence.speech_spans(flags, frame, min_s=GAP_MIN_S, join_gap=0.30)
     for a, b in spans:
-        if b < 2.0 or vad_evidence.voice_band_ratio(pcm, a, b) < 0.45 \
-                or vad_evidence.segment_rms_db(pcm, a, b) < -42:
+        if (
+            b < 2.0
+            or vad_evidence.voice_band_ratio(pcm, a, b) < 0.45
+            or vad_evidence.segment_rms_db(pcm, a, b) < -42
+        ):
             continue
         # subtract every placed cue (+clearance) from the speech span
-        ivals = sorted((it["s"] - COVERAGE_PAD, it["e"] + COVERAGE_PAD)
-                       for it in placed
-                       if it["e"] + COVERAGE_PAD > a and it["s"] - COVERAGE_PAD < b)
+        ivals = sorted(
+            (it["s"] - COVERAGE_PAD, it["e"] + COVERAGE_PAD)
+            for it in placed
+            if it["e"] + COVERAGE_PAD > a and it["s"] - COVERAGE_PAD < b
+        )
         cur = a
         free: list[tuple[float, float]] = []
         for ps, pe in ivals:
@@ -478,11 +559,18 @@ def phase_captions() -> None:
     # insert only where no placed cue overlaps (lane-0 free slots)
     inserted = 0
     for g in gap_fills:
-        if any(g["s"] < it["e"] - 0.05 and g["e"] > it["s"] + 0.05
-               for it in placed):
+        if any(g["s"] < it["e"] - 0.05 and g["e"] > it["s"] + 0.05 for it in placed):
             continue
-        placed.append({"s": g["s"], "e": g["e"], "style": "Officer", "mv": 46,
-                       "c": None, "tag": "*unaudible*"})
+        placed.append(
+            {
+                "s": g["s"],
+                "e": g["e"],
+                "style": "Officer",
+                "mv": 46,
+                "c": None,
+                "tag": "*unaudible*",
+            }
+        )
         inserted += 1
     placed.sort(key=lambda x: x["s"])
     log(f"gap-fill: {len(spans)} VAD speech spans -> {inserted} *unaudible* cues")
@@ -509,7 +597,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         s, e, st, mv = it["s"], it["e"], it["style"], it["mv"]
         if it["tag"]:
             body = f"{{\\i1\\c{TAG_GRAY}\\2c{TAG_GRAY}\\i0}}{it['tag']}"
-            plain = it["tag"]   # keep the asterisks: *unaudible* is the agreed tag notation
+            plain = it["tag"]  # keep the asterisks: *unaudible* is the agreed tag notation
         else:
             k_parts = []
             c = it["c"]
@@ -520,8 +608,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 k_parts.append(f"{{\\k{dur_cs}}}{w['w']}")
             body = " ".join(k_parts)
             plain = " ".join(w["w"] for w in c)
-        ass_lines.append(f"Dialogue: 0,{_fmt_ass(s)},{_fmt_ass(e)},{st},,"
-                         f"0,0,{mv},,{{\\fad(40,30)}}{body}")
+        ass_lines.append(
+            f"Dialogue: 0,{_fmt_ass(s)},{_fmt_ass(e)},{st},,0,0,{mv},,{{\\fad(40,30)}}{body}"
+        )
         srt_lines.append(f"{i}\n{_fmt_srt(s)} --> {_fmt_srt(e)}\n{plain}\n")
     ASS_V4.write_text(ass_header + "\n".join(ass_lines) + "\n", encoding="utf-8")
     SRT_V4.write_text("\n".join(srt_lines), encoding="utf-8")
@@ -531,9 +620,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         styles[it["style"]] = styles.get(it["style"], 0) + 1
     n_tags = sum(1 for it in placed if it["tag"])
     log(f"captions v4: {len(placed)} cues -> {styles} ({n_tags} gray tags)")
-    json.dump({"cues": len(placed), "tags": n_tags, "gap_fills": inserted,
-               "tag_runs": len(tag_runs)},
-              open(V4 / "caption_v4_stats.json", "w"), indent=1)
+    with open(V4 / "caption_v4_stats.json", "w") as fh:
+        json.dump(
+            {"cues": len(placed), "tags": n_tags, "gap_fills": inserted, "tag_runs": len(tag_runs)},
+            fh,
+            indent=1,
+        )
 
 
 # --------------------------------------------------------------------- burn
@@ -543,8 +635,10 @@ def _chunk_ass_v4(ci: int) -> Path:
     t0 = ci * BURN_CHUNK_S
     dur = BURN_CHUNK_S
     head = text.split("[Events]")[0]
-    out_lines = [head + "[Events]\nFormat: Layer, Start, End, Style, Name, "
-                        "MarginL, MarginR, MarginV, Effect, Text\n"]
+    out_lines = [
+        head + "[Events]\nFormat: Layer, Start, End, Style, Name, "
+        "MarginL, MarginR, MarginV, Effect, Text\n"
+    ]
 
     def to_sec(ts: str) -> float:
         h, m, s = ts.split(":")
@@ -571,8 +665,7 @@ def _chunk_ass_v4(ci: int) -> Path:
         if local_e - local_s < 0.05:
             n_drop += 1
             continue
-        out_lines.append(",".join([parts[0], fmt(local_s), fmt(local_e)]
-                                  + parts[3:]))
+        out_lines.append(",".join([parts[0], fmt(local_s), fmt(local_e)] + parts[3:]))
         n_kept += 1
     path = V4 / f"captions_v4_chunk_{ci:02d}.ass"
     path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
@@ -606,9 +699,11 @@ def phase_burn(ci: int) -> None:
         bx, by = max(0, bx - 2), max(0, by - 2)
         bw = min(1280 - bx, bw + 4)
         bh = min(720 - by, bh + 4)
-        blur_fc += (f"{cur_v}split=2[bgw][wmw];"
-                    f"[wmw]crop={bw}:{bh}:{bx}:{by},gblur=sigma=20[wmb];"
-                    f"[bgw][wmb]overlay={bx}:{by}:shortest=1[v0];")
+        blur_fc += (
+            f"{cur_v}split=2[bgw][wmw];"
+            f"[wmw]crop={bw}:{bh}:{bx}:{by},gblur=sigma=20[wmb];"
+            f"[bgw][wmb]overlay={bx}:{by}:shortest=1[v0];"
+        )
         cur_v = "[v0]"
 
     cards_meta = json.loads((V4 / "cards_meta_v3.json").read_text())
@@ -623,19 +718,46 @@ def phase_burn(ci: int) -> None:
             continue
         idx = len(inputs) + 1
         inputs.append((V4 / png, idx))
-        fc += (f"[{idx}:v]format=rgba[c{idx}];"
-               f"{prev}[c{idx}]overlay=0:0:eof_action=repeat:"
-               f"enable='between(t,{max(0.0, lt0):.2f},{t_end:.2f})'[v{idx}];")
+        fc += (
+            f"[{idx}:v]format=rgba[c{idx}];"
+            f"{prev}[c{idx}]overlay=0:0:eof_action=repeat:"
+            f"enable='between(t,{max(0.0, lt0):.2f},{t_end:.2f})'[v{idx}];"
+        )
         prev = f"[v{idx}]"
     fc += f"{prev}format=yuv420p[vout]"
 
-    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{t0:.3f}",
-           "-t", f"{dur:.3f}", "-i", str(src)]
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{t0:.3f}",
+        "-t",
+        f"{dur:.3f}",
+        "-i",
+        str(src),
+    ]
     for png, _i in inputs:
         cmd += ["-i", str(png)]
-    cmd += ["-filter_complex", fc, "-map", "[vout]", "-an",
-            "-c:v", "libx264", "-preset", "superfast", "-crf", "20",
-            "-pix_fmt", "yuv420p", "-t", f"{dur:.3f}", str(part)]
+    cmd += [
+        "-filter_complex",
+        fc,
+        "-map",
+        "[vout]",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "superfast",
+        "-crf",
+        "20",
+        "-pix_fmt",
+        "yuv420p",
+        "-t",
+        f"{dur:.3f}",
+        str(part),
+    ]
     _sh(cmd, f"burn v4 chunk {ci}")
     mark.write_text("ok")
     log(f"burn v4 chunk {ci + 1}/{n_chunks} done ({dur:.1f}s, {len(inputs)} cards)")
@@ -652,11 +774,30 @@ def phase_burnconcat() -> None:
         parts.append(part)
     lst = V4 / "burn_v4_chunks.txt"
     lst.write_text("".join(f"file '{p.name}'\n" for p in parts))
-    _sh(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
-         "-i", str(lst), "-c", "copy", "-movflags", "+faststart",
-         str(V4 / "master_v4_burned.mp4")], "burn v4 concat")
-    log(f"master_v4_burned: {probe_dur(V4 / 'master_v4_burned.mp4'):.2f}s, "
-        f"{(V4 / 'master_v4_burned.mp4').stat().st_size / 1e6:.1f} MB")
+    _sh(
+        [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(lst),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(V4 / "master_v4_burned.mp4"),
+        ],
+        "burn v4 concat",
+    )
+    log(
+        f"master_v4_burned: {probe_dur(V4 / 'master_v4_burned.mp4'):.2f}s, "
+        f"{(V4 / 'master_v4_burned.mp4').stat().st_size / 1e6:.1f} MB"
+    )
 
 
 def phase_mux() -> None:
@@ -665,16 +806,40 @@ def phase_mux() -> None:
         raise SystemExit("burnconcat first")
     final = V4 / "master_postfx_v4.mp4"
     # the accepted audio (with the patched outro narration) is REUSED untouched
-    _sh(["ffmpeg", "-y", "-v", "error", "-i", str(burned),
-         "-i", str(V4 / "audio_v3.m4a"),
-         "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
-         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
-         "-movflags", "+faststart", str(final)], "final v4 mux")
+    _sh(
+        [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            str(burned),
+            "-i",
+            str(V4 / "audio_v3.m4a"),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-movflags",
+            "+faststart",
+            str(final),
+        ],
+        "final v4 mux",
+    )
     d_v, d_f = probe_dur(burned), probe_dur(final)
     if abs(d_f - d_v) > 1.0:
         raise SystemExit(f"duration drifted {abs(d_f - d_v):.2f}s — refusing")
-    log(f"muxed: master_postfx_v4.mp4 {d_f:.2f}s, "
-        f"{final.stat().st_size / 1e6:.1f} MB")
+    log(f"muxed: master_postfx_v4.mp4 {d_f:.2f}s, {final.stat().st_size / 1e6:.1f} MB")
 
 
 # --------------------------------------------------------------------- ship
@@ -687,10 +852,10 @@ def phase_ship() -> None:
         raise SystemExit("mux first")
     shutil.copyfile(final, SHIP_PACK / "final_720p.mp4")
     shutil.copyfile(SRT_V4, SHIP_PACK / "captions.srt")
-    shutil.copyfile(ASS_V4,
-                    Path("/home/z/my-project/download/eustis_acceptance_postfx_captions.ass"))
-    shutil.copyfile(SRT_V4,
-                    Path("/home/z/my-project/download/eustis_acceptance_captions.srt"))
+    shutil.copyfile(
+        ASS_V4, Path("/home/z/my-project/download/eustis_acceptance_postfx_captions.ass")
+    )
+    shutil.copyfile(SRT_V4, Path("/home/z/my-project/download/eustis_acceptance_captions.srt"))
     meta_p = SHIP_PACK / "metadata.json"
     if meta_p.exists():
         meta = json.loads(meta_p.read_text())
@@ -699,20 +864,22 @@ def phase_ship() -> None:
         meta["verification"]["duration_s"] = round(probe_dur(final), 1)
         meta["post_fx_v4"] = {
             "caption_truth": "VAD-evidence gates: speech_ratio<0.15 or ASR-loop "
-                             "(repeat>=3 at sr<0.5) or owner-confirmed windows "
-                             "-> gray-italic *unaudible*-family tags; LLM corrects "
-                             "text only where voice evidence allows; corrections "
-                             "re-aligned onto original word timestamps",
+            "(repeat>=3 at sr<0.5) or owner-confirmed windows "
+            "-> gray-italic *unaudible*-family tags; LLM corrects "
+            "text only where voice evidence allows; corrections "
+            "re-aligned onto original word timestamps",
             "speaker_colors": "role-flow audit on clearly audible lines only "
-                              "(sr>=0.5), flips capped 15%, every flip logged; "
-                              "unclear voice = neutral gray, never a speaker color",
+            "(sr>=0.5), flips capped 15%, every flip logged; "
+            "unclear voice = neutral gray, never a speaker color",
             "gap_fill": "VAD speech with no caption coverage -> *unaudible* "
-                        "gray-italic cues (owner law: audio without caption is "
-                        "handled)",
+            "gray-italic cues (owner law: audio without caption is "
+            "handled)",
         }
         meta_p.write_text(json.dumps(meta, indent=2))
-    log(f"shipped: {SHIP_PACK / 'final_720p.mp4'} "
-        f"({(SHIP_PACK / 'final_720p.mp4').stat().st_size / 1e6:.1f} MB)")
+    log(
+        f"shipped: {SHIP_PACK / 'final_720p.mp4'} "
+        f"({(SHIP_PACK / 'final_720p.mp4').stat().st_size / 1e6:.1f} MB)"
+    )
 
 
 PHASES = {

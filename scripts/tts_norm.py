@@ -21,6 +21,7 @@ Shared by the narration planner (pipe_03), the package TTS engine
 (audio_engine.tts) and the voice patch (postfx_v3), so every future video
 inherits the fix regardless of which entry point synthesized the voice.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -69,9 +70,7 @@ _META_HINTS = ("here is", "rewritten", "normalized:", "output:", "sure,", "as an
 # unit-ratio-shaped token behind ("391g/210L", "mg/dL", "km/h")? A letter-run
 # glued to a slash-bound token with digits. Used only to trigger one retry —
 # the LLM still does 100% of the solving.
-_UNSPOKEN_RATIO = re.compile(
-    r"[a-zA-Z]{1,5}\s*/\s*(?:[a-zA-Z]{1,5}|\d+(?:\.\d+)?[a-zA-Z]{1,5})"
-)
+_UNSPOKEN_RATIO = re.compile(r"[a-zA-Z]{1,5}\s*/\s*(?:[a-zA-Z]{1,5}|\d+(?:\.\d+)?[a-zA-Z]{1,5})")
 
 
 def _missed_ratios(src: str, out: str) -> bool:
@@ -129,9 +128,7 @@ def _validate(src: str, out: str) -> bool:
     if _digit_groups(src) != _digit_groups(out):
         return False  # a normalization that changes digits changes FACTS
     # script switch guard: ASCII-only source must not come back CJK/Cyrillic
-    if src.isascii() and not out.isascii():
-        return False
-    return True
+    return not (src.isascii() and not out.isascii())
 
 
 def _agent_normalize(text: str, context: str | None) -> str | None:
@@ -145,7 +142,7 @@ def _agent_normalize(text: str, context: str | None) -> str | None:
         prompt += f"\nContext (never mention it): {context}\n"
     prompt += f"\nLine:\n{text}"
     best: str | None = None
-    for attempt in range(3):
+    for _attempt in range(3):
         try:
             txt = llm_chat(prompt, timeout=120)
         except Exception:  # noqa: BLE001
@@ -157,9 +154,11 @@ def _agent_normalize(text: str, context: str | None) -> str | None:
         if not _missed_ratios(text, cand):
             return cand
         # the agent left unit ratios unspeakable — one strict retry
-        prompt = (_PROMPT + "\nYour previous answer still contains unspeakable "
-                  "slash unit tokens. Expand EVERY unit ratio into spoken words "
-                  f"(any unit system). Line:\n{text}")
+        prompt = (
+            _PROMPT + "\nYour previous answer still contains unspeakable "
+            "slash unit tokens. Expand EVERY unit ratio into spoken words "
+            f"(any unit system). Line:\n{text}"
+        )
     return best
 
 

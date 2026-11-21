@@ -12,6 +12,7 @@ voice-band energy floor so music/wind is not mistaken for speech.
 The speech_ratio of an utterance span is the fraction of VAD-positive
 30 ms frames inside [start, end].
 """
+
 import json
 import struct
 import wave
@@ -27,10 +28,9 @@ FRAME_MS = 30
 
 
 def load_pcm(path: Path) -> np.ndarray:
-    w = wave.open(str(path))
-    n = w.getnframes()
-    raw = w.readframes(n)
-    w.close()
+    with wave.open(str(path)) as w:
+        n = w.getnframes()
+        raw = w.readframes(n)
     return np.array(struct.unpack(f"<{n}h", raw), dtype=np.int16)
 
 
@@ -42,7 +42,7 @@ def vad_flags(pcm: np.ndarray, aggressiveness: int = 3) -> np.ndarray:
     flags = np.zeros(n_fr, dtype=bool)
     rms = np.zeros(n_fr)
     for i in range(n_fr):
-        seg = pcm[i * frame:(i + 1) * frame]
+        seg = pcm[i * frame : (i + 1) * frame]
         rms[i] = float(np.sqrt(np.mean(seg.astype(np.float64) ** 2)))
         try:
             flags[i] = vad.is_speech(seg.tobytes(), SR)
@@ -57,8 +57,9 @@ def speech_ratio(flags: np.ndarray, frame: int, s: float, e: float) -> float:
     return float(seg.mean()) if len(seg) else 0.0
 
 
-def speech_spans(flags: np.ndarray, frame: int, min_s: float = 0.45,
-                 join_gap: float = 0.30) -> list[tuple[float, float]]:
+def speech_spans(
+    flags: np.ndarray, frame: int, min_s: float = 0.45, join_gap: float = 0.30
+) -> list[tuple[float, float]]:
     """Contiguous VAD-positive spans >= min_s seconds, gaps < join_gap joined."""
     idx = np.flatnonzero(flags)
     if not len(idx):
@@ -72,8 +73,11 @@ def speech_spans(flags: np.ndarray, frame: int, min_s: float = 0.45,
             sps.append((st, prev))
             st = prev = i
     sps.append((st, prev))
-    return [(a * frame / SR, (b + 1) * frame / SR) for a, b in sps
-            if ((b - a + 1) * frame) / SR >= min_s]
+    return [
+        (a * frame / SR, (b + 1) * frame / SR)
+        for a, b in sps
+        if ((b - a + 1) * frame) / SR >= min_s
+    ]
 
 
 def voice_band_ratio(pcm: np.ndarray, s: float, e: float) -> float:
@@ -94,22 +98,25 @@ def segment_rms_db(pcm: np.ndarray, s: float, e: float) -> float:
     seg = pcm[a:b].astype(np.float64)
     if not len(seg):
         return -99.0
-    return 20 * np.log10(max(float(np.sqrt(np.mean(seg ** 2))), 1e-6) / 32768)
+    return 20 * np.log10(max(float(np.sqrt(np.mean(seg**2))), 1e-6) / 32768)
 
 
 if __name__ == "__main__":
     flags, rms, frame = vad_flags(load_pcm(V3 / "audio_src_16k.wav"))
     np.save(V3 / "vad_flags.npy", flags)
     np.save(V3 / "vad_rms.npy", rms)
-    json.dump({"frame_s": frame / SR, "sr": SR},
-              open(V3 / "vad_meta.json", "w"))
+    with open(V3 / "vad_meta.json", "w") as fh:
+        json.dump({"frame_s": frame / SR, "sr": SR}, fh)
     # validate on the hallucination window + known speech
-    for lo, hi, what in [(606.8, 614.0, "suspect reply zone"),
-                         (609.4, 628.9, "HALLUCINATION loop"),
-                         (300.0, 310.0, "mid-video control"),
-                         (630.0, 650.0, "outro narration")]:
+    for lo, hi, what in [
+        (606.8, 614.0, "suspect reply zone"),
+        (609.4, 628.9, "HALLUCINATION loop"),
+        (300.0, 310.0, "mid-video control"),
+        (630.0, 650.0, "outro narration"),
+    ]:
         r = speech_ratio(flags, frame, lo, hi)
         print(f"{what:22s} {lo:7.1f}-{hi:7.1f}  speech_ratio={r:.3f}")
     sp = speech_spans(flags, frame)
-    print(f"total speech spans: {len(sp)}, covered {sum(b - a for a, b in sp):.1f}s "
-          f"of {657.7:.0f}s")
+    print(
+        f"total speech spans: {len(sp)}, covered {sum(b - a for a, b in sp):.1f}s of {657.7:.0f}s"
+    )

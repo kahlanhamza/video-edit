@@ -65,6 +65,15 @@ target-version = "py312"
 select = ["E", "F", "I", "UP", "B", "SIM"]
 ignore = ["SIM108", "B008"]
 
+[tool.ruff.lint.per-file-ignores]
+# Pipeline ops scripts carry verified single-line DATA literals: LLM prompt
+# text (tts_norm, postfx v3 proofread), ASS style-header format lines and
+# ffmpeg filter graphs. Re-wrapping changes bytes that already shipped and
+# passed acceptance, so line-length is relaxed for these files only.
+"scripts/postfx_v3.py" = ["E501"]
+"scripts/caption_v4.py" = ["E501"]
+"scripts/tts_norm.py" = ["E501"]
+
 [tool.mypy]
 python_version = "3.12"
 mypy_path = "packages/core/src,packages/otio_engine/src,packages/audio_engine/src,packages/subtitles/src,packages/vision_fx/src,packages/agent_runtime/src,packages/perception/src,packages/skills/src,apps/api/src,apps/worker/src,apps/cli/src"
