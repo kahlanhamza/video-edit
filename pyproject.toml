@@ -17,6 +17,7 @@ dependencies = [
     "director-os-skills",
     "modal>=1.6.4",
     "webrtcvad>=2.0.10",
+    "boto3>=1.34",
     "setuptools<81",
 ]
 
