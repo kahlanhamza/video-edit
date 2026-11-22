@@ -16,6 +16,16 @@ export interface Job {
   error: string | null;
 }
 
+export interface RunResult {
+  project_id: string;
+  job_id: string;
+  reused: boolean;
+  dispatched: boolean;
+  detail: string;
+  stage: string;
+  progress_pct: number;
+}
+
 export interface TimelineVersion {
   version_num: number;
   created_by: string;
@@ -171,6 +181,14 @@ export const api = {
     });
   },
   getProject: (id: string) => req<Project>(`/projects/${id}`),
+  runPipeline: (id: string, videoUrl?: string, customHeaders?: Record<string, string>) =>
+    req<RunResult>(`/projects/${id}/run`, {
+      method: "POST",
+      body: JSON.stringify({
+        video_url: videoUrl || null,
+        custom_headers: customHeaders ?? null,
+      }),
+    }),
   ingestUrl: (id: string, url: string, customHeaders?: Record<string, string>) =>
     req<{ job_id: string; source_path: string; enqueued: boolean; detail: string }>(
       `/projects/${id}/ingest`,

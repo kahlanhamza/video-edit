@@ -128,12 +128,20 @@ class PipelineResult:
     post_fx: Any = None  # PostFxReport receipt when the post-FX pass ran
 
 
-def _update_job(s, job_id: str, stage: JobStage, progress: float, error: str | None = None) -> None:
-    job = s.get(JobRow, job_id)
-    job.current_stage = stage.value
-    job.progress_pct = progress
-    job.error_message = error
-    s.commit()
+def _update_job(
+    sessions, job_id: str, stage: JobStage, progress: float, error: str | None = None
+) -> None:
+    """Own the session internally — callers used to pass a bare session from
+    `deps.sessions()` that was never closed, leaking one pooled connection
+    per stage update (exhausts the pool once the Studio polls progress)."""
+    with sessions() as s:
+        job = s.get(JobRow, job_id)
+        if job is None:
+            return
+        job.current_stage = stage.value
+        job.progress_pct = progress
+        job.error_message = error
+        s.commit()
 
 
 def _set_status(s, project_id: str, status: ProjectStatus) -> None:
@@ -1844,11 +1852,11 @@ def stage_qa(
         export_enhance_ab(deps, project_id, enhance_info, video_path=raw_source)
     with deps.sessions() as s:
         if audit.ok:
-            _update_job(s, job_id, JobStage.human_gate, 100.0)
+            _update_job(deps.sessions, job_id, JobStage.human_gate, 100.0)
             _set_status(s, project_id, ProjectStatus.awaiting_review)
         else:
             failures = "; ".join(f"{c.name}: {c.detail}" for c in audit.failures)
-            _update_job(s, job_id, JobStage.qa, 90.0, error=f"qa_failed: {failures}")
+            _update_job(deps.sessions, job_id, JobStage.qa, 90.0, error=f"qa_failed: {failures}")
             _set_status(s, project_id, ProjectStatus.qa_failed)
             if retention_failed and final_path.exists():
                 quarantine = final_path.with_name(
@@ -1933,17 +1941,17 @@ def run_pipeline(
     deps.log(f"[pipeline] project={project_id} job={job_id}")
 
     try:
-        _update_job(deps.sessions(), job_id, JobStage.ingest, 5.0)
+        _update_job(deps.sessions, job_id, JobStage.ingest, 5.0)
         asset_id = stage_ingest(source, project_id, deps)
 
         if deps.redact_backend:
-            _update_job(deps.sessions(), job_id, JobStage.redaction, 15.0)
+            _update_job(deps.sessions, job_id, JobStage.redaction, 15.0)
             stage_redaction(asset_id, source, project_id, deps)
 
-        _update_job(deps.sessions(), job_id, JobStage.perception, 22.0)
+        _update_job(deps.sessions, job_id, JobStage.perception, 22.0)
         transcript = stage_perception(asset_id, source, project_id, deps)
 
-        _update_job(deps.sessions(), job_id, JobStage.proofread, 26.0)
+        _update_job(deps.sessions, job_id, JobStage.proofread, 26.0)
         try:
             proof = stage_proofread(asset_id, transcript, project_id, deps)
             transcript = {**transcript, "proofread": proof}
@@ -1955,7 +1963,7 @@ def run_pipeline(
         if deps.vision_enrich:
             stage_vision_enrichment(asset_id, source, deps)
 
-        _update_job(deps.sessions(), job_id, JobStage.planning, 40.0)
+        _update_job(deps.sessions, job_id, JobStage.planning, 40.0)
         timeline, version = stage_planning(
             asset_id, transcript, project_id, deps, force_replan=force_replan
         )
@@ -1968,7 +1976,7 @@ def run_pipeline(
             _asset = s.get(MediaAssetRow, asset_id)
             documentary_planned = bool(_asset and _asset.duration_s >= DOCUMENTARY_MIN_SOURCE_S)
         if deps.llm_direct and not documentary_planned:
-            _update_job(deps.sessions(), job_id, JobStage.planning, 42.0)
+            _update_job(deps.sessions, job_id, JobStage.planning, 42.0)
             from director_os.worker.director import stage_director
 
             try:
@@ -1978,7 +1986,7 @@ def run_pipeline(
             except Exception as e:  # noqa: BLE001 — the LLM is a director, not a dependency
                 deps.log(f"  [director] stage failed ({e}) — deterministic v1 cut rides on")
 
-        _update_job(deps.sessions(), job_id, JobStage.narration, 46.0)
+        _update_job(deps.sessions, job_id, JobStage.narration, 46.0)
         narration_audio: dict[str, Path] | None = None
         narration_clips: list[dict] = []
         try:
@@ -2042,7 +2050,7 @@ def run_pipeline(
         # their master WAV at render time, exactly as before.
         enhance_info = None
         if deps.audio_mode == "isolate_2bus":
-            _update_job(deps.sessions(), job_id, JobStage.audio_prep, 52.0)
+            _update_job(deps.sessions, job_id, JobStage.audio_prep, 52.0)
             from director_os.worker.audio_enhance import stage_audio_enhance
 
             kept = kept_windows_from_timeline(timeline, asset_id)
@@ -2057,7 +2065,7 @@ def run_pipeline(
                 music_flagged_spans=music_spans,
             )
 
-        _update_job(deps.sessions(), job_id, JobStage.render, 60.0)
+        _update_job(deps.sessions, job_id, JobStage.render, 60.0)
         report, otio_path = stage_render(
             timeline,
             project_id,
@@ -2068,7 +2076,7 @@ def run_pipeline(
             narration_audio=narration_audio if narration_clips else None,
         )
 
-        _update_job(deps.sessions(), job_id, JobStage.subtitles, 85.0)
+        _update_job(deps.sessions, job_id, JobStage.subtitles, 85.0)
         stage_subtitles(timeline, transcript, project_id, deps)
 
         # POST-FX (owner rule): blur + enhance + captions run ONLY now, on the
@@ -2077,7 +2085,7 @@ def run_pipeline(
         post_fx_report = None
         final_for_qa = report.final_path
         if deps.post_fx:
-            _update_job(deps.sessions(), job_id, JobStage.qa, 88.0)
+            _update_job(deps.sessions, job_id, JobStage.qa, 88.0)
             try:
                 from director_os.worker.post_fx import stage_post_fx
 
@@ -2093,7 +2101,7 @@ def run_pipeline(
             except Exception as e:  # noqa: BLE001
                 deps.log(f"  [post-fx] FAILED ({e}) — QA audits the un-post-fx'd master")
 
-        _update_job(deps.sessions(), job_id, JobStage.qa, 90.0)
+        _update_job(deps.sessions, job_id, JobStage.qa, 90.0)
         # expected duration = the DAG's frame-quantized total (what ffmpeg truly
         # renders), NOT the raw OTIO sum — unquantized sums accumulate per-segment
         # frame rounding and fail QA on long cuts (live: 4.92 s over 329 segments)
@@ -2116,7 +2124,7 @@ def run_pipeline(
         # is what the human ships). Soft-fail: a pack glitch never unpublishes
         # a QA-passed master. The JOB stays parked at human_gate — the pack is
         # a sub-product of the gate, not a stage beyond it.
-        _update_job(deps.sessions(), job_id, JobStage.ship_pack, 97.0)
+        _update_job(deps.sessions, job_id, JobStage.ship_pack, 97.0)
         try:
             from director_os.worker.ship_pack import build_ship_pack
 
@@ -2143,14 +2151,14 @@ def run_pipeline(
             )
         except Exception as e:  # noqa: BLE001 — pack failure is never a QA failure
             deps.log(f"  [ship-pack] skipped ({e})")
-        _update_job(deps.sessions(), job_id, JobStage.human_gate, 100.0)
+        _update_job(deps.sessions, job_id, JobStage.human_gate, 100.0)
     except Exception as e:
         # soft-failure persistence: the job row records WHERE it died, so the
         # operator (or the retry task) resumes instead of guessing. A HARD kill
         # (SIGKILL) persists nothing — resume works because every stage's
         # product lives in its domain table, never only in memory.
         stage, progress = _current_stage(deps.sessions, job_id)
-        _update_job(deps.sessions(), job_id, stage, progress, error=str(e)[:2000])
+        _update_job(deps.sessions, job_id, stage, progress, error=str(e)[:2000])
         raise
 
     shipped = post_fx_report.final_path if post_fx_report else report.final_path
@@ -2229,6 +2237,21 @@ def make_deps(
     )
 
 
+def production_transcribe(settings: Settings | None = None) -> Callable[[Path, str], Any] | None:
+    """Gladia transcriber when GLADIA_API_KEY is configured, else None.
+
+    The fleet entrypoint (`advance_job`) uses this so a real worker run
+    transcribes instead of dying at perception with "no transcribe callable".
+    Tests inject their own stub; production env provides the key.
+    """
+    resolved = settings or get_settings()
+    if not resolved.gladia_api_key:
+        return None
+    from director_os.perception.gladia import GladiaClient
+
+    return GladiaClient(resolved.gladia_api_key).transcribe
+
+
 def advance_job(
     job_id: str | None,
     project_id: str,
@@ -2242,8 +2265,11 @@ def advance_job(
     Registered as a Celery task in `director_os.worker.tasks`; kept as a plain
     function here so tests and a future Temporal workflow call it unchanged.
     """
-    deps = make_deps(database_url)
-    result = run_pipeline(Path(source), project_id, deps, job_id=job_id, force_replan=force_replan)
+    deps = make_deps(database_url, transcribe=production_transcribe())
+    # source stays a str: run_pipeline detects http(s) URLs and downloads
+    # through the guardrail UA layer — Path()-wrapping here would turn a URL
+    # into a bogus relative path and kill URL ingest on the fleet path.
+    result = run_pipeline(source, project_id, deps, job_id=job_id, force_replan=force_replan)
     return {
         "job_id": result.job_id,
         "final": str(result.final_path),

@@ -107,7 +107,8 @@ def _load_or_compute_spans(work_dir: Path) -> list[tuple[float, float]]:
     try:
         import sys
 
-        sys.path.insert(0, "/home/z/my-project/scripts")
+        repo_scripts = Path(__file__).resolve().parents[5] / "scripts"
+        sys.path.insert(0, str(repo_scripts))
         import vad_evidence
     except Exception as e:  # noqa: BLE001 — no engine available: hard fail
         raise ToolOperationError(

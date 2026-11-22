@@ -109,6 +109,20 @@ export default function ProjectsPage() {
         auto_discover: autoDiscover,
         ...(sources.length > 0 ? { sources } : {}),
       });
+      // one action: create AND run — the agent takes it from here (download,
+      // scrape sources, script, cut, render). Failures are resumable via the
+      // project page's Run/Resume button.
+      let runNote = "";
+      if (videoUrls.length > 0) {
+        try {
+          const run = await api.runPipeline(created.id, videoUrls[0]);
+          runNote = run.reused
+            ? "resumed the previous pipeline run"
+            : `pipeline started (${run.detail})`;
+        } catch (e) {
+          runNote = `pipeline not started: ${e instanceof Error ? e.message : e}`;
+        }
+      }
       // uploads run sequentially after the case exists; failures are
       // collected per-source so the rest of the case is not lost.
       const failed: string[] = [];
@@ -127,8 +141,10 @@ export default function ProjectsPage() {
       await refresh();
       if (failed.length > 0) {
         setError(
-          `case created, but ${failed.length} upload(s) failed — ${failed.join(" · ")}`,
+          `case created, but ${failed.length} upload(s) failed — ${failed.join(" · ")} ${runNote}`,
         );
+      } else if (runNote) {
+        setError(`case created — ${runNote}`);
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

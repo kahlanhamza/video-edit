@@ -693,7 +693,7 @@ def _align_words(new_text: str, orig_words: list[dict]) -> list[dict]:
 
 
 def _llm_json_array(prompt: str, expect_json: bool = True) -> list | dict:
-    sys.path.insert(0, "/home/z/my-project/scripts")
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from llm_bridge import llm_chat
 
     for attempt in range(3):

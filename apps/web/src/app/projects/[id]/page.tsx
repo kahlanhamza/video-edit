@@ -193,6 +193,8 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
   const [ingestUrl, setIngestUrl] = useState("");
   const [ingestBusy, setIngestBusy] = useState(false);
   const [ingestStatus, setIngestStatus] = useState<string | null>(null);
+  const [runBusy, setRunBusy] = useState(false);
+  const [runNote, setRunNote] = useState<string | null>(null);
   const [sources, setSources] = useState<CaseSourceOut[]>([]);
   const [dossier, setDossier] = useState<CaseDossier | null>(null);
   const [sourcesBusy, setSourcesBusy] = useState(false);
@@ -264,6 +266,24 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     esRef.current = es;
     return () => es.close();
   }, [id, jobs, refresh]);
+
+  async function runOrResume() {
+    setRunBusy(true);
+    setRunNote(null);
+    try {
+      const r = await api.runPipeline(id!);
+      setRunNote(
+        r.reused
+          ? `Resumed job ${r.job_id.slice(0, 8)}… from where it stopped — finished stages are never redone.`
+          : `Started job ${r.job_id.slice(0, 8)}… (${r.detail}).`,
+      );
+      await refresh();
+    } catch (e) {
+      setRunNote(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRunBusy(false);
+    }
+  }
 
   async function doIngest() {
     if (!ingestUrl.trim()) return;
@@ -381,14 +401,22 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
             )}
           </div>
         )}
-        {!latest && (
-          <p className="mt-2 text-sm text-slate-500">
-            No pipeline job yet — start one from the worker:
-            <code className="ml-2 rounded bg-slate-950 px-1.5 py-0.5 text-xs">
-              celery -A director_os.worker.celery_app.celery_app worker -l info
-            </code>
-          </p>
-        )}
+        <div className="mt-3 flex flex-wrap items-center gap-3">
+          <button className="btn" onClick={runOrResume} disabled={runBusy}>
+            {runBusy
+              ? "Starting…"
+              : latest && (progress?.error ?? latest.error)
+                ? "Resume pipeline"
+                : latest
+                  ? "Run again"
+                  : "Run pipeline"}
+          </button>
+          <span className="text-xs text-slate-500">
+            scrape sources → download video → transcribe → cut → render → QA — a
+            failed step continues where it stopped
+          </span>
+        </div>
+        {runNote && <p className="mt-2 text-xs text-slate-300">{runNote}</p>}
       </section>
 
       <section className="card">

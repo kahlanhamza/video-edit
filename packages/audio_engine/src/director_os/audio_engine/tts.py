@@ -55,9 +55,8 @@ def agent_normalize(text: str) -> str:
     if not TTS_NORMALIZE or not text or not text.strip():
         return text
     try:
-        scripts_dir = Path(
-            __import__("os").getenv("DIRECTOR_SCRIPTS_DIR", "/home/z/my-project/scripts")
-        )
+        default_dir = Path(__file__).resolve().parents[5] / "scripts"
+        scripts_dir = Path(__import__("os").getenv("DIRECTOR_SCRIPTS_DIR", str(default_dir)))
         if str(scripts_dir) not in _sys.path:
             _sys.path.insert(0, str(scripts_dir))
         from tts_norm import normalize as _norm

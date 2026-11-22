@@ -144,6 +144,9 @@ def test_approve_happy_path_flips_status_and_queues_render(
 
 
 def test_approve_degrades_cleanly_when_broker_down(api_client, reviewable_project, monkeypatch):
+    """Broker down no longer strands the approval: the gateway dispatches the
+    re-render inline (same advance_job entrypoint the fleet runs), so the
+    human decision is durable AND the render actually happens without a CLI."""
     from director_os.worker.celery_app import celery_app
 
     def boom(name, args=None, **kw):
@@ -154,8 +157,8 @@ def test_approve_degrades_cleanly_when_broker_down(api_client, reviewable_projec
     r = api_client.post(f"/projects/{pid}/approve")
     assert r.status_code == 202
     body = r.json()
-    assert body["enqueued"] is False
-    assert "enqueue failed" in body["detail"]
+    assert body["enqueued"] is True  # dispatched — inline, not stranded
+    assert "inline" in body["detail"]
     assert body["ok"] is True  # the human decision is durable even without a fleet
 
 

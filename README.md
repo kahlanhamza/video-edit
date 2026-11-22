@@ -58,9 +58,26 @@ npm run dev                  # -> http://localhost:3000 (Next dev server)
 
 The studio talks to the API at `NEXT_PUBLIC_API_BASE` (default
 `http://localhost:8000`; served by the compose `api` service, or run it
-yourself with `make api`). Alternative without docker:
-`make api` + `make worker` still need postgres+redis — the compose stack is
-the supported local path.
+yourself with `make api`). **No broker, no second terminal needed any more:**
+when no Celery broker is reachable, the gateway runs the pipeline itself in
+an inline worker thread (the exact `advance_job` entrypoint the fleet runs),
+so `make api` alone is a working Studio.
+
+### The one-button Studio flow
+
+1. New case: title + video URL(s) + case sources (article/news/PDF links,
+   pasted notes, uploads) → *Create case* — the pipeline **starts
+   automatically** (`POST /projects/{id}/run`)
+2. The agent scrapes the sources into the case dossier, downloads the video
+   (UA-guardrail), transcribes (Gladia), plans with the dossier, renders with
+   the segment cache and parks the master at the **Human Review Gate**
+3. A failed step is **resumed, never restarted**: press *Run pipeline /
+   Resume* on the project page (`POST /projects/{id}/run` reuses the newest
+   unfinished job — ASR never re-runs, cached segments never re-encode,
+   fetched sources never re-scrape)
+
+Prove the whole contract in one command: `uv run python scripts/live_api_smoke.py`
+(real HTTP surface: create → run → live Gladia ASR → render → human gate).
 
 ## The hard-won guardrails (PLAN §9) are executable
 
@@ -79,6 +96,7 @@ Every R&D bug is a CI test — see `tests/unit/test_g1..g8`:
 
 | Script | Purpose |
 | --- | --- |
+| `scripts/live_api_smoke.py` | **Studio-flow e2e**: real HTTP surface — create case with video link + HTML/PDF sources → `POST /run` (inline dispatch) → live Gladia ASR → render → human gate |
 | `scripts/e2e_real_video.py` | Full pipeline on REAL footage (resumable): ingest → YuNet face sweep → live Gladia ASR → render → subtitles → QA → burn-in |
 | `scripts/download_real_video.sh` | Rate-limit-aware Wikimedia download with backoff + checksum validation |
 | `scripts/demo_zoom_freeze.py` | Keyframed punch-in + freeze-callout demo over the real-footage master |
@@ -166,6 +184,7 @@ exhaustion (see STATUS.md session log).
 | M3 | Director Studio Next.js UI | **closed + acceptance-verified** — cases, live SSE pipeline progress, timeline versions, checkpoint-first dispatch with rollback, **proxy scrub player (480p) + mouse-drawn blur canvas + editable subtitle grid**, Human Review Gate publish (Next.js 15, `apps/web`). M3 acceptance was executed live in a real browser: a blur box drawn over the frame corner survived to the next render (cache-invalidation A/B + pixel proof) and an edited cue re-aligned via difflib without drift (see `docs/m3_acceptance/` evidence) |
 | M4 | Multimodal vision + Modal serverless GPU | **4-job vision stack landed, real-footage proven** — (1) CPU: YuNet face sweep + frame-quality pre-filter (dark/blur scoring); (2) VLM: 2-tier Gemini (`gemini-3.5-flash-lite` contact-sheet indexing / `gemini-3.8-flash` Frames-on-Demand QA) with **Modal-egress fallback for geo-blocked regions** (auto-retry, transient-503 backoff); (3) GPU fleet: `deploy/modal/redact_gpu.py` — YOLOv8-face + license-plate + ByteTrack persistent IDs → time-binned tracked `BlurRegion`s (modal free tier needs a payment method for T4; CPU-mode works today), YuNet fallback when fleet down; (4) AXON overlay OCR → intro card auto-population. Renderer: `enable='between(t,..)'` time-windowed blur (per-segment source→local translation) — pixel-verified on real footage (var 2.6 blurred vs 295.5 sharp). Full e2e on real Eustis FL bodycam: auto face blur + burned ASR subtitles delivered |
 | M6 | AI editor agent (Director pass) | **live, operator-as-LLM** — the five caption-gate workbench (`captions.*`, `qa.run_caption_checks`), deterministic critic `qa.self_audit`, durable session memory, undo/rollback rebind, zoom/freeze polish tools, hermetic evals 6/6 bound into CI; full 2627 s Eustis run: LIVE Gladia ASR (3944 words) → 53 measured-unreliable windows tagged + 44 residual gap fills → five gates GREEN → critic GREEN → durable timeline save. Engine fix: frame-quantized duration expectation (concat drift 4.92 s / 329 segments caught by pipeline QA) |
+| M7 | Studio one-button + durable resume + dispatch hardening | **landed + live-smoke proven** — `POST /projects/{id}/run` starts AND resumes (newest unfinished job reused; every stage short-circuits on its domain row), shared dispatcher makes celery→inline fallback automatic for run/ingest/approve/replan (no broker = gateway runs the pipeline itself, no CLI), fleet entrypoint fixed (`advance_job` no longer Path-wraps URL sources; Gladia transcriber wired from settings), `_update_job` pooled-session leak fixed, sandbox-hardcoded script paths made repo-relative, superseded v-series scripts removed (`caption_v4`, `qa_v6`, `runner_v4`); 3× live API smoke GREEN (create → run → Gladia → render → human gate) |
 | M5 | Cloud deployment + multi-channel hardening | **scaffolding landed** — compose healthchecks/restart policies, cost dashboard endpoint (durations + tokens), multi-channel publish fan-out with honest `not_configured` states, `.env.example`, **kill-mid-encode crash-recovery drill executable** |
 
 Live credentials (verified 2026-11-17): **Gladia cloud ASR is end-to-end green**

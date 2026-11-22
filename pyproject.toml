@@ -73,7 +73,6 @@ ignore = ["SIM108", "B008"]
 # ffmpeg filter graphs. Re-wrapping changes bytes that already shipped and
 # passed acceptance, so line-length is relaxed for these files only.
 "scripts/postfx_v3.py" = ["E501"]
-"scripts/caption_v4.py" = ["E501"]
 "scripts/agent_evals.py" = ["E501"]
 "scripts/agent_session_me.py" = ["E501"]
 "tests/unit/test_inspection_tools.py" = ["E501"]
@@ -82,7 +81,6 @@ ignore = ["SIM108", "B008"]
 "scripts/tts_norm.py" = ["E501"]
 "scripts/caption_v6.py" = ["E501"]
 "scripts/render_final_v6.py" = ["E501"]
-"scripts/qa_v6.py" = ["E501"]
 
 [tool.mypy]
 python_version = "3.12"

@@ -169,6 +169,85 @@ def _add_source_rows(project_id: str, body: ProjectCreate) -> int:
         s.close()
 
 
+# ------------------------------------------------------- job dispatch (one path for every trigger)
+_in_flight: set[str] = set()
+_in_flight_lock = __import__("threading").Lock()
+
+
+def _dispatch_advance(
+    job_id: str | None, project_id: str, source: str, *, force_replan: bool = False
+) -> tuple[bool, str]:
+    """Celery when the broker accepts the task, inline gateway thread otherwise.
+
+    The inline path is what makes `make api` alone enough for the Studio: the
+    API process runs the exact `advance_job` entrypoint the worker fleet runs,
+    with identical resume semantics. Double-dispatch of the same job is
+    guarded (the pipeline is resumable, not re-entrant). Returns
+    (dispatched, detail).
+    """
+    args = [job_id, project_id, source, get_settings().database_url]
+    if force_replan:
+        args = [project_id, source, get_settings().database_url]
+    try:
+        from director_os.worker.celery_app import celery_app
+
+        task = "directoros.replan_job" if force_replan else "directoros.advance_job"
+        celery_app.send_task(task, args=args, retry=False)
+        return True, "queued on the worker fleet"
+    except Exception:  # noqa: BLE001 — no broker must never 500 the Studio
+        pass
+
+    if force_replan:
+        _thread_replan(project_id, source)
+        return True, "no broker — replan running inline in the gateway process"
+
+    if job_id is not None:
+        with _in_flight_lock:
+            if job_id in _in_flight:
+                return True, "job already running — watching progress"
+            _in_flight.add(job_id)
+
+    def _work() -> None:
+        from director_os.worker.pipeline import advance_job
+
+        try:
+            advance_job(job_id, project_id, source, get_settings().database_url)
+        except Exception as e:  # noqa: BLE001 — run_pipeline persisted the failure
+            print(f"[inline pipeline] job {str(job_id)[:8]} failed: {e}", flush=True)
+        finally:
+            if job_id is not None:
+                with _in_flight_lock:
+                    _in_flight.discard(job_id)
+
+    import threading
+
+    threading.Thread(target=_work, daemon=True, name=f"pipeline-{str(job_id)[:8]}").start()
+    return True, "no broker — pipeline running inline in the gateway process"
+
+
+def _thread_replan(project_id: str, source: str) -> None:
+    def _work() -> None:
+        from director_os.worker.pipeline import advance_job
+
+        try:
+            advance_job(None, project_id, source, get_settings().database_url, force_replan=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[inline replan] {project_id[:8]} failed: {e}", flush=True)
+
+    import threading
+
+    threading.Thread(target=_work, daemon=True, name=f"replan-{project_id[:8]}").start()
+
+
+def _validate_http_url(url: str, what: str) -> str:
+    url = (url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(
+            status_code=422, detail=f"{what} must be an http(s) URL, got: {url[:120]}"
+        )
+    return url
+
+
 @app.post("/projects", status_code=201, response_model=ProjectOut)
 def create_project(body: ProjectCreate) -> ProjectOut:
     s = session()
@@ -471,16 +550,10 @@ def _dispatch_replan(project_id: str) -> str:
         ).scalar_one()
     finally:
         s.close()
-    try:
-        from director_os.worker.tasks import replan_job_task
-
-        replan_job_task.delay(project_id, asset.source_url or "", get_settings().database_url)
-        return "replan task queued — the worker re-runs Stage 6+ (no re-ASR)"
-    except Exception as e:  # no broker in dev: the operator runs the worker
-        return (
-            "dossier refreshed; no worker broker reachable — start the worker and it "
-            f"will pick up the replan (detail: {e})"
-        )
+    enqueued, detail = _dispatch_advance(
+        None, project_id, asset.source_url or "", force_replan=True
+    )
+    return f"replan dispatched ({detail}) — Stage 6+ re-runs, ASR never re-runs"
 
 
 # ------------------------------------------------------------------ SSE progress
@@ -1157,23 +1230,128 @@ def ingest_url(project_id: str, body: IngestRequest) -> IngestResponse:
     finally:
         s.close()
 
-    enqueued, detail = False, "job queued — worker fleet will advance it"
-    try:
-        from director_os.worker.celery_app import celery_app
-
-        celery_app.send_task(
-            "directoros.advance_job",
-            args=[job_id, project_id, str(source), get_settings().database_url],
-            retry=False,
-        )
-        enqueued = True
-        detail = "queued on the worker fleet"
-    except Exception as e:  # broker down / worker package absent: stays queued
-        detail = (
-            f"job queued — fleet enqueue failed ({type(e).__name__}); "
-            "start the worker fleet to advance"
-        )
+    enqueued, detail = _dispatch_advance(job_id, project_id, str(source))
     return IngestResponse(job_id=job_id, source_path=str(source), enqueued=enqueued, detail=detail)
+
+
+# ------------------------------------------------------- run pipeline (Studio one-button)
+class RunRequest(BaseModel):
+    """Start (or RESUME) the autonomous pipeline for a project.
+
+    With a `video_url` the gateway downloads it server-side (kill-safe .part
+    rename) exactly like /ingest, then dispatches. Without one, the project's
+    registered media asset (or its newest unfinished job) is resumed — a
+    failed step continues WHERE IT STOPPED; finished stages short-circuit
+    (ASR never re-runs, cached segments never re-encode, fetched sources
+    never re-scrape).
+    """
+
+    video_url: str | None = None
+    custom_headers: dict[str, str] | None = None
+
+
+class RunResponse(BaseModel):
+    project_id: str
+    job_id: str
+    reused: bool
+    dispatched: bool
+    detail: str
+    stage: str
+    progress_pct: float
+
+
+@app.post("/projects/{project_id}/run", response_model=RunResponse, status_code=202)
+def run_project(project_id: str, body: RunRequest | None = None) -> RunResponse:
+    """One button: scrape sources -> ingest video -> ASR -> cut -> render -> QA.
+
+    Resume contract: the project's newest unfinished job is reused when no
+    fresh media URL is given; every stage persists its product, so a retry
+    continues from the failed stage instead of restarting from scratch.
+    """
+    body = body or RunRequest()
+
+    if body.video_url is not None and body.video_url.strip():
+        # fresh media: same kill-safe download path as /ingest
+        vurl = _validate_http_url(body.video_url, "video_url")
+        dest_dir = get_settings().output_dir / "pipeline" / project_id / "sources"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / _source_filename(vurl)
+        try:
+            source = download(vurl, dest, extra_headers=body.custom_headers or None)
+        except Exception as e:  # httpx errors, bad status codes, disk failures
+            raise HTTPException(status_code=502, detail=f"media download failed: {e}") from e
+        source_str = str(source)
+
+        s = session()
+        try:
+            if s.get(ProjectRow, project_id) is None:
+                raise HTTPException(status_code=404, detail="project not found")
+            job = JobRow(project_id=project_id, current_stage="ingest", progress_pct=0.0)
+            s.add(job)
+            s.commit()
+            job_id = job.id
+        finally:
+            s.close()
+        reused = False
+    else:
+        # resume path: newest unfinished job + its registered media asset
+        s = session()
+        try:
+            if s.get(ProjectRow, project_id) is None:
+                raise HTTPException(status_code=404, detail="project not found")
+            last = s.execute(
+                select(JobRow)
+                .where(JobRow.project_id == project_id)
+                .order_by(JobRow.created_at.desc(), JobRow.id.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            asset = s.execute(
+                select(MediaAssetRow)
+                .where(MediaAssetRow.project_id == project_id)
+                .order_by(MediaAssetRow.id)
+                .limit(1)
+            ).scalar_one_or_none()
+            unfinished = last is not None and (
+                last.error_message is not None or (last.progress_pct or 0.0) < 100.0
+            )
+            if unfinished and asset is not None and asset.source_url:
+                job_id, source_str, reused = last.id, asset.source_url, True  # type: ignore[union-attr]
+            elif asset is not None and asset.source_url:
+                # finished pipeline but a finished job exists: re-advance is
+                # harmless (every stage short-circuits) — but a fresh job is
+                # cleaner for SSE tracking
+                job = JobRow(project_id=project_id, current_stage="ingest", progress_pct=0.0)
+                s.add(job)
+                s.commit()
+                job_id, source_str, reused = job.id, asset.source_url, False
+            else:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "nothing to run yet — provide a video_url (or ingest one first) "
+                        "so the pipeline has media to process"
+                    ),
+                )
+        finally:
+            s.close()
+
+    dispatched, dispatch_detail = _dispatch_advance(job_id, project_id, source_str)
+    s2 = session()
+    try:
+        job_row = s2.get(JobRow, job_id)
+        stage = job_row.current_stage if job_row else "ingest"
+        pct = job_row.progress_pct if job_row else 0.0
+    finally:
+        s2.close()
+    return RunResponse(
+        project_id=project_id,
+        job_id=job_id,
+        reused=reused,
+        dispatched=dispatched,
+        detail=dispatch_detail,
+        stage=stage,
+        progress_pct=pct,
+    )
 
 
 # ------------------------------------------------------- approve & render gate
@@ -1228,22 +1406,12 @@ def approve_project(project_id: str) -> ApproveResponse:
     finally:
         s.close()
 
-    enqueued, detail = False, "approve job queued — worker fleet will advance it"
-    try:
-        from director_os.worker.celery_app import celery_app
-
-        celery_app.send_task(
-            "directoros.advance_job",
-            args=[job_id, project_id, source, get_settings().database_url],
-            retry=False,
-        )
-        enqueued = True
-        detail = "approved — re-render queued on the worker fleet (cache hits are free)"
-    except Exception as e:  # broker down / worker package absent: stays queued
-        detail = (
-            f"approve job queued — fleet enqueue failed ({type(e).__name__}); "
-            "start the worker fleet to advance"
-        )
+    enqueued, dispatch_detail = _dispatch_advance(job_id, project_id, source)
+    detail = (
+        "approved — re-render dispatched (cache hits are free)"
+        if enqueued
+        else "approve dispatch failed"
+    ) + f" ({dispatch_detail})"
     return ApproveResponse(
         ok=True, job_id=job_id, status="approved", version=version, enqueued=enqueued, detail=detail
     )
