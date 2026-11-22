@@ -20,7 +20,14 @@ interface RowState {
   saved: boolean;
 }
 
-export default function SubtitleGrid({ projectId }: { projectId: string }) {
+export default function SubtitleGrid({
+  projectId,
+  onSeek,
+}: {
+  projectId: string;
+  /** click a row timecode to send the program monitor there */
+  onSeek?: (t: number) => void;
+}) {
   const [cues, setCues] = useState<Cue[]>([]);
   const [rows, setRows] = useState<Record<number, RowState>>({});
   const [error, setError] = useState<string | null>(null);
@@ -69,29 +76,34 @@ export default function SubtitleGrid({ projectId }: { projectId: string }) {
   }
 
   if (loaded && cues.length === 0) {
-    return <p className="text-sm text-slate-500">no cues yet — run the pipeline first</p>;
+    return (
+      <p className="text-[12px] leading-relaxed text-[var(--tx-3)]">
+        No cues yet — transcription lands them here (and on the CC track) once
+        the pipeline runs.
+      </p>
+    );
   }
 
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between">
-        <p className="text-xs text-slate-500">
+        <p className="text-[11px] text-[var(--tx-3)]">
           {cues.length} cue(s) · word timings re-aligned on save (difflib, no drift)
         </p>
-        <a className="btn-ghost text-xs" href={srtDownloadUrl(projectId)} download>
+        <a className="btn-ghost !h-6 !px-2 !text-[11px]" href={srtDownloadUrl(projectId)} download>
           download .srt
         </a>
       </div>
-      {error && <p className="text-xs text-red-400">{error}</p>}
-      <div className="max-h-96 overflow-y-auto rounded border border-slate-800">
-        <table className="w-full table-fixed text-sm">
-          <thead className="sticky top-0 bg-slate-900 text-left text-xs uppercase text-slate-500">
+      {error && <p className="text-[11px] text-[var(--err)]">{error}</p>}
+      <div className="overflow-y-auto rounded-md border border-[var(--line-1)]">
+        <table className="w-full table-fixed text-[12px]">
+          <thead className="sticky top-0 bg-[var(--bg-2)] text-left">
             <tr>
-              <th className="w-10 px-2 py-1">#</th>
-              <th className="w-28 px-2 py-1">in/out</th>
-              <th className="w-32 px-2 py-1">speaker</th>
-              <th className="px-2 py-1">text</th>
-              <th className="w-16 px-2 py-1"></th>
+              <th className="micro-label w-9 px-2 py-1.5">#</th>
+              <th className="micro-label w-24 px-1 py-1.5">in/out</th>
+              <th className="micro-label w-24 px-1 py-1.5">speaker</th>
+              <th className="micro-label px-1 py-1.5">text</th>
+              <th className="w-14 px-1 py-1.5"></th>
             </tr>
           </thead>
           <tbody>
@@ -99,29 +111,35 @@ export default function SubtitleGrid({ projectId }: { projectId: string }) {
               const row = rows[c.index];
               const dirty = row && (row.text !== c.text || row.speaker !== c.speaker);
               return (
-                <tr key={c.index} className="border-t border-slate-800 align-top">
-                  <td className="px-2 py-1 text-slate-500">{c.index}</td>
-                  <td className="px-2 py-1 font-mono text-xs text-slate-400">
-                    {fmtMs(c.start_ms)}–{fmtMs(c.end_ms)}
+                <tr key={c.index} className="border-t border-[var(--line-1)] align-top">
+                  <td className="px-2 py-1 text-[var(--tx-3)]">{c.index}</td>
+                  <td className="px-1 py-1">
+                    <button
+                      className="tcode text-[10px] text-[var(--tx-3)] hover:text-[var(--acc)]"
+                      title="seek program monitor here"
+                      onClick={() => onSeek?.(c.start_ms / 1000)}
+                    >
+                      {fmtMs(c.start_ms)}–{fmtMs(c.end_ms)}
+                    </button>
                   </td>
-                  <td className="px-2 py-1">
+                  <td className="px-1 py-1">
                     <input
-                      className="input px-1 py-0.5 text-xs"
+                      className="input !h-6 !px-1.5 !text-[11px]"
                       value={row?.speaker ?? c.speaker}
                       onChange={(e) => updateLocal(c.index, { speaker: e.target.value })}
                     />
                   </td>
-                  <td className="px-2 py-1">
+                  <td className="px-1 py-1">
                     <textarea
-                      className="input w-full px-1 py-0.5 text-xs"
+                      className="input !px-1.5 !py-1 !text-[11px]"
                       rows={1}
                       value={row?.text ?? c.text}
                       onChange={(e) => updateLocal(c.index, { text: e.target.value })}
                     />
                   </td>
-                  <td className="px-2 py-1 text-right">
+                  <td className="px-1 py-1 text-right">
                     <button
-                      className="btn-ghost px-2 py-0.5 text-xs"
+                      className="btn-ghost !h-6 !px-2 !text-[11px]"
                       disabled={!dirty || row?.saving}
                       onClick={() => save(c.index)}
                     >

@@ -363,7 +363,13 @@ def run_probe(
     if provider in ("llm", "llm_openai_compat", "meta", "openai_compat"):
         base = p("LLM_BASE_URL")
         model = p("LLM_MODEL") or "muse-ember-1.0"
-        return probe_openai_compat(p("LLM_API_KEY"), base, model, transport=transport)
+        if base:
+            return probe_openai_compat(p("LLM_API_KEY"), base, model, transport=transport)
+        # Blank Base URL = native Google AI Studio — same law as the vision
+        # card. Without this branch, a saved + valid Gemini key probed with
+        # empty inputs returned "Base URL is empty" FAILED (bug report:
+        # "test says connected, clicking test errors until I re-save").
+        return probe_gemini_rest(p("LLM_API_KEY"), transport=transport)
     if provider in ("llm_gemini", "gemini"):
         return probe_gemini_rest(p("LLM_API_KEY"), transport=transport)
     if provider in ("vision", "vision_gemini"):

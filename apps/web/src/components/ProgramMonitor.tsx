@@ -1,0 +1,393 @@
+"use client";
+
+// ProgramMonitor — the NLE program viewer: letterboxed proxy on true black,
+// mouse-drawn blur boxes over it, and a professional transport bar
+// (go-start / step-back / play / step-fwd / go-end + hero timecode).
+// Keyboard: Space play · J/K/L shuttle · I/O in-out · arrows frame-step.
+
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+} from "react";
+import { Asset, Redaction, api, assetProxyUrl, assetScrubUrl } from "@/lib/api";
+import { formatTimecodeFrames, scrubBackground, scrubFrameCount, scrubFrameIndex } from "@/lib/nle";
+import { useNLEShortcuts } from "@/hooks/useNLEShortcuts";
+import { Icon } from "./studio/icons";
+
+export interface MonitorHandle {
+  seek: (t: number) => void;
+}
+
+interface Draft {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+export const ProgramMonitor = forwardRef<
+  MonitorHandle,
+  {
+    projectId: string;
+    asset: Asset;
+    fps: number;
+    onTimeUpdate: (t: number) => void;
+    onChanged: () => void;
+  }
+>(function ProgramMonitor(
+  { projectId, asset, fps, onTimeUpdate, onChanged },
+  ref,
+) {
+  const [regions, setRegions] = useState<Redaction[]>([]);
+  const [draft, setDraft] = useState<Draft | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [showExisting, setShowExisting] = useState(true);
+  const [drawMode, setDrawMode] = useState(false);
+  const [playing, setPlaying] = useState(false);
+  const [time, setTime] = useState(0);
+  const [videoReady, setVideoReady] = useState(false);
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+
+  const { state: nle } = useNLEShortcuts({ videoRef, fps, enabled: !drawMode });
+
+  useImperativeHandle(ref, () => ({
+    seek: (t: number) => {
+      const v = videoRef.current;
+      if (v) v.currentTime = t;
+      setTime(t);
+    },
+  }));
+
+  const onTimeUpdateRef = useRef(onTimeUpdate);
+  onTimeUpdateRef.current = onTimeUpdate;
+
+  const reload = useCallback(async () => {
+    try {
+      setRegions(await api.listRedactions(projectId));
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    reload();
+  }, [reload]);
+
+  function toDisplayCoords(ev: React.MouseEvent): { x: number; y: number } {
+    const rect = wrapRef.current!.getBoundingClientRect();
+    return {
+      x: Math.max(0, Math.min(ev.clientX - rect.left, rect.width)),
+      y: Math.max(0, Math.min(ev.clientY - rect.top, rect.height)),
+    };
+  }
+
+  function onMouseDown(ev: React.MouseEvent) {
+    const p = toDisplayCoords(ev);
+    setDraft({ x0: p.x, y0: p.y, x1: p.x, y1: p.y });
+  }
+
+  function onMouseMove(ev: React.MouseEvent) {
+    if (!draft) return;
+    const p = toDisplayCoords(ev);
+    setDraft({ ...draft, x1: p.x, y1: p.y });
+  }
+
+  async function onMouseUp() {
+    if (!draft) return;
+    const dx = Math.abs(draft.x1 - draft.x0);
+    const dy = Math.abs(draft.y1 - draft.y0);
+    setDraft(null);
+    if (dx < 8 || dy < 8) return;
+    const rect = wrapRef.current!.getBoundingClientRect();
+    const sx = asset.width / rect.width;
+    const sy = asset.height / rect.height;
+    try {
+      await api.addRedaction(projectId, {
+        x: Math.round(Math.min(draft.x0, draft.x1) * sx),
+        y: Math.round(Math.min(draft.y0, draft.y1) * sy),
+        w: Math.max(1, Math.round(dx * sx)),
+        h: Math.max(1, Math.round(dy * sy)),
+      });
+      await reload();
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function removeRegion(id: string) {
+    try {
+      await api.deleteRedaction(projectId, id);
+      await reload();
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  const rect = wrapRef.current?.getBoundingClientRect();
+  const scaleX = rect ? rect.width / asset.width : 0;
+  const scaleY = rect ? rect.height / asset.height : 0;
+
+  const transport = (fn: (v: HTMLVideoElement) => void) => () => {
+    if (videoRef.current) fn(videoRef.current);
+  };
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      {/* ---- viewer toolbar ---- */}
+      <div className="flex h-9 shrink-0 items-center gap-2 border-b border-[var(--line-1)] bg-[var(--bg-2)] px-2.5">
+        <span className="micro-label">Program</span>
+        <div className="flex-1" />
+        <button
+          className="icon-btn"
+          data-active={drawMode}
+          title="Draw mode — drag a box on the video to add a privacy blur (raw-frame coords)"
+          onClick={() => {
+            setDrawMode(!drawMode);
+            setDraft(null);
+          }}
+        >
+          <Icon name="wand" />
+        </button>
+        <button
+          className="icon-btn"
+          data-active={showExisting}
+          title={showExisting ? "hide blur boxes" : "show blur boxes"}
+          onClick={() => setShowExisting((v) => !v)}
+        >
+          <Icon name={showExisting ? "eye" : "eyeOff"} />
+        </button>
+        <span className="chip" title="studio-drawn blur boxes">blur boxes: {regions.length}</span>
+      </div>
+
+      {/* ---- video surface ---- */}
+      <div className="relative flex min-h-0 flex-1 items-center justify-center bg-black">
+        <div
+          ref={wrapRef}
+          className={`relative h-full max-h-full select-none ${drawMode ? "cursor-crosshair" : ""}`}
+          onMouseDown={drawMode ? onMouseDown : undefined}
+          onMouseMove={drawMode ? onMouseMove : undefined}
+          onMouseUp={drawMode ? onMouseUp : undefined}
+        >
+          {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
+          <video
+            ref={videoRef}
+            src={assetProxyUrl(asset.id)}
+            className="h-full w-auto"
+            style={{ aspectRatio: `${asset.width} / ${asset.height}` }}
+            preload="metadata"
+            playsInline
+            onLoadedData={() => setVideoReady(true)}
+            onCanPlay={() => setVideoReady(true)}
+            onTimeUpdate={(ev) => {
+              const t = ev.currentTarget.currentTime;
+              setTime(t);
+              onTimeUpdateRef.current?.(t);
+            }}
+            onPlay={() => setPlaying(true)}
+            onPause={() => setPlaying(false)}
+            onClick={() => {
+              const v = videoRef.current;
+              if (v) v.paused ? v.play() : v.pause();
+            }}
+          />
+          {/* poster overlay — the real first scrub frame until the video decodes */}
+          {!videoReady && (
+            <div
+              className="pointer-events-none absolute inset-0 flex items-center justify-center"
+              aria-hidden
+            >
+              <div
+                className="h-full w-full"
+                style={scrubBackground(
+                  scrubFrameIndex(0, asset.duration_s),
+                  scrubFrameCount(asset.duration_s),
+                  assetScrubUrl(asset.id),
+                )}
+              />
+            </div>
+          )}
+          {nle.inS !== null && (
+            <span
+              className="pointer-events-none absolute inset-y-1 border-l-2 border-[var(--ok)]"
+              title={`in ${nle.inS.toFixed(2)}s`}
+              style={{ left: `${Math.min(100, (nle.inS / asset.duration_s) * 100)}%` }}
+            />
+          )}
+          {nle.outS !== null && (
+            <span
+              className="pointer-events-none absolute inset-y-1 border-r-2 border-[var(--acc)]"
+              title={`out ${nle.outS.toFixed(2)}s`}
+              style={{ left: `${Math.min(100, (nle.outS / asset.duration_s) * 100)}%` }}
+            />
+          )}
+          {nle.splits.map((t) => (
+            <span
+              key={t}
+              title={`split ${t.toFixed(2)}s`}
+              className="pointer-events-none absolute top-1 h-2.5 w-0.5 bg-[var(--warn)]"
+              style={{ left: `${Math.min(100, (t / asset.duration_s) * 100)}%` }}
+            />
+          ))}
+          {showExisting &&
+            scaleX > 0 &&
+            regions.map((r) => (
+              <div
+                key={r.id}
+                className="pointer-events-none absolute border border-[var(--err)] bg-[rgba(241,109,109,0.14)]"
+                style={{
+                  left: r.x * scaleX,
+                  top: r.y * scaleY,
+                  width: r.w * scaleX,
+                  height: r.h * scaleY,
+                }}
+                title={`${r.label || "blur"} ${r.w}x${r.h}@${r.x},${r.y}`}
+              />
+            ))}
+          {draft && (
+            <div
+              className="pointer-events-none absolute border border-dashed border-[var(--acc)] bg-[var(--acc-bg)]"
+              style={{
+                left: Math.min(draft.x0, draft.x1),
+                top: Math.min(draft.y0, draft.y1),
+                width: Math.abs(draft.x1 - draft.x0),
+                height: Math.abs(draft.y1 - draft.y0),
+              }}
+            />
+          )}
+        </div>
+      </div>
+
+      {/* ---- transport bar ---- */}
+      <div className="flex h-11 shrink-0 items-center gap-1 border-t border-[var(--line-1)] bg-[var(--bg-2)] px-2.5">
+        <button
+          className="icon-btn"
+          title="go to start (Home)"
+          onClick={transport((v) => {
+            v.currentTime = 0;
+            onTimeUpdate(0);
+          })}
+        >
+          <Icon name="goStart" />
+        </button>
+        <button
+          className="icon-btn"
+          title="step back one frame (←)"
+          onClick={transport((v) => {
+            v.pause();
+            v.currentTime = Math.max(0, v.currentTime - 1 / fps);
+          })}
+        >
+          <Icon name="stepBack" />
+        </button>
+        <button
+          className="icon-btn !h-8 !w-8 rounded-full border border-[var(--line-2)] text-[var(--tx-1)] hover:border-[var(--acc)] hover:text-[var(--acc)]"
+          title="play / pause (Space)"
+          onClick={transport((v) => (v.paused ? v.play() : v.pause()))}
+        >
+          <Icon name={playing ? "pause" : "play"} size={18} />
+        </button>
+        <button
+          className="icon-btn"
+          title="step forward one frame (→)"
+          onClick={transport((v) => {
+            v.pause();
+            v.currentTime = Math.min(asset.duration_s, v.currentTime + 1 / fps);
+          })}
+        >
+          <Icon name="stepFwd" />
+        </button>
+        <button
+          className="icon-btn"
+          title="go to end (End)"
+          onClick={transport((v) => {
+            v.currentTime = asset.duration_s;
+          })}
+        >
+          <Icon name="goEnd" />
+        </button>
+        <span className="tcode tcode-hero ml-2">
+          {formatTimecodeFrames(time, fps)}
+        </span>
+        <span className="tcode text-[12px] text-[var(--tx-3)]">
+          / {formatTimecodeFrames(asset.duration_s, fps)}
+        </span>
+        <div className="flex-1" />
+        <span className="chip" title="source resolution and frame rate">
+          {asset.width}×{asset.height} · {fps.toFixed(2)} fps
+        </span>
+      </div>
+
+      {/* ---- blur region list (contextual, under transport) ---- */}
+      {(regions.length > 0 || drawMode) && (
+        <div className="max-h-24 shrink-0 overflow-y-auto border-t border-[var(--line-1)] px-2.5 py-1.5">
+          {drawMode && (
+            <p className="text-[11px] text-[var(--tx-2)]">
+              Draw mode on — drag a box over a face or watermark; it rides the
+              raw footage at render time.
+            </p>
+          )}
+          {regions.map((r) => (
+            <div
+              key={r.id}
+              className="group flex items-center justify-between rounded px-1 py-0.5 hover:bg-[var(--bg-2)]"
+            >
+              <span className="tcode text-[11px] text-[var(--tx-2)]">
+                {r.label || "blur"} · {r.w}×{r.h} @ {r.x},{r.y}
+              </span>
+              <button
+                className="icon-btn !h-5 !w-5 opacity-0 group-hover:opacity-100"
+                title="delete blur box"
+                onClick={() => removeRegion(r.id)}
+              >
+                <Icon name="trash" size={12} />
+              </button>
+            </div>
+          ))}
+          {error && <p className="text-[11px] text-[var(--err)]">{error}</p>}
+        </div>
+      )}
+
+      {/* keyboard legend */}
+      <div className="flex h-6 shrink-0 items-center gap-3 border-t border-[var(--line-1)] px-2.5 text-[10px] text-[var(--tx-3)]">
+        <span>Space play</span>
+        <span>J·K·L shuttle</span>
+        <span>I / O mark in-out</span>
+        <span>←/→ frame step</span>
+        <span>S split at playhead</span>
+        <span>Ctrl+Z undo</span>
+      </div>
+    </div>
+  );
+});
+
+export function MonitorEmpty({ onRun }: { onRun?: () => void }) {
+  return (
+    <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 bg-black">
+      <span className="flex h-14 w-14 items-center justify-center rounded-xl bg-[var(--bg-2)] text-[var(--tx-3)]">
+        <Icon name="media" size={26} />
+      </span>
+      <div className="text-center">
+        <p className="text-[13px] font-medium text-[var(--tx-1)]">
+          No program yet
+        </p>
+        <p className="mt-1 max-w-[300px] text-[11px] leading-relaxed text-[var(--tx-3)]">
+          Ingest builds a 480p scrub proxy automatically. Run the pipeline and
+          the monitor comes alive here.
+        </p>
+      </div>
+      {onRun && (
+        <button className="btn" onClick={onRun}>
+          <Icon name="play" size={12} /> Run pipeline
+        </button>
+      )}
+    </div>
+  );
+}

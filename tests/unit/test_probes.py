@@ -302,3 +302,68 @@ def test_make_vision_clients_base_url_paths(monkeypatch):
     assert idx._client.base_url == "http://localhost:1234/v1"
     assert idx._client.model == "my-vision-model"
     get_settings.cache_clear()
+
+
+def test_llm_probe_blank_base_url_routes_to_gemini(monkeypatch):
+    """Regression (user bug report): LLM saved in the vault with a BLANK base
+    URL (native Google AI Studio). The llm probe used to hard-route to
+    probe_openai_compat, which fails fast with "Base URL is empty" — so the
+    Test button errored on every fresh visit until the key was re-typed and
+    re-saved. Blank base must fall back to the native Gemini probe, exactly
+    like the vision card."""
+    from director_os.core.config import get_settings
+
+    monkeypatch.setenv("LLM_API_KEY", "AQ-saved-key")
+    monkeypatch.setenv("LLM_BASE_URL", "")
+    monkeypatch.setenv("LLM_MODEL", "gemini-2.5-flash")
+    get_settings.cache_clear()
+
+    import director_os.core.probes as probes_mod
+
+    def boom_compat(*a, **kw):  # pragma: no cover - must not be reached
+        raise AssertionError("openai_compat probe reached with blank base URL")
+
+    monkeypatch.setattr(probes_mod, "probe_openai_compat", boom_compat)
+    monkeypatch.setattr(
+        probes_mod,
+        "probe_gemini_rest",
+        lambda key, base_url=None, transport=None, timeout_s=15.0: ProbeResult(
+            True, 12, "authenticated"
+        ),
+    )
+
+    # no typed params: saved vault values resolve through Settings
+    result = run_probe("llm", {}, get_settings())
+    assert result.ok and result.detail == "authenticated"
+    get_settings.cache_clear()
+
+
+def test_youtube_probe_resolves_saved_vault_values(monkeypatch):
+    """Regression: YOUTUBE_* had no Settings fields, so a saved vault value
+    could never be resolved — run_probe saw "" for all three and the Test
+    button demanded re-entry. The Settings dataclass must carry them."""
+    from director_os.core.config import get_settings
+
+    monkeypatch.setenv("YOUTUBE_CLIENT_ID", "saved.apps.googleusercontent.com")
+    monkeypatch.setenv("YOUTUBE_CLIENT_SECRET", "GOCSPX-saved")
+    monkeypatch.setenv("YOUTUBE_REFRESH_TOKEN", "saved-refresh")
+    get_settings.cache_clear()
+
+    seen: dict = {}
+
+    def fake_youtube(client_id, client_secret, refresh_token, transport=None, timeout_s=15.0):
+        seen.update(client_id=client_id, client_secret=client_secret, refresh_token=refresh_token)
+        return ProbeResult(True, 30, "refresh token valid")
+
+    import director_os.core.probes as probes_mod
+
+    monkeypatch.setattr(probes_mod, "probe_youtube", fake_youtube)
+
+    result = run_probe("youtube", {}, get_settings())
+    assert result.ok
+    assert seen == {
+        "client_id": "saved.apps.googleusercontent.com",
+        "client_secret": "GOCSPX-saved",
+        "refresh_token": "saved-refresh",
+    }
+    get_settings.cache_clear()

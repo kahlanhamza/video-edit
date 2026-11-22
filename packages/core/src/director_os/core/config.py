@@ -90,6 +90,10 @@ class Settings:
     elevenlabs_api_key: str
     elevenlabs_voice_id: str
     elevenlabs_model_id: str
+    # --- YouTube publish (OAuth desktop client + refresh token)
+    youtube_client_id: str
+    youtube_client_secret: str
+    youtube_refresh_token: str
 
 
 def _load() -> Settings:
@@ -142,6 +146,13 @@ def _load() -> Settings:
         elevenlabs_api_key=_env("ELEVENLABS_API_KEY", ""),
         elevenlabs_voice_id=_env("ELEVENLABS_VOICE_ID", ""),
         elevenlabs_model_id=os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2"),
+        # youtube publish — REQUIRED fields: without them the credential
+        # overlay (Settings UI) can never surface saved YouTube keys, so
+        # run_probe got "" for all three and the Test button failed even
+        # though the vault held valid values
+        youtube_client_id=_env("YOUTUBE_CLIENT_ID", ""),
+        youtube_client_secret=_env("YOUTUBE_CLIENT_SECRET", ""),
+        youtube_refresh_token=_env("YOUTUBE_REFRESH_TOKEN", ""),
     )
 
 

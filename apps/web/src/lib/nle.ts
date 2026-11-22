@@ -81,3 +81,96 @@ export function clampZoom(pxPerSecond: number): number {
 export function timelineWidth(durationS: number, pxPerSecond: number): number {
   return Math.max(1, Math.ceil(durationS * pxPerSecond));
 }
+
+// --- additions for the pro timeline (pure, unit-tested) ---------------------
+
+/** HH:MM:SS:FF — the professional ruler/timecode format (frames at fps). */
+export function formatTimecodeFrames(t: number, fps = 30): string {
+  const safe = Math.max(0, t);
+  const frames = Math.floor((safe * fps) % fps);
+  const total = Math.floor(safe);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const pad = (n: number, w = 2) => String(n).padStart(w, "0");
+  return `${pad(h)}:${pad(m)}:${pad(s)}:${pad(frames)}`;
+}
+
+/** mm:ss — compact ruler label for low zoom levels. */
+export function formatTimecodeShort(t: number): string {
+  const safe = Math.max(0, t);
+  const m = Math.floor(safe / 60);
+  const s = Math.floor(safe % 60);
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+export interface RulerTick {
+  t: number;
+  /** major ticks carry a label; minor are just marks */
+  major: boolean;
+}
+
+/**
+ * Full ruler tick model for the visible span [viewStartS, viewEndS]:
+ * major ticks every `step` seconds with `divisions` minor marks between.
+ * Mirrors Premiere/Resolve rulers (adaptive density, labels only on major).
+ */
+export function rulerTicks(
+  viewStartS: number,
+  viewEndS: number,
+  pxPerSecond: number,
+  divisions = 4,
+): RulerTick[] {
+  const step = tickStep(pxPerSecond);
+  const out: RulerTick[] = [];
+  const first = Math.floor(viewStartS / step) * step;
+  for (let t = first; t <= viewEndS + step; t += step / divisions) {
+    const snapped = Number(t.toFixed(4));
+    if (snapped < viewStartS - 1e-6) continue;
+    out.push({ t: snapped, major: Math.abs((snapped / step) % 1) < 1e-6 });
+  }
+  return out;
+}
+
+/** Snap a time to the nearest `grid` seconds within `toleranceS`, else raw. */
+export function snapTime(t: number, grid: number, toleranceS: number): number {
+  if (grid <= 0) return t;
+  const nearest = Math.round(t / grid) * grid;
+  return Math.abs(nearest - t) <= toleranceS ? Number(nearest.toFixed(4)) : t;
+}
+
+// --- scrubsheet math (assets/{id}/scrubsheet: 1 row, ~1 frame / 2 s) --------
+
+export const SCRUB_INTERVAL_S = 2.0;
+export const SCRUB_MAX_THUMBS = 40;
+
+/** Frame count in the scrubsheet sprite for a source of `durationS`. */
+export function scrubFrameCount(durationS: number): number {
+  return Math.min(
+    SCRUB_MAX_THUMBS,
+    Math.max(1, Math.ceil(Math.max(durationS, 0.1) / SCRUB_INTERVAL_S)),
+  );
+}
+
+/** Sprite frame index covering source-time `t` (clamped to the sprite). */
+export function scrubFrameIndex(t: number, durationS: number): number {
+  const n = scrubFrameCount(durationS);
+  return clamp(Math.floor(t / SCRUB_INTERVAL_S), 0, n - 1);
+}
+
+/**
+ * CSS background-position for showing sprite frame `i` of `n` in a cell
+ * (classic one-row sprite slider: n*100% size, i/(n-1)*100% position).
+ */
+export function scrubBackground(i: number, n: number, url: string): {
+  backgroundImage: string;
+  backgroundSize: string;
+  backgroundPosition: string;
+} {
+  const pos = n > 1 ? (i / (n - 1)) * 100 : 0;
+  return {
+    backgroundImage: `url(${url})`,
+    backgroundSize: `${n * 100}% 100%`,
+    backgroundPosition: `${pos}% 0%`,
+  };
+}

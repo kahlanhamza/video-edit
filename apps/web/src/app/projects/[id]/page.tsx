@@ -1,19 +1,26 @@
 "use client";
 
-// Director Studio — the full-visibility editing workbench.
+// Director Studio — the professional NLE workbench (design system: see
+// apps/web/src/app/globals.css + docs/DESIGN_SYSTEM.md).
 //
-// Top bar: project identity + live stage/progress + Run/Stop/Delete.
-// Main grid: proxy player + blur canvas (left), embedded sandbox console (right).
-// Below: the multi-track NLE timeline (video / cards / audio / captions /
-// effects) with manual trim/split, then tabbed inspector panels (subtitles,
-// sources & dossier, director tools, publish, ingest).
+// Full-viewport app layout, no page scroll:
+//   ┌ top bar: identity · live stage/progress · hero timecode · Run/Stop/Del ┐
+//   │ rail │ left panel      │ program monitor + transport │ pipeline + console│
+//   └ timeline dock: 5 tracks, ruler, playhead, snapping, zoom ┘
+// The left rail switches Media / Sources / Captions / Tools / Publish.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import ProxyPlayer from "@/components/ProxyPlayer";
 import SubtitleGrid from "@/components/SubtitleGrid";
-import RunConsole from "@/components/studio/RunConsole";
+import {
+  MonitorEmpty,
+  MonitorHandle,
+  ProgramMonitor,
+} from "@/components/ProgramMonitor";
+import ConsolePanel from "@/components/studio/ConsolePanel";
+import { Icon, IconName } from "@/components/studio/icons";
+import PipelinePanel from "@/components/studio/PipelinePanel";
 import Timeline from "@/components/studio/Timeline";
 import { useLiveJob } from "@/hooks/useLiveJob";
 import {
@@ -28,30 +35,20 @@ import {
   TimelineState,
 } from "@/lib/api";
 
-// --- WS4: Case Sources & Dossier ---
+// --- WS4: Case Sources & Dossier --------------------------------------------
 
-const SOURCE_KIND_BADGE: Record<string, string> = {
-  url: "bg-sky-500/10 text-sky-300",
-  pdf: "bg-rose-500/10 text-rose-300",
-  text: "bg-emerald-500/10 text-emerald-300",
-  source_page: "bg-violet-500/10 text-violet-300",
+const SOURCE_KIND_CHIP: Record<string, string> = {
+  url: "chip chip-acc",
+  pdf: "chip chip-err",
+  text: "chip chip-ok",
+  source_page: "chip",
 };
 
 const SOURCE_STATUS_CHIP: Record<string, string> = {
-  pending: "bg-slate-800 text-slate-400",
-  extracting: "bg-amber-500/10 text-amber-300 animate-pulse",
-  ready: "bg-emerald-500/10 text-emerald-300",
-  failed: "bg-red-500/10 text-red-400",
-};
-
-const STUDIO_TABS = ["subtitles", "sources", "tools", "publish"] as const;
-type StudioTab = (typeof STUDIO_TABS)[number];
-
-const TAB_LABEL: Record<StudioTab, string> = {
-  subtitles: "Subtitles",
-  sources: "Sources & Dossier",
-  tools: "Director tools",
-  publish: "Publish",
+  pending: "chip",
+  extracting: "chip chip-warn",
+  ready: "chip chip-ok",
+  failed: "chip chip-err",
 };
 
 function isEmptyDossier(d: CaseDossier): boolean {
@@ -75,20 +72,20 @@ function DossierView({ dossier }: { dossier: CaseDossier }) {
     `${sourceId.slice(0, 8)}…`;
   const facts = dossier.key_facts ?? [];
   return (
-    <div className="mt-2 space-y-3">
-      <div className="text-sm">
-        <span className="font-semibold text-slate-100">
+    <div className="space-y-3">
+      <div className="text-[13px]">
+        <span className="font-semibold text-[var(--tx-1)]">
           {dossier.subject_name ?? "Unknown subject"}
         </span>
         {dossier.age != null && (
-          <span className="text-slate-400"> · age {dossier.age}</span>
+          <span className="text-[var(--tx-2)]"> · age {dossier.age}</span>
         )}
         {dossier.role_or_agency && (
-          <span className="text-slate-400"> · {dossier.role_or_agency}</span>
+          <span className="text-[var(--tx-2)]"> · {dossier.role_or_agency}</span>
         )}
       </div>
 
-      <dl className="space-y-1 text-sm">
+      <dl className="space-y-1.5 text-[12px]">
         {(
           [
             ["Incident", dossier.incident_datetime],
@@ -97,34 +94,30 @@ function DossierView({ dossier }: { dossier: CaseDossier }) {
           ] as Array<[string, string | null]>
         ).map(([label, value]) => (
           <div key={label} className="flex gap-2">
-            <dt className="w-28 shrink-0 text-xs uppercase tracking-wide text-slate-500">
-              {label}
-            </dt>
-            <dd className="min-w-0 flex-1 text-slate-200">{value ?? "—"}</dd>
+            <dt className="micro-label w-24 shrink-0 pt-0.5">{label}</dt>
+            <dd className="min-w-0 flex-1 text-[var(--tx-1)]">{value ?? "—"}</dd>
           </div>
         ))}
       </dl>
 
       {dossier.verdict_outcome && (
-        <p className="rounded bg-amber-500/10 px-2 py-1 text-sm text-amber-300">
-          Verdict / outcome: {dossier.verdict_outcome}
+        <p className="rounded border border-[rgba(245,181,68,.25)] bg-[rgba(245,181,68,.07)] px-2 py-1.5 text-[12px] text-[var(--warn)]">
+          Verdict: {dossier.verdict_outcome}
         </p>
       )}
 
       {facts.length > 0 && (
         <div>
-          <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-            Key facts
-          </h4>
-          <ul className="mt-1 space-y-1">
+          <h4 className="micro-label">Key facts</h4>
+          <ul className="mt-1.5 space-y-1.5">
             {facts.map((f, i) => (
-              <li key={i} className="text-sm">
-                <span className="text-slate-200">{f.fact}</span>
+              <li key={i} className="text-[12px] leading-relaxed">
+                <span className="text-[var(--tx-1)]">{f.fact}</span>
                 {f.date && (
-                  <span className="ml-1 text-xs text-slate-500">({f.date})</span>
+                  <span className="ml-1 text-[11px] text-[var(--tx-3)]">({f.date})</span>
                 )}
-                <span className="block text-xs text-slate-500" title={f.citation}>
-                  — from {sourceLabel(f.source_id)}
+                <span className="block text-[11px] text-[var(--tx-3)]" title={f.citation}>
+                  — {sourceLabel(f.source_id)}
                 </span>
               </li>
             ))}
@@ -134,17 +127,10 @@ function DossierView({ dossier }: { dossier: CaseDossier }) {
 
       {(dossier.charges?.length ?? 0) > 0 && (
         <div>
-          <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-            Charges
-          </h4>
-          <div className="mt-1 flex flex-wrap gap-1">
+          <h4 className="micro-label">Charges</h4>
+          <div className="mt-1.5 flex flex-wrap gap-1">
             {(dossier.charges ?? []).map((c, i) => (
-              <span
-                key={i}
-                className="rounded bg-slate-800 px-2 py-0.5 text-xs text-slate-300"
-              >
-                {c}
-              </span>
+              <span key={i} className="chip">{c}</span>
             ))}
           </div>
         </div>
@@ -152,17 +138,10 @@ function DossierView({ dossier }: { dossier: CaseDossier }) {
 
       {(dossier.test_results?.length ?? 0) > 0 && (
         <div>
-          <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-            Test results
-          </h4>
-          <div className="mt-1 flex flex-wrap gap-1">
+          <h4 className="micro-label">Test results</h4>
+          <div className="mt-1.5 flex flex-wrap gap-1">
             {(dossier.test_results ?? []).map((t, i) => (
-              <span
-                key={i}
-                className="rounded bg-slate-800 px-2 py-0.5 text-xs text-slate-300"
-              >
-                {t}
-              </span>
+              <span key={i} className="chip">{t}</span>
             ))}
           </div>
         </div>
@@ -199,6 +178,16 @@ const TOOLS = [
   },
 ];
 
+type LeftView = "media" | "sources" | "captions" | "tools" | "publish";
+
+const VIEWS: { id: LeftView; label: string; icon: IconName }[] = [
+  { id: "media", label: "Media", icon: "media" },
+  { id: "sources", label: "Sources", icon: "folder" },
+  { id: "captions", label: "Captions", icon: "captions" },
+  { id: "tools", label: "Director tools", icon: "wand" },
+  { id: "publish", label: "Publish", icon: "upload" },
+];
+
 export default function ProjectPage({ params }: { params: Promise<{ id: string }> }) {
   const [id, setId] = useState<string | null>(null);
   const [project, setProject] = useState<Project | null>(null);
@@ -207,9 +196,13 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
   const [assets, setAssets] = useState<Asset[]>([]);
   const [nle, setNle] = useState<NleTimeline | null>(null);
   const [playheadS, setPlayheadS] = useState(0);
-  const [tab, setTab] = useState<StudioTab>("subtitles");
+  const [view, setView] = useState<LeftView>("media");
   const [dispatchLog, setDispatchLog] = useState<DispatchResult[]>([]);
-  const [publish, setPublish] = useState<{ video_path: string; title: string; base_description: string }>({
+  const [publish, setPublish] = useState<{
+    video_path: string;
+    title: string;
+    base_description: string;
+  }>({
     video_path: "",
     title: "",
     base_description: "Rendered by DirectorOS — private review draft.",
@@ -233,6 +226,7 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
   const [addSourceLabel, setAddSourceLabel] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [editBusy, setEditBusy] = useState(false);
+  const monitorRef = useRef<MonitorHandle>(null);
 
   useEffect(() => {
     params.then((p) => setId(p.id));
@@ -265,7 +259,6 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     reloadNle();
   }, [refresh, reloadNle]);
 
-  // WS4: case sources + dossier — 404 / empty just means "not built yet"
   const loadSources = useCallback(async () => {
     if (!id) return;
     try {
@@ -286,14 +279,12 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
 
   const latestJob = jobs.length ? jobs[jobs.length - 1] : null;
 
-  // live console + timeline revisions over SSE
   const onTimelineRevision = useCallback(() => {
     reloadNle();
     refresh();
   }, [reloadNle, refresh]);
   const { state: live } = useLiveJob(id, latestJob?.id ?? null, onTimelineRevision);
 
-  // when a run finishes, pull the final state (thumbnails, versions, NLE)
   const prevDoneRef = useRef(false);
   useEffect(() => {
     if (live.done && !prevDoneRef.current) {
@@ -328,7 +319,7 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     try {
       const r = await api.ingestUrl(id!, ingestUrl.trim());
       setIngestStatus(
-        `${r.detail} — job ${r.job_id.slice(0, 8)}… watching the console`,
+        `${r.detail} — job ${r.job_id.slice(0, 8)}… watch the console`,
       );
       setIngestUrl("");
       await refresh();
@@ -402,7 +393,9 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
   async function doPublish() {
     try {
       const r = await api.publishDraft(id!, publish);
-      setPublishResult(`draft ${r.video_id} (${r.privacy_status}, captions: ${r.caption_attached})`);
+      setPublishResult(
+        `draft ${r.video_id} (${r.privacy_status}, captions: ${r.caption_attached})`,
+      );
     } catch (e) {
       setPublishResult(`failed: ${e instanceof Error ? e.message : e}`);
     }
@@ -421,7 +414,6 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
 
   async function handleSplitAtPlayhead(t: number) {
     if (!nle) return;
-    // the master clip under the playhead (video lane, timeline-local seconds)
     const clip = nle.clips.find(
       (c) => c.track === "V1_master" && t >= c.start_s && t < c.end_s,
     );
@@ -450,397 +442,476 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     }
   }
 
-  if (!id) return <p className="text-slate-500">Loading…</p>;
+  const seek = useCallback((t: number) => {
+    setPlayheadS(t);
+    monitorRef.current?.seek(t);
+  }, []);
+
+  if (!id) return <p className="p-6 text-[var(--tx-3)]">Loading…</p>;
 
   const pct = live.job?.progress_pct ?? latestJob?.progress_pct ?? 0;
   const stage = live.job?.stage ?? latestJob?.stage ?? "idle";
   const jobError = live.job?.error ?? latestJob?.error ?? null;
   const playable = assets.find((a) => a.has_proxy);
+  const fps = nle?.asset?.fps ?? 30;
+  const running = !live.done && !jobError && live.connected;
 
   return (
-    <div className="space-y-4">
-      {/* ---------------- top bar: identity + live status + operator controls ---------------- */}
-      <section className="card sticky top-0 z-20 !py-3 backdrop-blur">
-        <div className="flex flex-wrap items-center gap-3">
-          <Link
-            href="/"
-            className="btn-ghost !border-slate-700 !px-2 !py-1 text-xs"
-            title="back to all cases"
-          >
-            ←
-          </Link>
-          <div className="min-w-0">
-            <h1 className="truncate text-base font-bold">{project?.title ?? id}</h1>
-            <p className="text-[10px] uppercase tracking-wide text-slate-500">
-              {project?.niche_skill} · latest job {latestJob ? `${latestJob.id.slice(0, 8)}…` : "none"}
-            </p>
-          </div>
-          <span
-            className={`rounded px-2 py-0.5 text-xs uppercase ${
-              jobError
-                ? "bg-red-500/15 text-red-300"
-                : live.done
-                  ? "bg-emerald-500/15 text-emerald-300"
-                  : "bg-slate-800 text-slate-300"
-            }`}
-          >
-            {project?.status ?? "…"}
+    <div className="flex h-screen flex-col overflow-hidden bg-[var(--bg-0)]">
+      {/* ================= top bar ================= */}
+      <header className="flex h-12 shrink-0 items-center gap-3 border-b border-[var(--line-1)] bg-[var(--bg-1)] px-3">
+        <Link
+          href="/"
+          className="icon-btn"
+          title="back to all cases"
+        >
+          <Icon name="back" />
+        </Link>
+        <div className="flex items-center gap-2">
+          <span className="flex h-6 w-6 items-center justify-center rounded bg-[var(--acc-bg)] text-[var(--acc)]">
+            <Icon name="clapper" size={13} />
           </span>
-
-          {/* live stage + overall progress */}
-          <div className="min-w-[180px] flex-1">
-            <div className="flex justify-between text-[10px] text-slate-400">
-              <span>
-                stage <span className="font-semibold text-slate-200">{stage}</span>
-              </span>
-              <span className="tabular-nums">{pct.toFixed(0)}%</span>
-            </div>
-            <div className="mt-1 h-1.5 w-full rounded bg-slate-800">
-              <div
-                className={`h-1.5 rounded transition-all duration-300 ${
-                  jobError ? "bg-red-500" : "bg-amber-400"
-                }`}
-                style={{ width: `${Math.min(100, pct)}%` }}
-              />
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <button className="btn" onClick={runOrResume} disabled={runBusy}>
-              {runBusy
-                ? "Starting…"
-                : jobError
-                  ? "Resume pipeline"
-                  : latestJob
-                    ? "Run again"
-                    : "Run pipeline"}
-            </button>
-            <button
-              className="btn-ghost"
-              onClick={async () => {
-                setStopBusy(true);
-                try {
-                  const out = await api.stopProject(id);
-                  setRunNote(out.note);
-                } catch (e) {
-                  setRunNote(e instanceof Error ? e.message : String(e));
-                } finally {
-                  setStopBusy(false);
-                }
-              }}
-              disabled={stopBusy || !latestJob}
-              title="parks the job at the next stage boundary — completed stages are kept"
-            >
-              {stopBusy ? "Stopping…" : "Stop"}
-            </button>
-            <button
-              className="btn-ghost !text-red-400 hover:!border-red-500"
-              onClick={async () => {
-                if (
-                  !window.confirm(
-                    "Delete this project, all its jobs and all pipeline output? This cannot be undone.",
-                  )
-                )
-                  return;
-                setDeleteBusy(true);
-                try {
-                  await api.deleteProject(id);
-                  router.push("/");
-                } catch (e) {
-                  setError(e instanceof Error ? e.message : String(e));
-                  setDeleteBusy(false);
-                }
-              }}
-              disabled={deleteBusy}
-              title="removes every DB row + the pipeline output tree for this project"
-            >
-              {deleteBusy ? "Deleting…" : "Delete"}
-            </button>
-            <Link href="/settings" className="btn-ghost text-xs" title="credentials vault">
-              ⚙
-            </Link>
-          </div>
+          <span className="text-[13px] font-semibold tracking-wide text-[var(--tx-1)]">
+            DirectorOS <span className="font-normal text-[var(--tx-3)]">Studio</span>
+          </span>
         </div>
-        {(runNote || jobError) && (
-          <p className={`mt-2 text-xs ${jobError ? "text-red-400" : "text-slate-300"}`}>
-            {jobError ?? runNote}
+        <span className="h-5 w-px bg-[var(--line-2)]" />
+        <div className="min-w-0">
+          <h1 className="truncate text-[13px] font-medium text-[var(--tx-1)]">
+            {project?.title ?? id}
+          </h1>
+          <p className="truncate text-[10px] uppercase tracking-wider text-[var(--tx-3)]">
+            {project?.niche_skill.replaceAll("_", " ")}
+            {latestJob ? ` · job ${latestJob.id.slice(0, 8)}…` : " · no jobs yet"}
           </p>
-        )}
-        {error && !runNote && !jobError && (
-          <p className="mt-2 text-xs text-red-400">{error}</p>
-        )}
-      </section>
+        </div>
+        <span
+          className={`chip ${
+            jobError ? "chip-err" : live.done ? "chip-ok" : running ? "chip-acc" : ""
+          }`}
+        >
+          {project?.status ?? "…"}
+        </span>
 
-      {/* ---------------- main grid: player + live console ---------------- */}
-      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_380px]">
-        <section className="card min-w-0">
-          <div className="flex items-center justify-between">
-            <h2 className="text-sm font-semibold">Proxy scrub + blur canvas</h2>
-            {nle?.asset && (
-              <span className="text-[10px] text-slate-500">
-                source {nle.asset.width}x{nle.asset.height} @ {nle.asset.fps.toFixed(2)}fps ·{" "}
-                {nle.asset.duration_s.toFixed(1)}s
-              </span>
-            )}
+        {/* single source of truth: live stage + overall progress */}
+        <div className="hidden min-w-[200px] max-w-[340px] flex-1 items-center gap-2.5 md:flex">
+          <span className="truncate text-[11px] text-[var(--tx-2)]">
+            <span className="micro-label">stage</span>{" "}
+            <span className="font-medium text-[var(--tx-1)]">{stage}</span>
+          </span>
+          <div className="bar-track min-w-[80px] flex-1">
+            <div
+              className="bar-fill"
+              data-tone={jobError ? "err" : live.done ? "ok" : undefined}
+              style={{ width: `${Math.min(100, pct)}%` }}
+            />
           </div>
-          {playable ? (
-            <div className="mt-3">
-              <ProxyPlayer
-                projectId={id}
-                asset={playable}
-                onChanged={() => {
-                  reloadNle();
-                }}
-                onTimeUpdate={setPlayheadS}
-              />
-            </div>
-          ) : (
-            <p className="mt-2 text-sm text-slate-500">
-              no 480p proxy yet — ingest builds one automatically (480p + scrubsheet + 64k audio)
-            </p>
-          )}
-        </section>
+          <span className="tcode text-[11px] text-[var(--tx-2)]">
+            {pct.toFixed(0)}%
+          </span>
+        </div>
 
-        <section className="card flex min-h-[420px] flex-col !p-0 xl:h-[520px]">
-          <RunConsole live={live} />
-        </section>
-      </div>
+        <div className="flex-1" />
 
-      {/* ---------------- full-width live NLE timeline ---------------- */}
-      <section className="card">
-        <Timeline
-          nle={nle}
-          playheadS={playheadS}
-          onSeek={setPlayheadS}
-          onTrimClip={handleTrim}
-          onSplitAtPlayhead={handleSplitAtPlayhead}
-          onDeleteEffect={handleDeleteEffect}
-        />
-        {editBusy && <p className="mt-1 text-xs text-amber-300">dispatching edit…</p>}
-        <p className="mt-1 text-xs text-slate-500">
-          active checkpoint: v{timeline?.active_version ?? "—"} · every mutation is a durable
-          checkpoint; failed dispatches roll back automatically
-        </p>
-      </section>
+        <button className="btn" onClick={runOrResume} disabled={runBusy}>
+          <Icon name="play" size={11} />
+          {runBusy
+            ? "Starting…"
+            : jobError
+              ? "Resume"
+              : latestJob
+                ? "Run again"
+                : "Run pipeline"}
+        </button>
+        <button
+          className="btn-ghost"
+          onClick={async () => {
+            setStopBusy(true);
+            try {
+              const out = await api.stopProject(id);
+              setRunNote(out.note);
+            } catch (e) {
+              setRunNote(e instanceof Error ? e.message : String(e));
+            } finally {
+              setStopBusy(false);
+            }
+          }}
+          disabled={stopBusy || !latestJob}
+          title="parks the job at the next stage boundary — completed stages are kept"
+        >
+          <Icon name="stop" size={11} /> Stop
+        </button>
+        <button
+          className="btn-danger"
+          onClick={async () => {
+            if (
+              !window.confirm(
+                "Delete this project, all its jobs and all pipeline output? This cannot be undone.",
+              )
+            )
+              return;
+            setDeleteBusy(true);
+            try {
+              await api.deleteProject(id);
+              router.push("/");
+            } catch (e) {
+              setError(e instanceof Error ? e.message : String(e));
+              setDeleteBusy(false);
+            }
+          }}
+          disabled={deleteBusy}
+          title="removes every DB row + the pipeline output tree for this project"
+        >
+          <Icon name="trash" size={12} />
+          {deleteBusy ? "Deleting…" : "Delete"}
+        </button>
+        <Link href="/settings" className="icon-btn" title="credentials vault">
+          <Icon name="settings" />
+        </Link>
+      </header>
 
-      {/* ---------------- tabbed inspector ---------------- */}
-      <section className="card">
-        <div className="flex flex-wrap gap-1 border-b border-slate-800 pb-2">
-          {STUDIO_TABS.map((t) => (
+      {/* error / run note strip */}
+      {(jobError || runNote || error) && (
+        <div
+          className={`flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-[11px] ${
+            jobError
+              ? "border-[rgba(241,109,109,.3)] bg-[rgba(241,109,109,.08)] text-[var(--err)]"
+              : "border-[var(--line-1)] bg-[var(--bg-1)] text-[var(--tx-2)]"
+          }`}
+        >
+          <button
+            className="icon-btn !h-4 !w-4"
+            onClick={() => {
+              setRunNote(null);
+              setError(null);
+            }}
+            title="dismiss"
+          >
+            <Icon name="x" size={10} />
+          </button>
+          <span className="min-w-0 truncate">{jobError ?? runNote ?? error}</span>
+        </div>
+      )}
+
+      {/* ================= body ================= */}
+      <div className="flex min-h-0 flex-1">
+        {/* icon rail */}
+        <nav className="flex w-11 shrink-0 flex-col items-center gap-1 border-r border-[var(--line-1)] bg-[var(--bg-1)] py-2">
+          {VIEWS.map((v) => (
             <button
-              key={t}
-              className={`rounded px-3 py-1 text-sm ${
-                tab === t
-                  ? "bg-amber-500/15 font-semibold text-amber-300"
-                  : "text-slate-400 hover:text-slate-200"
-              }`}
-              onClick={() => setTab(t)}
+              key={v.id}
+              className="icon-btn !h-9 !w-9"
+              data-active={view === v.id}
+              title={v.label}
+              onClick={() => setView(v.id)}
             >
-              {TAB_LABEL[t]}
+              <Icon name={v.icon} size={17} />
             </button>
           ))}
-        </div>
+          <div className="flex-1" />
+          <Link href="/settings" className="icon-btn !h-9 !w-9" title="Settings">
+            <Icon name="settings" size={16} />
+          </Link>
+        </nav>
 
-        <div className="pt-3">
-          {tab === "subtitles" && <SubtitleGrid projectId={id} />}
-
-          {tab === "sources" && (
-            <div>
-              <div className="flex items-center justify-between gap-2">
-                <p className="text-xs text-slate-500">
-                  every source feeding this case — the dossier is re-planned from them on refresh
-                </p>
-                <button className="btn-ghost" onClick={refreshAndReplan} disabled={sourcesBusy}>
-                  {sourcesBusy ? "Refreshing…" : "Refresh & re-plan"}
-                </button>
-              </div>
-
-              <div className="mt-3 grid gap-4 lg:grid-cols-2">
+        {/* left panel */}
+        <aside className="flex w-[300px] shrink-0 flex-col border-r border-[var(--line-1)] bg-[var(--bg-1)]">
+          <div className="panel-header">
+            <span className="micro-label">
+              {VIEWS.find((v) => v.id === view)?.label}
+            </span>
+          </div>
+          <div className="min-h-0 flex-1 overflow-y-auto p-3">
+            {view === "media" && (
+              <div className="space-y-4">
                 <div>
-                  <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                    Sources ({sources.length})
-                  </h3>
-                  <ul className="mt-2 space-y-1">
-                    {sources.map((s) => (
-                      <li key={s.id} className="flex items-center gap-2 text-sm">
-                        <span
-                          className={`rounded px-2 py-0.5 text-xs uppercase tracking-wide ${
-                            SOURCE_KIND_BADGE[s.kind] ?? "bg-slate-800 text-slate-400"
-                          }`}
-                        >
-                          {s.kind}
-                        </span>
-                        <span className="min-w-0 flex-1 truncate text-slate-300" title={s.label}>
-                          {s.label || `${s.id.slice(0, 8)}…`}
-                        </span>
-                        <span
-                          className={`rounded px-2 py-0.5 text-xs uppercase tracking-wide ${
-                            SOURCE_STATUS_CHIP[s.status] ?? "bg-slate-800 text-slate-400"
-                          }`}
-                          title={s.status === "failed" && s.error ? s.error : undefined}
-                        >
-                          {s.status}
-                        </span>
-                      </li>
-                    ))}
-                    {sources.length === 0 && (
-                      <li className="text-sm text-slate-500">
-                        no sources yet — attach one below, or create a case with video URLs
-                      </li>
-                    )}
-                  </ul>
-                  {refreshNote && <p className="mt-2 text-xs text-emerald-400">{refreshNote}</p>}
-                  <div className="mt-3 space-y-2 border-t border-slate-800 pt-3">
-                    <div className="flex gap-2">
-                      <select
-                        className="input w-28"
-                        value={addSourceKind}
-                        onChange={(e) => setAddSourceKind(e.target.value as "url" | "text")}
-                      >
-                        <option value="url">URL</option>
-                        <option value="text">Notes</option>
-                      </select>
-                      <input
-                        className="input"
-                        placeholder={
-                          addSourceKind === "url"
-                            ? "https://court.example/case-doc (news, court page, direct .pdf)"
-                            : "label (e.g. sentencing update)"
-                        }
-                        value={addSourceKind === "url" ? addSourceUrl : addSourceLabel}
-                        onChange={(e) =>
-                          addSourceKind === "url"
-                            ? setAddSourceUrl(e.target.value)
-                            : setAddSourceLabel(e.target.value)
-                        }
-                      />
-                    </div>
-                    {addSourceKind === "text" && (
-                      <textarea
-                        className="input"
-                        rows={2}
-                        placeholder="paste notes — FOIA updates, sentencing, corrections"
-                        value={addSourceText}
-                        onChange={(e) => setAddSourceText(e.target.value)}
-                      />
-                    )}
+                  <h3 className="micro-label">Ingest media</h3>
+                  <p className="mt-1 text-[11px] leading-relaxed text-[var(--tx-3)]">
+                    FOIA portal / CDN link — the gateway downloads it (UA-aware)
+                    and the fleet advances ingest → perception → render.
+                  </p>
+                  <div className="mt-2 flex gap-1.5">
+                    <input
+                      className="input"
+                      placeholder="https://portal.example/case/bodycam.mp4"
+                      value={ingestUrl}
+                      onChange={(e) => setIngestUrl(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && doIngest()}
+                    />
                     <button
-                      className="btn-ghost"
-                      onClick={addSourceLater}
-                      disabled={
-                        sourcesBusy ||
-                        (addSourceKind === "url" ? !addSourceUrl.trim() : !addSourceText.trim())
-                      }
+                      className="btn shrink-0"
+                      onClick={doIngest}
+                      disabled={ingestBusy || !ingestUrl.trim()}
                     >
-                      Attach source
+                      <Icon name="upload" size={12} />
                     </button>
+                  </div>
+                  {ingestStatus && (
+                    <p className="mt-1.5 text-[11px] text-[var(--tx-2)]">{ingestStatus}</p>
+                  )}
+                </div>
+
+                <div>
+                  <h3 className="micro-label">Assets ({assets.length})</h3>
+                  <div className="mt-1.5 space-y-1.5">
+                    {assets.length === 0 && (
+                      <p className="text-[11px] text-[var(--tx-3)]">
+                        no assets yet — ingest creates the 480p proxy bundle
+                      </p>
+                    )}
+                    {assets.map((a) => (
+                      <div
+                        key={a.id}
+                        className="flex items-center gap-2 rounded-md border border-[var(--line-1)] bg-[var(--bg-2)] px-2 py-1.5"
+                      >
+                        <span className="text-[var(--tx-3)]">
+                          <Icon name="film" size={14} />
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-[11px] text-[var(--tx-1)]">
+                            {a.role.replaceAll("_", " ")}
+                          </p>
+                          <p className="tcode text-[10px] text-[var(--tx-3)]">
+                            {a.duration_s.toFixed(1)}s
+                          </p>
+                        </div>
+                        <span className={`chip ${a.has_proxy ? "chip-ok" : ""}`}>
+                          {a.has_proxy ? "480p" : "raw"}
+                        </span>
+                      </div>
+                    ))}
                   </div>
                 </div>
 
                 <div>
-                  <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                    CaseDossier
-                  </h3>
+                  <h3 className="micro-label">Checkpoints</h3>
+                  <p className="mt-1 text-[11px] leading-relaxed text-[var(--tx-3)]">
+                    active v{timeline?.active_version ?? "—"} · every mutation is
+                    a durable checkpoint; failed dispatches roll back
+                    automatically.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {view === "sources" && (
+              <div className="space-y-4">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="micro-label">Sources ({sources.length})</h3>
+                  <button className="btn-ghost !h-6 !px-2 !text-[11px]" onClick={refreshAndReplan} disabled={sourcesBusy}>
+                    {sourcesBusy ? "Refreshing…" : "Refresh & re-plan"}
+                  </button>
+                </div>
+                <ul className="space-y-1">
+                  {sources.map((s) => (
+                    <li key={s.id} className="flex items-center gap-1.5">
+                      <span className={`shrink-0 ${SOURCE_KIND_CHIP[s.kind] ?? "chip"}`}>
+                        {s.kind}
+                      </span>
+                      <span
+                        className="min-w-0 flex-1 truncate text-[11.5px] text-[var(--tx-1)]"
+                        title={s.label}
+                      >
+                        {s.label || `${s.id.slice(0, 8)}…`}
+                      </span>
+                      <span
+                        className={`shrink-0 ${SOURCE_STATUS_CHIP[s.status] ?? "chip"}`}
+                        title={s.status === "failed" && s.error ? s.error : undefined}
+                      >
+                        {s.status}
+                      </span>
+                    </li>
+                  ))}
+                  {sources.length === 0 && (
+                    <li className="text-[11px] text-[var(--tx-3)]">
+                      no sources yet — attach one below, or create a case with video URLs
+                    </li>
+                  )}
+                </ul>
+                {refreshNote && (
+                  <p className="text-[11px] text-[var(--ok)]">{refreshNote}</p>
+                )}
+
+                <div className="space-y-2 border-t border-[var(--line-1)] pt-3">
+                  <div className="flex gap-1.5">
+                    <select
+                      className="input !w-20"
+                      value={addSourceKind}
+                      onChange={(e) => setAddSourceKind(e.target.value as "url" | "text")}
+                    >
+                      <option value="url">URL</option>
+                      <option value="text">Notes</option>
+                    </select>
+                    <input
+                      className="input"
+                      placeholder={
+                        addSourceKind === "url"
+                          ? "https://court.example/case-doc"
+                          : "label (e.g. sentencing update)"
+                      }
+                      value={addSourceKind === "url" ? addSourceUrl : addSourceLabel}
+                      onChange={(e) =>
+                        addSourceKind === "url"
+                          ? setAddSourceUrl(e.target.value)
+                          : setAddSourceLabel(e.target.value)
+                      }
+                    />
+                  </div>
+                  {addSourceKind === "text" && (
+                    <textarea
+                      className="input"
+                      rows={2}
+                      placeholder="paste notes — FOIA updates, sentencing, corrections"
+                      value={addSourceText}
+                      onChange={(e) => setAddSourceText(e.target.value)}
+                    />
+                  )}
+                  <button
+                    className="btn-ghost w-full"
+                    onClick={addSourceLater}
+                    disabled={
+                      sourcesBusy ||
+                      (addSourceKind === "url" ? !addSourceUrl.trim() : !addSourceText.trim())
+                    }
+                  >
+                    <Icon name="plus" size={12} /> Attach source
+                  </button>
+                </div>
+
+                <div className="border-t border-[var(--line-1)] pt-3">
+                  <h3 className="micro-label">Case dossier</h3>
                   {dossier && !isEmptyDossier(dossier) ? (
-                    <DossierView dossier={dossier} />
+                    <div className="mt-2">
+                      <DossierView dossier={dossier} />
+                    </div>
                   ) : (
-                    <p className="mt-2 text-sm text-slate-500">
+                    <p className="mt-1.5 text-[11px] text-[var(--tx-3)]">
                       No dossier yet — add sources and refresh.
                     </p>
                   )}
                 </div>
               </div>
+            )}
 
-              <div className="mt-4 border-t border-slate-800 pt-3">
-                <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                  Paste media URL
-                </h3>
-                <p className="mt-1 text-xs text-slate-500">
-                  FOIA portal / CDN link — the gateway downloads it (UA-aware) and the fleet
-                  advances ingest → perception → render. Watch the live console.
+            {view === "captions" && <SubtitleGrid projectId={id} onSeek={seek} />}
+
+            {view === "tools" && (
+              <div className="space-y-3">
+                <p className="text-[11px] leading-relaxed text-[var(--tx-3)]">
+                  Checkpoint-first director tools — the same engine the LLM
+                  director uses. Every dispatch is versioned and rolls back on
+                  failure.
                 </p>
-                <div className="mt-2 flex gap-2">
-                  <input
-                    className="input"
-                    placeholder="https://portal.example/case/bodycam.mp4"
-                    value={ingestUrl}
-                    onChange={(e) => setIngestUrl(e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && doIngest()}
-                  />
-                  <button className="btn" onClick={doIngest} disabled={ingestBusy || !ingestUrl.trim()}>
-                    {ingestBusy ? "Ingesting…" : "Ingest"}
-                  </button>
-                </div>
-                {ingestStatus && <p className="mt-2 text-sm text-slate-300">{ingestStatus}</p>}
-              </div>
-            </div>
-          )}
-
-          {tab === "tools" && (
-            <div>
-              <p className="text-xs text-slate-500">
-                checkpoint-first director tools — same engine the LLM director uses
-              </p>
-              <div className="mt-2 flex flex-wrap gap-2">
-                {TOOLS.map((t) => (
-                  <button
-                    key={t.id}
-                    className="btn-ghost"
-                    onClick={() => dispatchTool(t.id, t.args)}
-                    title={t.id}
-                  >
-                    {t.hint}
-                  </button>
-                ))}
-              </div>
-              {dispatchLog.length > 0 && (
-                <ul className="mt-3 space-y-1 text-xs">
-                  {dispatchLog.map((d, i) => (
-                    <li key={i} className={d.ok ? "text-emerald-400" : "text-red-400"}>
-                      {d.tool} →{" "}
-                      {d.ok ? `v${d.version}` : `ROLLED BACK to v${d.rolled_back_to}`} · {d.detail}
-                    </li>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {TOOLS.map((t) => (
+                    <button
+                      key={t.id}
+                      className="btn-ghost !h-8 justify-start !text-[11px]"
+                      onClick={() => dispatchTool(t.id, t.args)}
+                      title={t.id}
+                    >
+                      {t.hint}
+                    </button>
                   ))}
-                </ul>
-              )}
-            </div>
-          )}
+                </div>
+                {editBusy && (
+                  <p className="text-[11px] text-[var(--warn)]">dispatching edit…</p>
+                )}
+                {dispatchLog.length > 0 && (
+                  <ul className="space-y-1 text-[11px]">
+                    {dispatchLog.map((d, i) => (
+                      <li
+                        key={i}
+                        className={d.ok ? "text-[var(--ok)]" : "text-[var(--err)]"}
+                      >
+                        {d.tool} →{" "}
+                        {d.ok ? `v${d.version}` : `ROLLED BACK to v${d.rolled_back_to}`} ·{" "}
+                        {d.detail}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
 
-          {tab === "publish" && (
-            <div className="grid gap-2 md:max-w-xl">
-              <p className="text-xs text-slate-500">
-                Human Review Gate — approve the cut as a YouTube Private Draft
-              </p>
-              <input
-                className="input"
-                placeholder="master path (e.g. output/pipeline/<id>/final.mp4)"
-                value={publish.video_path}
-                onChange={(e) => setPublish({ ...publish, video_path: e.target.value })}
-              />
-              <input
-                className="input"
-                placeholder="draft title"
-                value={publish.title}
-                onChange={(e) => setPublish({ ...publish, title: e.target.value })}
-              />
-              <textarea
-                className="input"
-                rows={2}
-                placeholder="description"
-                value={publish.base_description}
-                onChange={(e) => setPublish({ ...publish, base_description: e.target.value })}
-              />
-              <button
-                className="btn w-fit"
-                onClick={doPublish}
-                disabled={!publish.video_path || !publish.title}
-              >
-                Publish private draft
-              </button>
-              {publishResult && <p className="text-sm text-slate-300">{publishResult}</p>}
-            </div>
+            {view === "publish" && (
+              <div className="space-y-2">
+                <p className="text-[11px] leading-relaxed text-[var(--tx-3)]">
+                  Human Review Gate — approve the cut as a YouTube Private Draft.
+                </p>
+                <input
+                  className="input"
+                  placeholder="master path (output/pipeline/<id>/final.mp4)"
+                  value={publish.video_path}
+                  onChange={(e) => setPublish({ ...publish, video_path: e.target.value })}
+                />
+                <input
+                  className="input"
+                  placeholder="draft title"
+                  value={publish.title}
+                  onChange={(e) => setPublish({ ...publish, title: e.target.value })}
+                />
+                <textarea
+                  className="input"
+                  rows={3}
+                  placeholder="description"
+                  value={publish.base_description}
+                  onChange={(e) =>
+                    setPublish({ ...publish, base_description: e.target.value })
+                  }
+                />
+                <button
+                  className="btn"
+                  onClick={doPublish}
+                  disabled={!publish.video_path || !publish.title}
+                >
+                  <Icon name="upload" size={12} /> Publish private draft
+                </button>
+                {publishResult && (
+                  <p className="text-[11px] text-[var(--tx-2)]">{publishResult}</p>
+                )}
+              </div>
+            )}
+          </div>
+        </aside>
+
+        {/* program monitor */}
+        <main className="flex min-w-0 flex-1 flex-col bg-black">
+          {playable ? (
+            <ProgramMonitor
+              ref={monitorRef}
+              projectId={id}
+              asset={playable}
+              fps={fps}
+              onTimeUpdate={setPlayheadS}
+              onChanged={() => reloadNle()}
+            />
+          ) : (
+            <MonitorEmpty onRun={runOrResume} />
           )}
-        </div>
+        </main>
+
+        {/* pipeline + console */}
+        <aside className="flex w-[340px] shrink-0 flex-col overflow-hidden border-l border-[var(--line-1)] bg-[var(--bg-1)] xl:w-[380px]">
+          <div className="flex min-h-0 flex-[1.15] flex-col">
+            <PipelinePanel live={live} />
+          </div>
+          <div className="flex min-h-0 flex-1 flex-col">
+            <ConsolePanel live={live} />
+          </div>
+        </aside>
+      </div>
+
+      {/* ================= timeline dock ================= */}
+      <section className="flex h-[268px] shrink-0 flex-col border-t border-[var(--line-1)] bg-[var(--bg-1)]">
+        <Timeline
+          nle={nle}
+          playheadS={playheadS}
+          onSeek={seek}
+          onTrimClip={handleTrim}
+          onSplitAtPlayhead={handleSplitAtPlayhead}
+          onDeleteEffect={handleDeleteEffect}
+        />
       </section>
     </div>
   );
