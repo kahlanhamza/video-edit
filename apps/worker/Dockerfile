@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg curl \
+    && apt-get install -y --no-install-recommends ffmpeg curl build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # deep-filter (DeepFilterNet3) — the Bus-1 neural speech extractor for the
@@ -27,4 +27,4 @@ COPY packages ./packages
 COPY apps ./apps
 RUN uv sync --frozen --no-dev
 
-CMD ["celery", "-A", "director_os.worker.celery_app.celery_app", "worker", "-l", "info"]
+CMD ["/app/.venv/bin/celery", "-A", "director_os.worker.celery_app.celery_app", "worker", "-l", "info"]
