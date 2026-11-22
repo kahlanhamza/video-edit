@@ -66,11 +66,35 @@ class S3ObjectStore:
             aws_secret_access_key=self.settings.r2_secret_access_key,
         )
 
+    def _ensure_bucket(self) -> None:
+        """Idempotently make sure the bucket exists before the first write.
+
+        Belt-and-suspenders for the one-command setup: even if the
+        minio-init container never ran (fresh machine, minio restarted
+        with a wiped volume), the very first render still succeeds.
+        """
+        if getattr(self, "_bucket_ok", False):
+            return
+        from botocore.exceptions import ClientError  # ships with boto3
+
+        client = self._client()
+        try:
+            client.head_bucket(Bucket=self.settings.r2_bucket)
+        except ClientError as e:
+            code = str(e.response.get("Error", {}).get("Code", ""))
+            if code in ("404", "NoSuchBucket"):
+                client.create_bucket(Bucket=self.settings.r2_bucket)
+            else:
+                raise
+        self._bucket_ok = True
+
     def put_file(self, key: str, src_path: str | Path) -> str:
+        self._ensure_bucket()
         self._client().upload_file(str(src_path), self.settings.r2_bucket, key)
         return key
 
     def get_file(self, key: str, dest_path: str | Path) -> Path:
+        self._ensure_bucket()
         dest = Path(dest_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
         self._client().download_file(self.settings.r2_bucket, key, str(dest))
