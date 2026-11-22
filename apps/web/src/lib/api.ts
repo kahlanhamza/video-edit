@@ -140,6 +140,41 @@ export interface RefreshSourcesResult {
   dossier: CaseDossier;
 }
 
+// --- Settings UI: provider credentials vault + live probes (ADR-0012) ---
+
+export interface SettingsField {
+  key: string;
+  kind: "secret" | "text";
+  label: string;
+  placeholder: string;
+  configured: boolean;
+  source: "studio" | "env" | null;
+  /** masked hint for secrets (raw values NEVER leave the API), full for text */
+  value: string;
+}
+
+export interface SettingsProvider {
+  id: string;
+  label: string;
+  hint: string;
+  probe: string | null;
+  fields: SettingsField[];
+}
+
+export interface ProvidersOut {
+  ok: boolean;
+  version: number;
+  encrypted_at_rest: boolean;
+  providers: SettingsProvider[];
+}
+
+export interface ProbeOut {
+  ok: boolean;
+  latency_ms: number;
+  detail: string;
+  extra: Record<string, string>;
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const r = await fetch(`${API_BASE}${path}`, {
     headers: { "Content-Type": "application/json" },
@@ -277,6 +312,22 @@ export const api = {
   refreshSources: (id: string) =>
     req<RefreshSourcesResult>(`/projects/${id}/sources/refresh`, {
       method: "POST",
+    }),
+  // --- Settings: credentials vault + connection probes
+  listProviders: () => req<ProvidersOut>("/settings/providers"),
+  saveCredentials: (entries: { key: string; value: string }[]) =>
+    req<ProvidersOut>("/settings/credentials", {
+      method: "PUT",
+      body: JSON.stringify({ entries }),
+    }),
+  deleteCredential: (key: string) =>
+    req<ProvidersOut>(`/settings/credentials/${encodeURIComponent(key)}`, {
+      method: "DELETE",
+    }),
+  testProvider: (provider: string, params: Record<string, string>) =>
+    req<ProbeOut>("/settings/test", {
+      method: "POST",
+      body: JSON.stringify({ provider, params }),
     }),
 };
 

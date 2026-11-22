@@ -21,6 +21,13 @@ export default function RootLayout({
           <span className="ml-3 text-xs text-slate-500">
             M3 — human review gate over the autonomous pipeline
           </span>
+          <a
+            href="/settings"
+            className="btn-ghost float-right !py-1 text-xs"
+            title="Provider credentials + connection tests"
+          >
+            Settings
+          </a>
         </header>
         <main className="mx-auto max-w-5xl p-6">{children}</main>
       </body>

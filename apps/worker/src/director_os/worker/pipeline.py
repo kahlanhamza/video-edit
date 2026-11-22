@@ -2211,7 +2211,16 @@ def make_deps(
 ) -> PipelineDeps:
     engine = make_engine(database_url)
     init_models(engine)
-    resolved = settings or get_settings()
+    if settings is None:
+        # Production path: Studio-saved credentials (Settings UI) override
+        # .env — refresh the overlay per job so key changes never need a
+        # worker restart. Tests inject explicit settings and skip this.
+        from director_os.core.credentials import apply_credentials_to_settings
+
+        apply_credentials_to_settings(engine)
+        resolved = get_settings()
+    else:
+        resolved = settings
     # REDACT_MODE env default ("tracked" | "yunet" | "modal") — explicit
     # overrides always win; unset env keeps the hermetic CPU default
     overrides.setdefault("redact_backend", os.getenv("REDACT_MODE", "").strip().lower() or None)

@@ -8,6 +8,20 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _reset_settings_overlay():
+    """Isolate the runtime credential overlay (ADR-0012) between tests.
+
+    The overlay is a process-global in core.config; without this reset a test
+    that saves credentials would leak them into every later test.
+    """
+    from director_os.core.config import set_settings_overrides
+
+    set_settings_overrides({})
+    yield
+    set_settings_overrides({})
+
+
 @pytest.fixture(scope="session")
 def fixture_video(tmp_path_factory) -> Path:
     """12s colorful test-source clip with a 48 kHz stereo audio track."""

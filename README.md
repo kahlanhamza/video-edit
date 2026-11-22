@@ -67,6 +67,27 @@ Everything else in `.env.example` is optional with sane defaults. The compose
 services override service URLs internally, so the SAME `.env` also drives a
 host-side `make api` — you only ever edit keys, never URLs.
 
+### Provider settings in the Studio (no .env editing, no restarts)
+
+The **Settings** page (top-right in the Studio, `/settings`) is a proper
+provider console: one card per provider — LLM, Gladia ASR, Vision, OpenRouter,
+ElevenLabs, Kaggle, Modal, YouTube, ingest identity — where you paste keys,
+hit **Test connection** (a live probe against the cheapest authenticated
+endpoint: never starts a paid job), and **Save** into the server-side vault.
+
+- **Any OpenAI-compatible LLM connects** — the LLM card ships one-click
+  presets (Meta Muse, Google AI Studio, OpenRouter, Groq, DeepSeek, local
+  Ollama, local LM Studio) and takes any custom base URL + model. Blank base
+  URL = native Gemini. (Agent-task APIs like Manus' task API don't speak the
+  chat-completions wire format; a gateway that exposes one does.)
+- **Saved keys override .env at runtime** — the gateway reloads the overlay
+  on save, the worker fleet re-reads it per job. Rotation without restarts;
+  removing a saved key falls back to .env.
+- Secrets are stored server-side and never returned to the browser (masked
+  hints only). At-rest encryption turns on when `SETTINGS_SECRET_KEY` is set
+  in .env; plaintext otherwise (same threat model as the .env file). See
+  ADR-0012.
+
 ### The one-button Studio flow
 
 1. New case: title + video URL(s) + case sources (article/news/PDF links,

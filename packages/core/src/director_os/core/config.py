@@ -10,6 +10,25 @@ from pathlib import Path
 LOCAL_STORAGE = "local"
 S3_STORAGE = "s3"
 
+# Runtime credential overlay (Studio Settings -> DB -> here, ADR-0012):
+# keys saved in the Settings UI override the process env inside get_settings()
+# WITHOUT a restart. Set/refreshed by core.credentials.apply_credentials_to_settings().
+_OVERRIDES: dict[str, str] = {}
+
+
+def set_settings_overrides(overrides: dict[str, str]) -> None:
+    """Replace the overlay (whitelist filtering is the caller's job) and
+    invalidate the cached Settings so the next get_settings() sees it."""
+    global _OVERRIDES
+    _OVERRIDES = dict(overrides)
+    get_settings.cache_clear()
+
+
+def _env(name: str, default: str = "") -> str:
+    if name in _OVERRIDES:
+        return _OVERRIDES[name]
+    return os.getenv(name, default)
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -76,8 +95,8 @@ def _load() -> Settings:
     output_dir = Path(os.getenv("OUTPUT_DIR", "./output")).resolve()
     return Settings(
         database_url=os.getenv("DATABASE_URL", "sqlite:///./output/directoros.db"),
-        redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
-        storage_backend=os.getenv("STORAGE_BACKEND", LOCAL_STORAGE),
+        redis_url=_env("REDIS_URL", "redis://localhost:6379/0"),
+        storage_backend=_env("STORAGE_BACKEND", LOCAL_STORAGE),
         output_dir=output_dir,
         ingest_dir=output_dir / "ingest",
         segments_dir=output_dir / "segments",
@@ -87,39 +106,39 @@ def _load() -> Settings:
         fps=int(os.getenv("FPS", "30")),
         res_w=int(os.getenv("RES_W", "1920")),
         res_h=int(os.getenv("RES_H", "1080")),
-        contact_email=os.getenv("CONTACT_EMAIL", "ops@directoros.example"),
-        r2_endpoint=os.getenv("R2_ENDPOINT", ""),
-        r2_access_key_id=os.getenv("R2_ACCESS_KEY_ID", ""),
-        r2_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY", ""),
-        r2_bucket=os.getenv("R2_BUCKET", "directoros"),
-        gladia_api_key=os.getenv("GLADIA_API_KEY", ""),
-        llm_api_key=os.getenv("LLM_API_KEY", ""),
-        llm_base_url=os.getenv("LLM_BASE_URL", ""),
-        llm_model=os.getenv("LLM_MODEL", ""),
-        llm_provider=os.getenv("LLM_PROVIDER", ""),
-        llm_budget_usd=float(os.getenv("LLM_BUDGET_USD", "15.0")),
-        llm_spend_ledger=os.getenv("LLM_SPEND_LEDGER", ""),
+        contact_email=_env("CONTACT_EMAIL", "ops@directoros.example"),
+        r2_endpoint=_env("R2_ENDPOINT", ""),
+        r2_access_key_id=_env("R2_ACCESS_KEY_ID", ""),
+        r2_secret_access_key=_env("R2_SECRET_ACCESS_KEY", ""),
+        r2_bucket=_env("R2_BUCKET", "directoros"),
+        gladia_api_key=_env("GLADIA_API_KEY", ""),
+        llm_api_key=_env("LLM_API_KEY", ""),
+        llm_base_url=_env("LLM_BASE_URL", ""),
+        llm_model=_env("LLM_MODEL", ""),
+        llm_provider=_env("LLM_PROVIDER", ""),
+        llm_budget_usd=float(_env("LLM_BUDGET_USD", "15.0") or "15.0"),
+        llm_spend_ledger=_env("LLM_SPEND_LEDGER", ""),
         llm_allow_training_on_content=(
-            os.getenv("LLM_ALLOW_TRAINING_ON_CONTENT", "").lower() in {"1", "true", "yes"}
+            _env("LLM_ALLOW_TRAINING_ON_CONTENT", "").lower() in {"1", "true", "yes"}
         ),
-        llm_fallback_models=os.getenv("LLM_FALLBACK_MODELS", ""),
-        gemini_fallback_models=os.getenv("GEMINI_FALLBACK_MODELS", ""),
-        openrouter_api_key=os.getenv("OPENROUTER_API_KEY", ""),
-        openrouter_base_url=os.getenv("OPENROUTER_BASE_URL", ""),
-        openrouter_model=os.getenv("OPENROUTER_MODEL", ""),
+        llm_fallback_models=_env("LLM_FALLBACK_MODELS", ""),
+        gemini_fallback_models=_env("GEMINI_FALLBACK_MODELS", ""),
+        openrouter_api_key=_env("OPENROUTER_API_KEY", ""),
+        openrouter_base_url=_env("OPENROUTER_BASE_URL", ""),
+        openrouter_model=_env("OPENROUTER_MODEL", ""),
         openrouter_fallback_models=os.getenv("OPENROUTER_FALLBACK_MODELS", ""),
-        vision_api_key=os.getenv("VISION_API_KEY", ""),
+        vision_api_key=_env("VISION_API_KEY", ""),
         vision_provider=os.getenv("VISION_PROVIDER", ""),
-        vision_model=os.getenv("VISION_MODEL", "gemini-3.5-flash-lite"),
+        vision_model=_env("VISION_MODEL", "gemini-3.5-flash-lite"),
         vision_fallback_models=os.getenv("VISION_FALLBACK_MODELS", "gemini-3.1-flash-lite"),
-        compute_backend=os.getenv("COMPUTE_BACKEND", "local").strip().lower(),
-        kaggle_username=os.getenv("KAGGLE_USERNAME", ""),
-        kaggle_key=os.getenv("KAGGLE_KEY", ""),
-        modal_token_id=os.getenv("MODAL_TOKEN_ID", ""),
-        modal_token_secret=os.getenv("MODAL_TOKEN_SECRET", ""),
+        compute_backend=_env("COMPUTE_BACKEND", "local").strip().lower(),
+        kaggle_username=_env("KAGGLE_USERNAME", ""),
+        kaggle_key=_env("KAGGLE_KEY", ""),
+        modal_token_id=_env("MODAL_TOKEN_ID", ""),
+        modal_token_secret=_env("MODAL_TOKEN_SECRET", ""),
         tts_provider=os.getenv("TTS_PROVIDER", "edge").strip().lower(),
-        elevenlabs_api_key=os.getenv("ELEVENLABS_API_KEY", ""),
-        elevenlabs_voice_id=os.getenv("ELEVENLABS_VOICE_ID", ""),
+        elevenlabs_api_key=_env("ELEVENLABS_API_KEY", ""),
+        elevenlabs_voice_id=_env("ELEVENLABS_VOICE_ID", ""),
         elevenlabs_model_id=os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2"),
     )
 

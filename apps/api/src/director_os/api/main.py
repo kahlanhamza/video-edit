@@ -23,6 +23,14 @@ from director_os.api.youtube import (
     YouTubePublisher,
 )
 from director_os.core.config import get_settings
+from director_os.core.credentials import (
+    CredentialRow,
+    apply_credentials_to_settings,
+    delete_credential,
+    encryption_active,
+    mask_secret,
+    upsert_credentials,
+)
 from director_os.core.db import (
     AgentToolLogRow,
     CaseDossierRow,
@@ -78,6 +86,8 @@ def session() -> Session:
         _engine = make_engine()
         init_models(_engine)
         _session_factory = make_session_factory(_engine)
+        # Studio-saved credentials (Settings UI) win over .env from here on.
+        apply_credentials_to_settings(_engine)
     return _session_factory()
 
 
@@ -1415,3 +1425,280 @@ def approve_project(project_id: str) -> ApproveResponse:
     return ApproveResponse(
         ok=True, job_id=job_id, status="approved", version=version, enqueued=enqueued, detail=detail
     )
+
+
+# ---------------------------------------------------------------------------
+# Settings UI — provider credentials vault + live connection probes (ADR-0012)
+# ---------------------------------------------------------------------------
+
+_PROVIDER_SPECS: list[dict[str, Any]] = [
+    {
+        "id": "llm",
+        "label": "LLM — the AI editor's brain",
+        "probe": "llm",
+        "hint": (
+            "Any OpenAI-compatible endpoint works: Meta Muse (https://api.meta.ai/v1), "
+            "OpenRouter, Groq, DeepSeek, Together, local Ollama (http://localhost:11434/v1) or "
+            "LM Studio (http://localhost:1234/v1). "
+            "Leave the Base URL BLANK for native Google AI Studio."
+        ),
+        "fields": [
+            {"key": "LLM_API_KEY", "kind": "secret", "label": "API key"},
+            {
+                "key": "LLM_BASE_URL",
+                "kind": "text",
+                "label": "Base URL (blank = Google AI Studio)",
+                "placeholder": "https://api.meta.ai/v1",
+            },
+            {"key": "LLM_MODEL", "kind": "text", "label": "Model", "placeholder": "muse-ember-1.0"},
+            {
+                "key": "LLM_FALLBACK_MODELS",
+                "kind": "text",
+                "label": "Fallback models (comma-separated)",
+                "placeholder": "optional",
+            },
+            {
+                "key": "LLM_BUDGET_USD",
+                "kind": "text",
+                "label": "Spend cap (USD)",
+                "placeholder": "15.0",
+            },
+        ],
+    },
+    {
+        "id": "gladia",
+        "label": "Gladia — ASR + diarization (captions)",
+        "probe": "gladia",
+        "hint": (
+            "Free tier at app.gladia.io. Without it the pipeline runs but skips "
+            "transcription/captions."
+        ),
+        "fields": [{"key": "GLADIA_API_KEY", "kind": "secret", "label": "API key"}],
+    },
+    {
+        "id": "vision",
+        "label": "Vision LLM — frame understanding",
+        "probe": "vision_gemini",
+        "hint": (
+            "Gemini-family key for contact-sheet indexing and Frames-on-Demand QA "
+            "(an AI Studio key works)."
+        ),
+        "fields": [
+            {"key": "VISION_API_KEY", "kind": "secret", "label": "API key"},
+            {
+                "key": "VISION_MODEL",
+                "kind": "text",
+                "label": "Model",
+                "placeholder": "gemini-3.5-flash-lite",
+            },
+        ],
+    },
+    {
+        "id": "openrouter",
+        "label": "OpenRouter — secondary LLM tier (:free models)",
+        "probe": "openrouter",
+        "hint": (
+            "Automatic capacity failover tier when the primary LLM is rate-limited. "
+            "Model ids look like vendor/model:free."
+        ),
+        "fields": [
+            {"key": "OPENROUTER_API_KEY", "kind": "secret", "label": "API key"},
+            {
+                "key": "OPENROUTER_BASE_URL",
+                "kind": "text",
+                "label": "Base URL",
+                "placeholder": "https://openrouter.ai/api/v1",
+            },
+            {
+                "key": "OPENROUTER_MODEL",
+                "kind": "text",
+                "label": "Model",
+                "placeholder": "vendor/model:free",
+            },
+        ],
+    },
+    {
+        "id": "elevenlabs",
+        "label": "ElevenLabs — studio-grade narration TTS",
+        "probe": "elevenlabs",
+        "hint": "Optional: edge-tts is the $0 default narrator.",
+        "fields": [
+            {"key": "ELEVENLABS_API_KEY", "kind": "secret", "label": "API key"},
+            {
+                "key": "ELEVENLABS_VOICE_ID",
+                "kind": "text",
+                "label": "Voice ID",
+                "placeholder": "optional",
+            },
+        ],
+    },
+    {
+        "id": "kaggle",
+        "label": "Kaggle — free GPU compute lane",
+        "probe": "kaggle",
+        "hint": (
+            "KGAT_ token from kaggle.com/settings → API → Create New Token. "
+            "Set COMPUTE_BACKEND=kaggle to use it."
+        ),
+        "fields": [
+            {"key": "KAGGLE_USERNAME", "kind": "text", "label": "Username"},
+            {"key": "KAGGLE_KEY", "kind": "secret", "label": "API token (KGAT_...)"},
+            {
+                "key": "COMPUTE_BACKEND",
+                "kind": "text",
+                "label": "Compute backend",
+                "placeholder": "local|kaggle|modal",
+            },
+        ],
+    },
+    {
+        "id": "modal",
+        "label": "Modal — serverless GPU (needs a payment method)",
+        "probe": "modal",
+        "hint": (
+            "Dormant by design: their card verification charges a fee. "
+            "Leave empty unless that changes."
+        ),
+        "fields": [
+            {"key": "MODAL_TOKEN_ID", "kind": "secret", "label": "Token ID"},
+            {"key": "MODAL_TOKEN_SECRET", "kind": "secret", "label": "Token secret"},
+        ],
+    },
+    {
+        "id": "youtube",
+        "label": "YouTube — private draft publishing",
+        "probe": "youtube",
+        "hint": (
+            "One-time interactive OAuth: run scripts/gen_youtube_refresh_token.py "
+            "on any machine with a browser."
+        ),
+        "fields": [
+            {"key": "YOUTUBE_CLIENT_ID", "kind": "secret", "label": "OAuth client ID"},
+            {"key": "YOUTUBE_CLIENT_SECRET", "kind": "secret", "label": "OAuth client secret"},
+            {"key": "YOUTUBE_REFRESH_TOKEN", "kind": "secret", "label": "Refresh token"},
+        ],
+    },
+    {
+        "id": "ingest",
+        "label": "Ingest identity (guardrail UA contact)",
+        "probe": None,
+        "hint": "Rides the descriptive User-Agent on every cloud fetch (PLAN guardrail 3).",
+        "fields": [{"key": "CONTACT_EMAIL", "kind": "text", "label": "Contact email"}],
+    },
+]
+
+
+class CredentialEntry(BaseModel):
+    key: str = Field(min_length=1, max_length=100)
+    value: str = Field(max_length=4096)
+
+
+class CredentialsIn(BaseModel):
+    entries: list[CredentialEntry] = Field(default_factory=list, max_length=40)
+
+
+class CredentialsOut(BaseModel):
+    ok: bool
+    version: int
+    encrypted_at_rest: bool
+    providers: list[dict[str, Any]]
+
+
+class ProbeIn(BaseModel):
+    provider: str = Field(min_length=1, max_length=40)
+    params: dict[str, str] = Field(default_factory=dict)
+
+
+class ProbeOut(BaseModel):
+    ok: bool
+    latency_ms: int
+    detail: str
+    extra: dict[str, str] = Field(default_factory=dict)
+
+
+def _settings_providers_payload() -> list[dict[str, Any]]:
+    """Catalog with per-field value hints — secrets masked, never returned raw."""
+    s = get_settings()
+    with session() as sess:
+        studio_keys = {row.key for row in sess.query(CredentialRow).all()}
+    providers: list[dict[str, Any]] = []
+    for spec in _PROVIDER_SPECS:
+        fields: list[dict[str, Any]] = []
+        for f in spec["fields"]:
+            key = f["key"]
+            current = str(getattr(s, key.lower(), "") or "")
+            source = "studio" if key in studio_keys else ("env" if current else None)
+            fields.append(
+                {
+                    "key": key,
+                    "kind": f["kind"],
+                    "label": f["label"],
+                    "placeholder": f.get("placeholder", ""),
+                    "configured": bool(current),
+                    "source": source,
+                    # secrets travel as masked hints only — never raw
+                    "value": mask_secret(current) if f["kind"] == "secret" else current,
+                }
+            )
+        providers.append(
+            {
+                "id": spec["id"],
+                "label": spec["label"],
+                "hint": spec["hint"],
+                "probe": spec["probe"],
+                "fields": fields,
+            }
+        )
+    return providers
+
+
+@app.get("/settings/providers", response_model=CredentialsOut)
+def list_settings_providers() -> CredentialsOut:
+    return CredentialsOut(
+        ok=True,
+        version=0,
+        encrypted_at_rest=encryption_active(),
+        providers=_settings_providers_payload(),
+    )
+
+
+@app.put("/settings/credentials", response_model=CredentialsOut)
+def save_settings_credentials(body: CredentialsIn) -> CredentialsOut:
+    entries = {e.key: e.value for e in body.entries}
+    try:
+        with session() as sess:
+            version = upsert_credentials(sess, entries)
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    apply_credentials_to_settings(_engine)
+    payload = _settings_providers_payload()
+    return CredentialsOut(
+        ok=True, version=version, encrypted_at_rest=encryption_active(), providers=payload
+    )
+
+
+@app.delete("/settings/credentials/{key}", response_model=CredentialsOut)
+def delete_settings_credential(key: str) -> CredentialsOut:
+    try:
+        with session() as sess:
+            version = delete_credential(sess, key)
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    apply_credentials_to_settings(_engine)
+    payload = _settings_providers_payload()
+    return CredentialsOut(
+        ok=True, version=version, encrypted_at_rest=encryption_active(), providers=payload
+    )
+
+
+@app.post("/settings/test", response_model=ProbeOut)
+def test_settings_provider(body: ProbeIn) -> ProbeOut:
+    from director_os.core.probes import run_probe
+
+    try:
+        result = run_probe(body.provider, body.params, get_settings())
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:  # a probe must never 500 on bad credentials
+        return ProbeOut(ok=False, latency_ms=0, detail=f"{type(e).__name__}: {e}", extra={})
+    return ProbeOut(**result.as_dict())

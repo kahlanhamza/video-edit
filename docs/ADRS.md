@@ -98,3 +98,35 @@ Premiere) must be driven directly.
 **Consequences:** no protocol tax, no token explosion; the registry schema
 remains the single contract; an MCP facade over the same registry is a
 mechanical follow-up if ever needed.
+
+## ADR-0012 — Studio credentials vault: DB-backed keys with env overlay, live probes in the Settings UI (2026-11-22)
+
+**Context:** provider configuration lived ONLY in `.env` (edit file, restart
+containers). The owner asked for big-tech provider settings: connect ANY
+LLM (not just the two defaults) — including self-hosted and OpenAI-compatible
+gateways — plus Modal/Kaggle/Gladia/ElevenLabs/YouTube, with connect-test
+buttons in the web UI. Engine fact: `OpenAICompatBackend` already accepts any
+base URL, so the engine was never the limit — configuration delivery was.
+Manus-style task APIs are NOT OpenAI chat-completions, so they cannot serve
+the tool loop directly (documented in the UI; any chat-completions gateway
+connects in one paste).
+
+**Decision:** a `credentials` table (strict env-name whitelist, fail-closed)
+is the Studio-editable layer; `set_settings_overrides()` merges DB rows OVER
+process env inside `get_settings()` — precedence: typed probe params > saved
+Studio keys > .env. Gateway applies the overlay on first DB bind + every
+save; the worker fleet re-reads it in `make_deps` per job (no restart).
+At-rest encryption is Fernet when `SETTINGS_SECRET_KEY` is set and
+`cryptography` is importable — plaintext by default (the same threat model
+as the .env file it replaces), surfaced honestly in the UI. Probes hit the
+CHEAPEST authenticated endpoint per provider (LLM: max_tokens=1 ping; Gladia:
+GET nonexistent job → 404 == authenticated; OpenRouter: /key metadata;
+Kaggle: /hello; ElevenLabs: /v1/user; YouTube: OAuth refresh round-trip;
+Modal: real SDK App.lookup with NotFound==auth-ok). Raw secrets never leave
+the API — masked hints only (`••••last4`). `STORAGE_BACKEND`/`DATABASE_URL`
+are deliberately NOT vault-manageable (compose owns them; a UI override
+could brick the stack).
+
+**Consequences:** no restart for key rotation; CI stays hermetic (probes
+transport-injected, MockTransport-pinned); a settings-vault wipe degrades to
+.env behavior; adding a provider = one catalog entry + one probe function.
