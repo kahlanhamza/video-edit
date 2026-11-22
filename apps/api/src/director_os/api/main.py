@@ -39,6 +39,7 @@ from director_os.core.db import (
     MediaAssetRow,
     PerceptionIndexRow,
     ProjectRow,
+    TimelineVersionRow,
     init_models,
     make_engine,
     make_session_factory,
@@ -50,6 +51,7 @@ from fastapi import FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -1103,9 +1105,15 @@ def _redaction_regions(s: Session, asset_id: str) -> list[dict[str, Any]]:
 
 
 def _save_redaction_regions(s: Session, asset_id: str, regions: list[dict[str, Any]]) -> None:
+    """Merge-save regions — the sweep payload (per_frame plan, plan_digest,
+    keep_track_ids, ranges_digest) rides the SAME column and must survive
+    every canvas edit. The old overwrite silently destroyed the tracked
+    redaction plan on the first studio-drawn box."""
     row = s.get(PerceptionIndexRow, asset_id)
-    assert row is not None  # created by _redaction_regions above
-    row.redaction_tracks_json = {"regions": regions}
+    if row is None:
+        row = PerceptionIndexRow(asset_id=asset_id)
+        s.add(row)
+    row.redaction_tracks_json = {**(row.redaction_tracks_json or {}), "regions": regions}
     s.commit()
 
 
@@ -1345,6 +1353,11 @@ def run_project(project_id: str, body: RunRequest | None = None) -> RunResponse:
         finally:
             s.close()
 
+    # Run = explicit resume intent: clear any operator STOP flag so the
+    # pipeline advances instead of parking at the first stage boundary
+    stop_flag = get_settings().output_dir / "pipeline" / project_id / "STOP"
+    stop_flag.unlink(missing_ok=True)
+
     dispatched, dispatch_detail = _dispatch_advance(job_id, project_id, source_str)
     s2 = session()
     try:
@@ -1372,6 +1385,67 @@ class ApproveResponse(BaseModel):
     version: int | None = None
     enqueued: bool
     detail: str
+
+
+@app.post("/projects/{project_id}/stop", status_code=202)
+def stop_project(project_id: str) -> dict[str, Any]:
+    """Cooperative stop: parks the running job at the NEXT stage boundary.
+
+    The checkpoint law keeps every completed stage — nothing restarts. Run
+    (resume) clears the flag and continues from the parked stage. An ffmpeg
+    already in flight finishes; the next boundary stops.
+    """
+    s = session()
+    try:
+        if s.get(ProjectRow, project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+    finally:
+        s.close()
+    flag = get_settings().output_dir / "pipeline" / project_id / "STOP"
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text(datetime.now(UTC).isoformat())
+    return {
+        "stopped": True,
+        "note": "job parks at the next stage boundary — completed stages are kept; Run resumes",
+    }
+
+
+@app.delete("/projects/{project_id}", status_code=204)
+def delete_project(project_id: str) -> Response:
+    """Full teardown: every DB row (jobs, assets, perception index, timeline
+    versions, dossier, sources, agent logs) + the pipeline output tree.
+    The content-addressed segment cache is shared across projects and stays.
+    """
+    import shutil
+
+    s = session()
+    try:
+        project = s.get(ProjectRow, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        asset_ids = list(
+            s.execute(
+                select(MediaAssetRow.id).where(MediaAssetRow.project_id == project_id)
+            ).scalars()
+        )
+        if asset_ids:
+            s.execute(
+                sa_delete(PerceptionIndexRow).where(PerceptionIndexRow.asset_id.in_(asset_ids))
+            )
+        s.execute(sa_delete(JobRow).where(JobRow.project_id == project_id))
+        s.execute(sa_delete(MediaAssetRow).where(MediaAssetRow.project_id == project_id))
+        s.execute(sa_delete(TimelineVersionRow).where(TimelineVersionRow.project_id == project_id))
+        s.execute(sa_delete(CaseDossierRow).where(CaseDossierRow.project_id == project_id))
+        s.execute(sa_delete(CaseSourceRow).where(CaseSourceRow.project_id == project_id))
+        s.execute(sa_delete(AgentToolLogRow).where(AgentToolLogRow.project_id == project_id))
+        s.delete(project)
+        s.commit()
+    finally:
+        s.close()
+    tree = get_settings().output_dir / "pipeline" / project_id
+    if tree.exists():
+        shutil.rmtree(tree, ignore_errors=True)
+    return Response(status_code=204)
 
 
 @app.post("/projects/{project_id}/approve", response_model=ApproveResponse, status_code=202)
@@ -1478,13 +1552,21 @@ _PROVIDER_SPECS: list[dict[str, Any]] = [
     {
         "id": "vision",
         "label": "Vision LLM — frame understanding",
-        "probe": "vision_gemini",
+        "probe": "vision",
         "hint": (
-            "Gemini-family key for contact-sheet indexing and Frames-on-Demand QA "
-            "(an AI Studio key works)."
+            "Contact-sheet indexing + Frames-on-Demand QA. Native Gemini (blank "
+            "Base URL, AI Studio key) or ANY OpenAI-compatible endpoint — set "
+            "the Base URL (e.g. https://openrouter.ai/api/v1, Groq, DeepSeek, "
+            "local Ollama/LM Studio) and a vision-capable model."
         ),
         "fields": [
             {"key": "VISION_API_KEY", "kind": "secret", "label": "API key"},
+            {
+                "key": "VISION_BASE_URL",
+                "kind": "text",
+                "label": "Base URL (blank = native Gemini)",
+                "placeholder": "https://api.openai-compatible.example/v1",
+            },
             {
                 "key": "VISION_MODEL",
                 "kind": "text",

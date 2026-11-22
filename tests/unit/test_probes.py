@@ -231,3 +231,74 @@ def test_probe_result_shape():
         "detail": "d",
         "extra": {},
     }
+
+
+def test_vision_probe_openai_compat_vs_gemini(monkeypatch):
+    """VISION_BASE_URL set -> openai-compat probe with VISION_MODEL; blank ->
+    native Gemini probe. The Vision card connects to ANY provider."""
+    from director_os.core.config import get_settings
+
+    seen: dict = {}
+
+    def fake_compat(api_key, base_url, model, transport=None, timeout_s=20.0):
+        seen.update(api_key=api_key, base_url=base_url, model=model)
+        return ProbeResult(True, 3, "compat ok")
+
+    def fake_gemini(key, transport=None):
+        seen.update(gemini_key=key)
+        return ProbeResult(True, 4, "gemini ok")
+
+    import director_os.core.probes as probes_mod
+
+    monkeypatch.setattr(probes_mod, "probe_openai_compat", fake_compat)
+    monkeypatch.setattr(probes_mod, "probe_gemini_rest", fake_gemini)
+
+    s = get_settings()
+    # blank base url -> gemini lane
+    r = run_probe("vision", {"VISION_API_KEY": "k"}, s)
+    assert r.ok and seen.get("gemini_key") == "k"
+
+    # base url set -> openai-compat lane with the typed model
+    r2 = run_probe(
+        "vision",
+        {
+            "VISION_API_KEY": "k2",
+            "VISION_BASE_URL": "https://openrouter.ai/api/v1",
+            "VISION_MODEL": "qwen/qwen3.8-27b:free",
+        },
+        s,
+    )
+    assert r2.ok
+    assert seen == {
+        "gemini_key": "k",
+        "api_key": "k2",
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "qwen/qwen3.8-27b:free",
+    }
+    # the legacy alias still dispatches
+    assert run_probe("vision_gemini", {"VISION_API_KEY": "k3"}, s).ok
+
+
+def test_make_vision_clients_base_url_paths(monkeypatch):
+    """VISION_BASE_URL set -> OpenAI-compat primary tier (custom model); blank
+    -> native Gemini primary. OpenRouter failover rides when configured."""
+    from director_os.core.config import get_settings
+    from director_os.perception.vision import GeminiVisionClient, OpenRouterVisionClient
+    from director_os.perception.vision_index import make_vision_clients
+
+    monkeypatch.setenv("VISION_API_KEY", "v-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "")
+    monkeypatch.setenv("OPENROUTER_BASE_URL", "")
+    monkeypatch.setenv("VISION_BASE_URL", "")
+    get_settings.cache_clear()
+    idx, qa = make_vision_clients("v-key")
+    assert isinstance(idx._client, GeminiVisionClient)
+
+    monkeypatch.setenv("VISION_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("VISION_INDEX_MODEL", "my-vision-model")
+    get_settings.cache_clear()
+    idx, qa = make_vision_clients("v-key")
+    assert isinstance(idx._client, OpenRouterVisionClient)
+    assert idx._client.base_url == "http://localhost:1234/v1"
+    assert idx._client.model == "my-vision-model"
+    get_settings.cache_clear()

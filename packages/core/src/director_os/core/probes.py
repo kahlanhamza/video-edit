@@ -364,8 +364,21 @@ def run_probe(
         base = p("LLM_BASE_URL")
         model = p("LLM_MODEL") or "muse-ember-1.0"
         return probe_openai_compat(p("LLM_API_KEY"), base, model, transport=transport)
-    if provider in ("llm_gemini", "gemini", "vision_gemini"):
-        return probe_gemini_rest(p("LLM_API_KEY") or p("VISION_API_KEY"), transport=transport)
+    if provider in ("llm_gemini", "gemini"):
+        return probe_gemini_rest(p("LLM_API_KEY"), transport=transport)
+    if provider in ("vision", "vision_gemini"):
+        # OpenAI-compatible vision endpoint when a Base URL is set (Groq,
+        # DeepSeek, Ollama, LM Studio, any /chat/completions gateway); blank
+        # Base URL = native Gemini generateContent.
+        base = p("VISION_BASE_URL")
+        if base:
+            return probe_openai_compat(
+                p("VISION_API_KEY"),
+                base,
+                p("VISION_MODEL") or "gemini-3.5-flash-lite",
+                transport=transport,
+            )
+        return probe_gemini_rest(p("VISION_API_KEY"), transport=transport)
     if provider == "gladia":
         return probe_gladia(p("GLADIA_API_KEY"), transport=transport)
     if provider == "openrouter":

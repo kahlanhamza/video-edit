@@ -75,6 +75,7 @@ class Settings:
     # --- vision LLM (M4)
     vision_api_key: str
     vision_provider: str
+    vision_base_url: str
     vision_model: str
     vision_fallback_models: str
     # --- compute backend (M4: local ONNX default / Kaggle free GPU / Modal optional)
@@ -129,6 +130,7 @@ def _load() -> Settings:
         openrouter_fallback_models=os.getenv("OPENROUTER_FALLBACK_MODELS", ""),
         vision_api_key=_env("VISION_API_KEY", ""),
         vision_provider=os.getenv("VISION_PROVIDER", ""),
+        vision_base_url=_env("VISION_BASE_URL", ""),
         vision_model=_env("VISION_MODEL", "gemini-3.5-flash-lite"),
         vision_fallback_models=os.getenv("VISION_FALLBACK_MODELS", "gemini-3.1-flash-lite"),
         compute_backend=_env("COMPUTE_BACKEND", "local").strip().lower(),

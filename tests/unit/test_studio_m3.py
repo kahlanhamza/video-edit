@@ -246,3 +246,59 @@ def test_drawn_redaction_reaches_render_pipeline(project_with_asset):
         s.commit()
     regions = _project_redaction_regions(factory, "a_studio")
     assert [r.track_id for r in regions] == ["n1", "flat2"]
+
+
+def test_redaction_canvas_edit_preserves_sweep_payload(project_with_asset):
+    """The sweep payload (per_frame plan, plan_digest, ranges_digest) rides the
+    SAME column as the canvas regions — a studio-drawn box or a delete used to
+    WIPE it (the tracked redaction plan silently vanished on first edit)."""
+    from director_os.core.db import PerceptionIndexRow
+
+    client, pid = project_with_asset
+    import director_os.api.main as api_main
+    from director_os.core.db import MediaAssetRow
+    from sqlalchemy import select
+
+    # same selection law as _primary_asset (order_by id, limit 1)
+    s = api_main.session()
+    try:
+        asset_id = s.execute(
+            select(MediaAssetRow.id)
+            .where(MediaAssetRow.project_id == pid)
+            .order_by(MediaAssetRow.id)
+            .limit(1)
+        ).scalar_one()
+    finally:
+        s.close()
+    s = api_main.session()
+    try:
+        row = s.get(PerceptionIndexRow, asset_id)
+        if row is None:
+            row = PerceptionIndexRow(asset_id=asset_id)
+            s.add(row)
+        row.redaction_tracks_json = {
+            "regions": [],
+            "per_frame": {"fps": 30, "n_frames": 900, "trajectories": []},
+            "plan_digest": "abc12345",
+            "keep_track_ids": ["person_1"],
+            "ranges_digest": "deadbeef01",
+        }
+        s.commit()
+    finally:
+        s.close()
+
+    r = client.post(f"/projects/{pid}/redactions", json={"x": 10, "y": 10, "w": 50, "h": 50})
+    assert r.status_code == 201
+    region_id = r.json()["id"]
+    assert client.delete(f"/projects/{pid}/redactions/{region_id}").status_code == 204
+
+    s = __import__("director_os.api.main", fromlist=["session"]).session()
+    try:
+        payload = s.get(PerceptionIndexRow, asset_id).redaction_tracks_json
+    finally:
+        s.close()
+    assert payload["plan_digest"] == "abc12345"
+    assert payload["ranges_digest"] == "deadbeef01"
+    assert payload["keep_track_ids"] == ["person_1"]
+    assert payload["per_frame"]["n_frames"] == 900
+    assert payload["regions"] == []

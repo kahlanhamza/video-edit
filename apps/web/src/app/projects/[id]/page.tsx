@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import ProxyPlayer from "@/components/ProxyPlayer";
 import SubtitleGrid from "@/components/SubtitleGrid";
 import {
@@ -195,6 +196,9 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
   const [ingestStatus, setIngestStatus] = useState<string | null>(null);
   const [runBusy, setRunBusy] = useState(false);
   const [runNote, setRunNote] = useState<string | null>(null);
+  const [stopBusy, setStopBusy] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const router = useRouter();
   const [sources, setSources] = useState<CaseSourceOut[]>([]);
   const [dossier, setDossier] = useState<CaseDossier | null>(null);
   const [sourcesBusy, setSourcesBusy] = useState(false);
@@ -410,6 +414,42 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
                 : latest
                   ? "Run again"
                   : "Run pipeline"}
+          </button>
+          <button
+            className="btn-ghost"
+            onClick={async () => {
+              setStopBusy(true);
+              try {
+                const out = await api.stopProject(id);
+                setRunNote(out.note);
+              } catch (e) {
+                setRunNote(e instanceof Error ? e.message : String(e));
+              } finally {
+                setStopBusy(false);
+              }
+            }}
+            disabled={stopBusy || !latest}
+            title="parks the job at the next stage boundary — completed stages are kept"
+          >
+            {stopBusy ? "Stopping…" : "Stop"}
+          </button>
+          <button
+            className="btn-ghost !text-red-400 hover:!border-red-500"
+            onClick={async () => {
+              if (!window.confirm("Delete this project, all its jobs and all pipeline output? This cannot be undone.")) return;
+              setDeleteBusy(true);
+              try {
+                await api.deleteProject(id);
+                router.push("/");
+              } catch (e) {
+                setError(e instanceof Error ? e.message : String(e));
+                setDeleteBusy(false);
+              }
+            }}
+            disabled={deleteBusy}
+            title="removes every DB row + the pipeline output tree for this project"
+          >
+            {deleteBusy ? "Deleting…" : "Delete project"}
           </button>
           <span className="text-xs text-slate-500">
             scrape sources → download video → transcribe → cut → render → QA — a

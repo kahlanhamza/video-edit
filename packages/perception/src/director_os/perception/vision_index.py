@@ -22,6 +22,7 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from director_os.core.fonts import pick_font
 from director_os.core.qa_probe import probe
@@ -73,14 +74,18 @@ def qa_model() -> str:
 def make_vision_clients(api_key: str) -> tuple[VisionAdapter, VisionAdapter]:
     """(index_adapter, qa_adapter) — lite tier + flagship tier; blank key -> fakes.
 
-    When OPENROUTER creds exist each tier rides a `FailoverVisionClient`:
-    Gemini primary (own model chain via VISION_FALLBACK_MODELS) -> OpenRouter
-    :free models (`google/gemma-4-31b:free` -> `qwen/qwen3.8-27b:free`).
+    VISION_BASE_URL set -> ANY OpenAI-compatible vision endpoint is the
+    PRIMARY tier (models = VISION_MODEL / VISION_INDEX_MODEL, VISION_QA_MODEL),
+    with the OpenRouter :free tier still riding as failover when configured.
+    Blank Base URL -> native Gemini (AI Studio key), the original law.
     """
     if not api_key:
         return VisionAdapter(FakeVisionClient()), VisionAdapter(FakeVisionClient())
     from director_os.core.config import get_settings
-    from director_os.perception.vision import FailoverVisionClient, OpenRouterVisionClient
+    from director_os.perception.vision import (
+        FailoverVisionClient,
+        OpenRouterVisionClient,
+    )
 
     settings = get_settings()
     fallback: OpenRouterVisionClient | None = None
@@ -89,8 +94,21 @@ def make_vision_clients(api_key: str) -> tuple[VisionAdapter, VisionAdapter]:
             settings.openrouter_api_key,
             base_url=settings.openrouter_base_url,
         )
-    index = GeminiVisionClient(api_key, model=index_model())
-    qa = GeminiVisionClient(api_key, model=qa_model())
+    if settings.vision_base_url:
+        # OpenAI-compatible vision endpoint as the primary tier
+        index: Any = OpenRouterVisionClient(
+            api_key,
+            base_url=settings.vision_base_url,
+            models=[index_model()],
+        )
+        qa: Any = OpenRouterVisionClient(
+            api_key,
+            base_url=settings.vision_base_url,
+            models=[qa_model()],
+        )
+    else:
+        index = GeminiVisionClient(api_key, model=index_model())
+        qa = GeminiVisionClient(api_key, model=qa_model())
     if fallback is None:
         return VisionAdapter(index), VisionAdapter(qa)
     return (

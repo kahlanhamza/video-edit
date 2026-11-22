@@ -43,6 +43,7 @@ ALLOWED_CREDENTIAL_KEYS: tuple[str, ...] = (
     "LLM_ALLOW_TRAINING_ON_CONTENT",
     # vision LLM (frame understanding)
     "VISION_API_KEY",
+    "VISION_BASE_URL",
     "VISION_MODEL",
     # ASR
     "GLADIA_API_KEY",

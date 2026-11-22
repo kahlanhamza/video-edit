@@ -185,7 +185,13 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
     const body = await r.json().catch(() => ({}));
     throw new Error(body.detail ?? `${r.status} ${r.statusText}`);
   }
-  return r.json() as Promise<T>;
+  // 204 / empty body (DELETE endpoints) — parsing json on an empty stream
+  // throws "Unexpected end of JSON input" and the caller sees a fake failure
+  if (r.status === 204 || r.headers.get("content-length") === "0") {
+    return undefined as T;
+  }
+  const text = await r.text();
+  return (text ? JSON.parse(text) : undefined) as T;
 }
 
 export const api = {
@@ -216,6 +222,9 @@ export const api = {
     });
   },
   getProject: (id: string) => req<Project>(`/projects/${id}`),
+  stopProject: (id: string) =>
+    req<{ stopped: boolean; note: string }>(`/projects/${id}/stop`, { method: "POST" }),
+  deleteProject: (id: string) => req<undefined>(`/projects/${id}`, { method: "DELETE" }),
   runPipeline: (id: string, videoUrl?: string, customHeaders?: Record<string, string>) =>
     req<RunResult>(`/projects/${id}/run`, {
       method: "POST",

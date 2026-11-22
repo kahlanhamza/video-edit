@@ -129,6 +129,20 @@ class PipelineResult:
     post_fx: Any = None  # PostFxReport receipt when the post-FX pass ran
 
 
+def _stop_flag(deps: PipelineDeps, project_id: str) -> Path:
+    return deps.settings.output_dir / "pipeline" / project_id / "STOP"
+
+
+def _check_stop(deps: PipelineDeps, project_id: str) -> None:
+    """Cooperative stop: the operator's STOP sentinel parks the job at the
+    next stage boundary. The checkpoint law applies — every completed stage
+    stays done; Run (resume) clears the flag and continues from the parked
+    stage. Never mid-encode: an ffmpeg in flight finishes, the NEXT boundary
+    stops."""
+    if _stop_flag(deps, project_id).exists():
+        raise PipelineError("stopped by operator — press Run to resume (completed stages are kept)")
+
+
 def _update_job(
     sessions, job_id: str, stage: JobStage, progress: float, error: str | None = None
 ) -> None:
@@ -2206,6 +2220,7 @@ def run_pipeline(
         asset_id = stage_ingest(source, project_id, deps)
 
         _update_job(deps.sessions, job_id, JobStage.perception, 22.0)
+        _check_stop(deps, project_id)
         transcript = stage_perception(asset_id, source, project_id, deps)
 
         _update_job(deps.sessions, job_id, JobStage.proofread, 26.0)
@@ -2221,6 +2236,7 @@ def run_pipeline(
             stage_vision_enrichment(asset_id, source, deps)
 
         _update_job(deps.sessions, job_id, JobStage.planning, 40.0)
+        _check_stop(deps, project_id)
         timeline, version = stage_planning(
             asset_id, transcript, project_id, deps, force_replan=force_replan
         )
@@ -2249,9 +2265,11 @@ def run_pipeline(
         # and two queued jobs share one sweep via the ranges cache + lock.
         if deps.redact_backend:
             _update_job(deps.sessions, job_id, JobStage.redaction, 44.0)
+            _check_stop(deps, project_id)
             stage_redaction(asset_id, source, project_id, deps, timeline=timeline)
 
         _update_job(deps.sessions, job_id, JobStage.narration, 46.0)
+        _check_stop(deps, project_id)
         narration_audio: dict[str, Path] | None = None
         narration_clips: list[dict] = []
         try:
@@ -2316,6 +2334,7 @@ def run_pipeline(
         enhance_info = None
         if deps.audio_mode == "isolate_2bus":
             _update_job(deps.sessions, job_id, JobStage.audio_prep, 52.0)
+            _check_stop(deps, project_id)
             from director_os.worker.audio_enhance import stage_audio_enhance
 
             kept = kept_windows_from_timeline(timeline, asset_id)
@@ -2331,6 +2350,7 @@ def run_pipeline(
             )
 
         _update_job(deps.sessions, job_id, JobStage.render, 60.0)
+        _check_stop(deps, project_id)
         report, otio_path = stage_render(
             timeline,
             project_id,
@@ -2342,6 +2362,7 @@ def run_pipeline(
         )
 
         _update_job(deps.sessions, job_id, JobStage.subtitles, 85.0)
+        _check_stop(deps, project_id)
         stage_subtitles(timeline, transcript, project_id, deps)
 
         # POST-FX (owner rule): blur + enhance + captions run ONLY now, on the
@@ -2367,6 +2388,7 @@ def run_pipeline(
                 deps.log(f"  [post-fx] FAILED ({e}) — QA audits the un-post-fx'd master")
 
         _update_job(deps.sessions, job_id, JobStage.qa, 90.0)
+        _check_stop(deps, project_id)
         # expected duration = the DAG's frame-quantized total (what ffmpeg truly
         # renders), NOT the raw OTIO sum — unquantized sums accumulate per-segment
         # frame rounding and fail QA on long cuts (live: 4.92 s over 329 segments)
