@@ -6,6 +6,7 @@ Every lane appends one row. Dense, factual, surprises included. Pushed every tas
 
 | Date | Lane | What happened | Outcome | Commits |
 |---|---|---|---|---|
+| 2026-11-22 | v6 caption truth | v5 regression (source-clock captions burned on the master, rejected small-font style) fixed at the root: Gladia ASR + diarization on the SHIPPED master audio, LLM operator supervisor pass (roles audited line-by-line, mixed diarization split at word level, ASR ghosts rule-tagged, corrections word-locked), committed caption_v4 laws applied (owner-window continuous tags, VAD gap-fill, two-lane, DejaVu 40pt approved typography, Officer=white/Suspect=gold/Narrator=cyan). QA 13/13 green incl. narrator-on-b-roll isolation + font legibility. Concat via mpegts+genpts (v5 law) after the mp4 concat timeline collapse was reproduced. Shipped to github.com/kahlanhamza/video-edit release eustis-final-v6 (v5 release deleted) | Eustis final shipped | (this commit) |
 | 2026-11-14 | day 0 | PLAN.md v1.0 ratified — DirectorOS blueprint, M1–M5, 10-stage pipeline | spec-first, zero code | a6d80e5 |
 | 2026-11-14 | M1 scaffold | uv monorepo, docker-compose, CI, Makefile, ADRs | engine skeleton | 6477f97 |
 | 2026-11-14 | M1 core | contracts, OTIO compile, segment cache, render path | M1 engine landed | f07ea47 |

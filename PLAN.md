@@ -1,6 +1,8 @@
 # Project Blueprint: Autonomous Multimodal Video Editing & Documentary Platform ("DirectorOS")
 
 > **Status:** Architecture RFC / Master Implementation Plan (v1.0)  
+> **Session log 2026-11-22:** caption-truth v6 — the v5 regression (SOURCE-clock captions on the 657.7 s master + rejected small-font style) fixed at the root: fresh Gladia ASR + diarization on the shipped master audio itself, an LLM operator supervisor pass (decisions_v6.json: role map Officer/Suspect/Narrator, word-level splits of mixed diarization segments, rule-locked tags, word-locked corrections), and the committed caption_v4 laws (owner-window continuous tags, VAD gap-fill, two-lane placement, DejaVu Sans 40 pt approved typography). QA 13/13 green. `scripts/asr_master_v6.py` + `build_evidence_v6.py` + `caption_v6.py` + `render_final_v6.py` + `qa_v6.py`. Shipped: release `eustis-final-v6`.
+
 > **Session log 2026-11-21:** caption-truth v4 shipped on the real Eustis master
 > (QA 11/11 green: officer/suspect color audit 0 mismatches, no
 > speech-without-caption, hallucination loops replaced by gray `*unaudible*`
