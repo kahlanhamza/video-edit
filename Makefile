@@ -1,4 +1,4 @@
-.PHONY: setup lint type test up down api worker render-fixture demo-1080p clean
+.PHONY: setup lint type test up down logs api worker render-fixture demo-1080p clean
 
 setup:
 	uv sync
@@ -14,10 +14,13 @@ test:
 	uv run pytest
 
 up:
-	docker compose up -d
+	docker compose up -d --build
 
 down:
 	docker compose down
+
+logs:
+	docker compose logs -f
 
 # load the repo .env when present (shell env still wins), so a bare
 # `make api` really is a working Studio - Gladia/LLM keys wire themselves

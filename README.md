@@ -36,32 +36,36 @@ Director Studio (Next.js 16, M3)  →  FastAPI gateway + Celery/Redis orchestrat
 | `apps/web` | M3 — Director Studio UI (stubbed) |
 | `gpu_services` | M4 — Modal serverless GPU endpoints (stubbed) |
 
-## Quickstart
+## Run it on your computer (the easy way)
+
+One prerequisite: [Docker Desktop](https://docs.docker.com/get-docker/)
+(includes compose). Then:
 
 ```bash
-uv sync                      # resolve + install the whole workspace
-make lint type test          # ruff + mypy + pytest (unit + integration)
-cp .env.example .env         # fill in the keys you have (all optional except
-                             # DATABASE_URL when not using docker-compose)
-docker compose up -d         # postgres(pgvector) + redis + minio + api + worker
-uv run director render tests/fixtures/fixture_30s.mp4 --max-seconds 12
+./setup.sh          # Windows: run setup.bat, or use WSL/Git Bash
 ```
 
-### Run the web app locally (Director Studio)
+The script checks Docker, creates `.env` from `.env.example`, asks for the two
+keys below (Enter skips), builds and boots the entire platform, and waits
+until everything is healthy.
 
-```bash
-docker compose up -d         # stack: db + redis + minio + api + worker
-cd apps/web
-npm ci                       # verified clean install (tsc 0 errors, 20/20 tests)
-npm run dev                  # -> http://localhost:3000 (Next dev server)
-```
+| Where | What |
+| --- | --- |
+| **Director Studio** — http://localhost:3000 | the web app: create cases, watch the pipeline live, review the master |
+| API gateway — http://localhost:8000 (`/docs` = Swagger) | pipeline + agent API |
+| MinIO console — http://localhost:9001 | object storage UI (`directoros` / `directoros-secret`) |
 
-The studio talks to the API at `NEXT_PUBLIC_API_BASE` (default
-`http://localhost:8000`; served by the compose `api` service, or run it
-yourself with `make api`). **No broker, no second terminal needed any more:**
-when no Celery broker is reachable, the gateway runs the pipeline itself in
-an inline worker thread (the exact `advance_job` entrypoint the fleet runs),
-so `make api` alone is a working Studio.
+**The only two keys worth pasting** — both free-tier friendly, both optional;
+edit `.env` any time, then `docker compose up -d` to pick them up:
+
+| Key | What it unlocks | Without it |
+| --- | --- | --- |
+| `GLADIA_API_KEY` — [app.gladia.io](https://app.gladia.io) | ASR + diarization: real captions, speaker colors, transcript-driven cuts | pipeline still runs, but skips captions/ASR |
+| `LLM_API_KEY` — [fai.meta.com/developer](https://fai.meta.com/developer) (Meta Model API, default) or [aistudio.google.com](https://aistudio.google.com/apikey) (Gemini) | the AI editor's brain: story map, act plan, narration scripts, caption-tag decisions | deterministic fallback cut — still a real documentary, just not LLM-planned |
+
+Everything else in `.env.example` is optional with sane defaults. The compose
+services override service URLs internally, so the SAME `.env` also drives a
+host-side `make api` — you only ever edit keys, never URLs.
 
 ### The one-button Studio flow
 
@@ -78,6 +82,20 @@ so `make api` alone is a working Studio.
 
 Prove the whole contract in one command: `uv run python scripts/live_api_smoke.py`
 (real HTTP surface: create → run → live Gladia ASR → render → human gate).
+
+### Developer path (no Docker, hot reload)
+
+```bash
+uv sync                      # resolve + install the whole workspace
+make lint type test          # ruff + mypy + pytest (unit + integration)
+docker compose up -d db redis minio   # just the backing services
+make api                     # gateway on :8000, .env wired automatically
+cd apps/web && npm ci && npm run dev  # Studio on :3000 with hot reload
+```
+
+When no Celery broker is reachable, the gateway runs the pipeline itself in
+an inline worker thread (the exact `advance_job` entrypoint the fleet runs),
+so `make api` alone is a working Studio.
 
 ## The hard-won guardrails (PLAN §9) are executable
 

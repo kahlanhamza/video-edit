@@ -1,3 +1,15 @@
+# DirectorOS — the whole platform on one machine.
+#
+#   docker compose up -d --build     (or just run ./setup.sh — recommended)
+#
+# What you get: postgres(pgvector) + redis + minio + api gateway (:8000)
+# + celery worker (ffmpeg fleet) + Director Studio web UI (:3000).
+#
+# Credentials: your .env is loaded into api and worker automatically
+# (GLADIA_API_KEY, LLM_API_KEY, ...). The service-internal URLs below
+# always WIN over .env inside containers, so the SAME .env also works
+# for host-side `make api` — you never touch URLs, only keys.
+
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -42,10 +54,26 @@ services:
       timeout: 3s
       retries: 10
 
+  # One-shot: create the object-storage bucket so the very first render
+  # cannot fail on a missing bucket.
+  minio-init:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 directoros directoros-secret &&
+      mc mb --ignore-existing local/directoros &&
+      echo 'minio bucket ready'"
+
   api:
     build:
       context: .
       dockerfile: apps/api/Dockerfile
+    env_file:
+      - path: .env
+        required: false
     environment:
       DATABASE_URL: postgresql+psycopg://directoros:directoros@db:5432/directoros
       REDIS_URL: redis://redis:6379/0
@@ -54,8 +82,11 @@ services:
       R2_ACCESS_KEY_ID: directoros
       R2_SECRET_ACCESS_KEY: directoros-secret
       R2_BUCKET: directoros
+      OUTPUT_DIR: /app/output
     ports:
       - "8000:8000"
+    volumes:
+      - outputdata:/app/output
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/health').read()"]
@@ -69,6 +100,8 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
 
   worker:
     build:
@@ -77,6 +110,9 @@ services:
     command:
       ["celery", "-A", "director_os.worker.celery_app.celery_app", "worker", "-l", "info"]
     restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
     environment:
       DATABASE_URL: postgresql+psycopg://directoros:directoros@db:5432/directoros
       REDIS_URL: redis://redis:6379/0
@@ -85,6 +121,9 @@ services:
       R2_ACCESS_KEY_ID: directoros
       R2_SECRET_ACCESS_KEY: directoros-secret
       R2_BUCKET: directoros
+      OUTPUT_DIR: /app/output
+    volumes:
+      - outputdata:/app/output
     healthcheck:
       test: ["CMD", "celery", "-A", "director_os.worker.celery_app.celery_app", "inspect", "ping"]
       interval: 15s
@@ -97,15 +136,30 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
 
-  # Director Studio web UI — Milestone 3 (PLAN §8). Built; needs a web Dockerfile to run in compose.
-  # web:
-  #   build:
-  #     context: .
-  #     dockerfile: apps/web/Dockerfile
-  #   ports:
-  #     - "3000:3000"
+  # Director Studio web UI — same stack, same one command. The browser on
+  # your machine talks to the API at http://localhost:8000 (compose maps it).
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE: http://localhost:8000
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      api:
+        condition: service_healthy
 
 volumes:
   pgdata:
   miniodata:
+  outputdata:
