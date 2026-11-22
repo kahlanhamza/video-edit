@@ -1,9 +1,21 @@
 "use client";
 
+// Director Studio — the full-visibility editing workbench.
+//
+// Top bar: project identity + live stage/progress + Run/Stop/Delete.
+// Main grid: proxy player + blur canvas (left), embedded sandbox console (right).
+// Below: the multi-track NLE timeline (video / cards / audio / captions /
+// effects) with manual trim/split, then tabbed inspector panels (subtitles,
+// sources & dossier, director tools, publish, ingest).
+
 import { useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import ProxyPlayer from "@/components/ProxyPlayer";
 import SubtitleGrid from "@/components/SubtitleGrid";
+import RunConsole from "@/components/studio/RunConsole";
+import Timeline from "@/components/studio/Timeline";
+import { useLiveJob } from "@/hooks/useLiveJob";
 import {
   api,
   Asset,
@@ -11,38 +23,10 @@ import {
   CaseSourceOut,
   DispatchResult,
   Job,
+  NleTimeline,
   Project,
   TimelineState,
-  sseUrl,
 } from "@/lib/api";
-
-const TOOLS = [
-  {
-    id: "timeline.trim_clip",
-    args: { item_index: 0, new_start_s: 1.0, new_dur_s: 3.0 },
-    hint: "trim master clip 0",
-  },
-  {
-    id: "timeline.split_clip",
-    args: { item_index: 0, at_local_s: 1.5 },
-    hint: "split master clip 0",
-  },
-  {
-    id: "redaction.add_blur",
-    args: { item_index: 0, bbox: [40, 40, 300, 120], sigma: 24 },
-    hint: "privacy blur on clip 0",
-  },
-  {
-    id: "cards.add",
-    args: {
-      template: "location_intro",
-      title: "CASE FILE",
-      start_s: 0.0,
-      dur_s: 3.0,
-    },
-    hint: "location card at 0s",
-  },
-];
 
 // --- WS4: Case Sources & Dossier ---
 
@@ -58,6 +42,16 @@ const SOURCE_STATUS_CHIP: Record<string, string> = {
   extracting: "bg-amber-500/10 text-amber-300 animate-pulse",
   ready: "bg-emerald-500/10 text-emerald-300",
   failed: "bg-red-500/10 text-red-400",
+};
+
+const STUDIO_TABS = ["subtitles", "sources", "tools", "publish"] as const;
+type StudioTab = (typeof STUDIO_TABS)[number];
+
+const TAB_LABEL: Record<StudioTab, string> = {
+  subtitles: "Subtitles",
+  sources: "Sources & Dossier",
+  tools: "Director tools",
+  publish: "Publish",
 };
 
 function isEmptyDossier(d: CaseDossier): boolean {
@@ -177,13 +171,43 @@ function DossierView({ dossier }: { dossier: CaseDossier }) {
   );
 }
 
+const TOOLS = [
+  {
+    id: "timeline.trim_clip",
+    args: { item_index: 0, new_start_s: 1.0, new_dur_s: 3.0 },
+    hint: "trim master clip 0",
+  },
+  {
+    id: "timeline.split_clip",
+    args: { item_index: 0, at_local_s: 1.5 },
+    hint: "split master clip 0",
+  },
+  {
+    id: "redaction.add_blur",
+    args: { item_index: 0, bbox: [40, 40, 300, 120], sigma: 24 },
+    hint: "privacy blur on clip 0",
+  },
+  {
+    id: "cards.add",
+    args: {
+      template: "location_intro",
+      title: "CASE FILE",
+      start_s: 0.0,
+      dur_s: 3.0,
+    },
+    hint: "location card at 0s",
+  },
+];
+
 export default function ProjectPage({ params }: { params: Promise<{ id: string }> }) {
   const [id, setId] = useState<string | null>(null);
   const [project, setProject] = useState<Project | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [timeline, setTimeline] = useState<TimelineState | null>(null);
   const [assets, setAssets] = useState<Asset[]>([]);
-  const [progress, setProgress] = useState<{ stage: string; pct: number; error: string | null } | null>(null);
+  const [nle, setNle] = useState<NleTimeline | null>(null);
+  const [playheadS, setPlayheadS] = useState(0);
+  const [tab, setTab] = useState<StudioTab>("subtitles");
   const [dispatchLog, setDispatchLog] = useState<DispatchResult[]>([]);
   const [publish, setPublish] = useState<{ video_path: string; title: string; base_description: string }>({
     video_path: "",
@@ -208,7 +232,7 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
   const [addSourceText, setAddSourceText] = useState("");
   const [addSourceLabel, setAddSourceLabel] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const esRef = useRef<EventSource | null>(null);
+  const [editBusy, setEditBusy] = useState(false);
 
   useEffect(() => {
     params.then((p) => setId(p.id));
@@ -227,9 +251,19 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     }
   }, [id]);
 
+  const reloadNle = useCallback(async () => {
+    if (!id) return;
+    try {
+      setNle(await api.nleTimeline(id));
+    } catch {
+      setNle(null); // 404 = no timeline yet
+    }
+  }, [id]);
+
   useEffect(() => {
     refresh();
-  }, [refresh]);
+    reloadNle();
+  }, [refresh, reloadNle]);
 
   // WS4: case sources + dossier — 404 / empty just means "not built yet"
   const loadSources = useCallback(async () => {
@@ -250,26 +284,24 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     loadSources();
   }, [loadSources]);
 
-  // live progress over SSE for the newest job
+  const latestJob = jobs.length ? jobs[jobs.length - 1] : null;
+
+  // live console + timeline revisions over SSE
+  const onTimelineRevision = useCallback(() => {
+    reloadNle();
+    refresh();
+  }, [reloadNle, refresh]);
+  const { state: live } = useLiveJob(id, latestJob?.id ?? null, onTimelineRevision);
+
+  // when a run finishes, pull the final state (thumbnails, versions, NLE)
+  const prevDoneRef = useRef(false);
   useEffect(() => {
-    if (!id || jobs.length === 0) return;
-    const latest = jobs[jobs.length - 1];
-    esRef.current?.close();
-    const es = new EventSource(sseUrl(id, latest.id));
-    es.addEventListener("progress", (ev) => {
-      const d = JSON.parse((ev as MessageEvent).data);
-      setProgress({ stage: d.stage, pct: d.progress_pct, error: d.error });
-    });
-    es.addEventListener("done", (ev) => {
-      const d = JSON.parse((ev as MessageEvent).data);
-      setProgress({ stage: d.stage, pct: d.progress_pct, error: d.error });
-      es.close();
+    if (live.done && !prevDoneRef.current) {
       refresh();
-    });
-    es.onerror = () => es.close();
-    esRef.current = es;
-    return () => es.close();
-  }, [id, jobs, refresh]);
+      reloadNle();
+    }
+    prevDoneRef.current = live.done;
+  }, [live.done, refresh, reloadNle]);
 
   async function runOrResume() {
     setRunBusy(true);
@@ -296,7 +328,7 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     try {
       const r = await api.ingestUrl(id!, ingestUrl.trim());
       setIngestStatus(
-        `${r.detail} — job ${r.job_id.slice(0, 8)}… watching progress below`,
+        `${r.detail} — job ${r.job_id.slice(0, 8)}… watching the console`,
       );
       setIngestUrl("");
       await refresh();
@@ -307,13 +339,19 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     }
   }
 
-  async function dispatch(tool: string, args: Record<string, unknown>) {
+  async function dispatchTool(
+    tool: string,
+    args: Record<string, unknown>,
+  ): Promise<DispatchResult | null> {
     try {
-      const result = await api.dispatchTool(id!, tool, args, "studio dispatch");
+      const result = await api.dispatchTool(id!, tool, args, "studio manual edit");
       setDispatchLog((log) => [result, ...log].slice(0, 10));
+      await reloadNle();
       await refresh();
+      return result;
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      return null;
     }
   }
 
@@ -370,347 +408,438 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     }
   }
 
+  // --- timeline manual edits ---
+  async function handleTrim(itemIndex: number, newStartS: number, newDurS: number) {
+    setEditBusy(true);
+    await dispatchTool("timeline.trim_clip", {
+      item_index: itemIndex,
+      new_start_s: newStartS,
+      new_dur_s: newDurS,
+    });
+    setEditBusy(false);
+  }
+
+  async function handleSplitAtPlayhead(t: number) {
+    if (!nle) return;
+    // the master clip under the playhead (video lane, timeline-local seconds)
+    const clip = nle.clips.find(
+      (c) => c.track === "V1_master" && t >= c.start_s && t < c.end_s,
+    );
+    if (!clip || clip.master_index == null) {
+      setError(`no master clip under ${t.toFixed(2)}s to split`);
+      return;
+    }
+    setEditBusy(true);
+    await dispatchTool("timeline.split_clip", {
+      item_index: clip.master_index,
+      at_local_s: Number((t - clip.start_s).toFixed(3)),
+    });
+    setEditBusy(false);
+  }
+
+  async function handleDeleteEffect(effectId: string) {
+    if (!id) return;
+    setEditBusy(true);
+    try {
+      await api.deleteRedaction(id, effectId);
+      await reloadNle();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setEditBusy(false);
+    }
+  }
+
   if (!id) return <p className="text-slate-500">Loading…</p>;
 
-  const latest = jobs[jobs.length - 1];
-  const pct = progress?.pct ?? latest?.progress_pct ?? 0;
+  const pct = live.job?.progress_pct ?? latestJob?.progress_pct ?? 0;
+  const stage = live.job?.stage ?? latestJob?.stage ?? "idle";
+  const jobError = live.job?.error ?? latestJob?.error ?? null;
   const playable = assets.find((a) => a.has_proxy);
 
   return (
-    <div className="space-y-6">
-      <section className="card">
-        <div className="flex items-center justify-between">
-          <h1 className="text-lg font-bold">{project?.title ?? id}</h1>
-          <span className="rounded bg-slate-800 px-2 py-0.5 text-xs uppercase text-slate-300">
+    <div className="space-y-4">
+      {/* ---------------- top bar: identity + live status + operator controls ---------------- */}
+      <section className="card sticky top-0 z-20 !py-3 backdrop-blur">
+        <div className="flex flex-wrap items-center gap-3">
+          <Link
+            href="/"
+            className="btn-ghost !border-slate-700 !px-2 !py-1 text-xs"
+            title="back to all cases"
+          >
+            ←
+          </Link>
+          <div className="min-w-0">
+            <h1 className="truncate text-base font-bold">{project?.title ?? id}</h1>
+            <p className="text-[10px] uppercase tracking-wide text-slate-500">
+              {project?.niche_skill} · latest job {latestJob ? `${latestJob.id.slice(0, 8)}…` : "none"}
+            </p>
+          </div>
+          <span
+            className={`rounded px-2 py-0.5 text-xs uppercase ${
+              jobError
+                ? "bg-red-500/15 text-red-300"
+                : live.done
+                  ? "bg-emerald-500/15 text-emerald-300"
+                  : "bg-slate-800 text-slate-300"
+            }`}
+          >
             {project?.status ?? "…"}
           </span>
-        </div>
-        {error && <p className="mt-2 text-sm text-red-400">{error}</p>}
-        {latest && (
-          <div className="mt-3">
-            <div className="flex justify-between text-xs text-slate-400">
+
+          {/* live stage + overall progress */}
+          <div className="min-w-[180px] flex-1">
+            <div className="flex justify-between text-[10px] text-slate-400">
               <span>
-                job {latest.id.slice(0, 8)}… · stage {progress?.stage ?? latest.stage}
+                stage <span className="font-semibold text-slate-200">{stage}</span>
               </span>
-              <span>{pct.toFixed(0)}%</span>
+              <span className="tabular-nums">{pct.toFixed(0)}%</span>
             </div>
-            <div className="mt-1 h-2 w-full rounded bg-slate-800">
+            <div className="mt-1 h-1.5 w-full rounded bg-slate-800">
               <div
-                className={`h-2 rounded ${latest.error ? "bg-red-500" : "bg-amber-500"}`}
+                className={`h-1.5 rounded transition-all duration-300 ${
+                  jobError ? "bg-red-500" : "bg-amber-400"
+                }`}
                 style={{ width: `${Math.min(100, pct)}%` }}
               />
             </div>
-            {(progress?.error ?? latest.error) && (
-              <p className="mt-1 text-xs text-red-400">{progress?.error ?? latest.error}</p>
-            )}
           </div>
-        )}
-        <div className="mt-3 flex flex-wrap items-center gap-3">
-          <button className="btn" onClick={runOrResume} disabled={runBusy}>
-            {runBusy
-              ? "Starting…"
-              : latest && (progress?.error ?? latest.error)
-                ? "Resume pipeline"
-                : latest
-                  ? "Run again"
-                  : "Run pipeline"}
-          </button>
-          <button
-            className="btn-ghost"
-            onClick={async () => {
-              setStopBusy(true);
-              try {
-                const out = await api.stopProject(id);
-                setRunNote(out.note);
-              } catch (e) {
-                setRunNote(e instanceof Error ? e.message : String(e));
-              } finally {
-                setStopBusy(false);
-              }
-            }}
-            disabled={stopBusy || !latest}
-            title="parks the job at the next stage boundary — completed stages are kept"
-          >
-            {stopBusy ? "Stopping…" : "Stop"}
-          </button>
-          <button
-            className="btn-ghost !text-red-400 hover:!border-red-500"
-            onClick={async () => {
-              if (!window.confirm("Delete this project, all its jobs and all pipeline output? This cannot be undone.")) return;
-              setDeleteBusy(true);
-              try {
-                await api.deleteProject(id);
-                router.push("/");
-              } catch (e) {
-                setError(e instanceof Error ? e.message : String(e));
-                setDeleteBusy(false);
-              }
-            }}
-            disabled={deleteBusy}
-            title="removes every DB row + the pipeline output tree for this project"
-          >
-            {deleteBusy ? "Deleting…" : "Delete project"}
-          </button>
-          <span className="text-xs text-slate-500">
-            scrape sources → download video → transcribe → cut → render → QA — a
-            failed step continues where it stopped
-          </span>
-        </div>
-        {runNote && <p className="mt-2 text-xs text-slate-300">{runNote}</p>}
-      </section>
 
-      <section className="card">
-        <h2 className="font-semibold">Paste media URL</h2>
-        <p className="mt-1 text-xs text-slate-500">
-          FOIA portal / CDN link — the gateway downloads it (UA-aware), registers
-          a queued job and the fleet advances ingest → perception → render. No
-          terminal involved.
-        </p>
-        <div className="mt-3 flex gap-2">
-          <input
-            className="input"
-            placeholder="https://portal.example/case/bodycam.mp4"
-            value={ingestUrl}
-            onChange={(e) => setIngestUrl(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && doIngest()}
-          />
-          <button className="btn" onClick={doIngest} disabled={ingestBusy || !ingestUrl.trim()}>
-            {ingestBusy ? "Ingesting…" : "Ingest"}
-          </button>
-        </div>
-        {ingestStatus && <p className="mt-2 text-sm text-slate-300">{ingestStatus}</p>}
-      </section>
-
-      <section className="card">
-        <h2 className="font-semibold">Proxy scrub + blur canvas</h2>
-        {playable ? (
-          <div className="mt-3">
-            <ProxyPlayer projectId={id} asset={playable} onChanged={refresh} />
+          <div className="flex items-center gap-2">
+            <button className="btn" onClick={runOrResume} disabled={runBusy}>
+              {runBusy
+                ? "Starting…"
+                : jobError
+                  ? "Resume pipeline"
+                  : latestJob
+                    ? "Run again"
+                    : "Run pipeline"}
+            </button>
+            <button
+              className="btn-ghost"
+              onClick={async () => {
+                setStopBusy(true);
+                try {
+                  const out = await api.stopProject(id);
+                  setRunNote(out.note);
+                } catch (e) {
+                  setRunNote(e instanceof Error ? e.message : String(e));
+                } finally {
+                  setStopBusy(false);
+                }
+              }}
+              disabled={stopBusy || !latestJob}
+              title="parks the job at the next stage boundary — completed stages are kept"
+            >
+              {stopBusy ? "Stopping…" : "Stop"}
+            </button>
+            <button
+              className="btn-ghost !text-red-400 hover:!border-red-500"
+              onClick={async () => {
+                if (
+                  !window.confirm(
+                    "Delete this project, all its jobs and all pipeline output? This cannot be undone.",
+                  )
+                )
+                  return;
+                setDeleteBusy(true);
+                try {
+                  await api.deleteProject(id);
+                  router.push("/");
+                } catch (e) {
+                  setError(e instanceof Error ? e.message : String(e));
+                  setDeleteBusy(false);
+                }
+              }}
+              disabled={deleteBusy}
+              title="removes every DB row + the pipeline output tree for this project"
+            >
+              {deleteBusy ? "Deleting…" : "Delete"}
+            </button>
+            <Link href="/settings" className="btn-ghost text-xs" title="credentials vault">
+              ⚙
+            </Link>
           </div>
-        ) : (
-          <p className="mt-2 text-sm text-slate-500">
-            no 480p proxy yet — ingest builds one automatically (480p + scrubsheet + 64k audio)
+        </div>
+        {(runNote || jobError) && (
+          <p className={`mt-2 text-xs ${jobError ? "text-red-400" : "text-slate-300"}`}>
+            {jobError ?? runNote}
           </p>
         )}
+        {error && !runNote && !jobError && (
+          <p className="mt-2 text-xs text-red-400">{error}</p>
+        )}
       </section>
 
-      <section className="card">
-        <div className="flex items-center justify-between gap-2">
-          <div>
-            <h2 className="font-semibold">Case Sources &amp; Dossier</h2>
-            <p className="mt-0.5 text-xs text-slate-500">
-              every source feeding this case — the dossier is re-planned from them
-              on refresh
-            </p>
-          </div>
-          <button
-            className="btn-ghost"
-            onClick={refreshAndReplan}
-            disabled={sourcesBusy}
-          >
-            {sourcesBusy ? "Refreshing…" : "Refresh & re-plan"}
-          </button>
-        </div>
-
-        <div className="mt-3 grid gap-4 lg:grid-cols-2">
-          <div>
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-              Sources ({sources.length})
-            </h3>
-            <ul className="mt-2 space-y-1">
-              {sources.map((s) => (
-                <li key={s.id} className="flex items-center gap-2 text-sm">
-                  <span
-                    className={`rounded px-2 py-0.5 text-xs uppercase tracking-wide ${
-                      SOURCE_KIND_BADGE[s.kind] ?? "bg-slate-800 text-slate-400"
-                    }`}
-                  >
-                    {s.kind}
-                  </span>
-                  <span
-                    className="min-w-0 flex-1 truncate text-slate-300"
-                    title={s.label}
-                  >
-                    {s.label || `${s.id.slice(0, 8)}…`}
-                  </span>
-                  <span
-                    className={`rounded px-2 py-0.5 text-xs uppercase tracking-wide ${
-                      SOURCE_STATUS_CHIP[s.status] ?? "bg-slate-800 text-slate-400"
-                    }`}
-                    title={s.status === "failed" && s.error ? s.error : undefined}
-                  >
-                    {s.status}
-                  </span>
-                </li>
-              ))}
-              {sources.length === 0 && (
-                <li className="text-sm text-slate-500">
-                  no sources yet — attach one below (a link, pasted notes or a
-                  file), or create a case with video URLs (auto-discover on)
-                </li>
-              )}
-            </ul>
-            {refreshNote && (
-              <p className="mt-2 text-xs text-emerald-400">{refreshNote}</p>
+      {/* ---------------- main grid: player + live console ---------------- */}
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_380px]">
+        <section className="card min-w-0">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-semibold">Proxy scrub + blur canvas</h2>
+            {nle?.asset && (
+              <span className="text-[10px] text-slate-500">
+                source {nle.asset.width}x{nle.asset.height} @ {nle.asset.fps.toFixed(2)}fps ·{" "}
+                {nle.asset.duration_s.toFixed(1)}s
+              </span>
             )}
-            <div className="mt-3 space-y-2 border-t border-slate-800 pt-3">
-              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                + attach more sources to this case
-              </p>
-              <div className="flex gap-2">
-                <select
-                  className="input w-28"
-                  value={addSourceKind}
-                  onChange={(e) => setAddSourceKind(e.target.value as "url" | "text")}
-                >
-                  <option value="url">URL</option>
-                  <option value="text">Notes</option>
-                </select>
-                <input
-                  className="input"
-                  placeholder={
-                    addSourceKind === "url"
-                      ? "https://court.example/case-doc (news, court page, direct .pdf)"
-                      : "label (e.g. sentencing update)"
-                  }
-                  value={addSourceKind === "url" ? addSourceUrl : addSourceLabel}
-                  onChange={(e) =>
-                    addSourceKind === "url"
-                      ? setAddSourceUrl(e.target.value)
-                      : setAddSourceLabel(e.target.value)
-                  }
-                />
-              </div>
-              {addSourceKind === "text" && (
-                <textarea
-                  className="input"
-                  rows={2}
-                  placeholder="paste notes — FOIA updates, sentencing, corrections"
-                  value={addSourceText}
-                  onChange={(e) => setAddSourceText(e.target.value)}
-                />
-              )}
-              <button
-                className="btn-ghost"
-                onClick={addSourceLater}
-                disabled={
-                  sourcesBusy ||
-                  (addSourceKind === "url" ? !addSourceUrl.trim() : !addSourceText.trim())
-                }
-              >
-                Attach source
-              </button>
+          </div>
+          {playable ? (
+            <div className="mt-3">
+              <ProxyPlayer
+                projectId={id}
+                asset={playable}
+                onChanged={() => {
+                  reloadNle();
+                }}
+                onTimeUpdate={setPlayheadS}
+              />
             </div>
-          </div>
+          ) : (
+            <p className="mt-2 text-sm text-slate-500">
+              no 480p proxy yet — ingest builds one automatically (480p + scrubsheet + 64k audio)
+            </p>
+          )}
+        </section>
 
-          <div>
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-              CaseDossier
-            </h3>
-            {dossier && !isEmptyDossier(dossier) ? (
-              <DossierView dossier={dossier} />
-            ) : (
-              <p className="mt-2 text-sm text-slate-500">
-                No dossier yet — add sources and refresh.
-              </p>
-            )}
-          </div>
-        </div>
-      </section>
+        <section className="card flex min-h-[420px] flex-col !p-0 xl:h-[520px]">
+          <RunConsole live={live} />
+        </section>
+      </div>
 
+      {/* ---------------- full-width live NLE timeline ---------------- */}
       <section className="card">
-        <h2 className="font-semibold">Subtitle grid</h2>
-        <div className="mt-3">
-          <SubtitleGrid projectId={id} />
-        </div>
-      </section>
-
-      <section className="card">
-        <h2 className="font-semibold">Timeline versions</h2>
+        <Timeline
+          nle={nle}
+          playheadS={playheadS}
+          onSeek={setPlayheadS}
+          onTrimClip={handleTrim}
+          onSplitAtPlayhead={handleSplitAtPlayhead}
+          onDeleteEffect={handleDeleteEffect}
+        />
+        {editBusy && <p className="mt-1 text-xs text-amber-300">dispatching edit…</p>}
         <p className="mt-1 text-xs text-slate-500">
-          active: {timeline?.active_version ?? "—"} · every mutation is a durable
+          active checkpoint: v{timeline?.active_version ?? "—"} · every mutation is a durable
           checkpoint; failed dispatches roll back automatically
         </p>
-        <ul className="mt-2 space-y-1">
-          {timeline?.versions.map((v) => (
-            <li
-              key={v.version_num}
-              className={`flex justify-between rounded px-2 py-1 text-sm ${
-                v.version_num === timeline.active_version
-                  ? "bg-amber-500/10 text-amber-300"
-                  : "text-slate-300"
-              }`}
-            >
-              <span>
-                v{v.version_num} · {v.created_by}
-              </span>
-              <span className="truncate text-xs text-slate-500">{v.checkpoint_note}</span>
-            </li>
-          ))}
-          {timeline?.versions.length === 0 && (
-            <li className="text-sm text-slate-500">no checkpoints yet</li>
-          )}
-        </ul>
       </section>
 
+      {/* ---------------- tabbed inspector ---------------- */}
       <section className="card">
-        <h2 className="font-semibold">Director tools (checkpoint-first)</h2>
-        <div className="mt-2 flex flex-wrap gap-2">
-          {TOOLS.map((t) => (
+        <div className="flex flex-wrap gap-1 border-b border-slate-800 pb-2">
+          {STUDIO_TABS.map((t) => (
             <button
-              key={t.id}
-              className="btn-ghost"
-              onClick={() => dispatch(t.id, t.args)}
-              title={t.id}
+              key={t}
+              className={`rounded px-3 py-1 text-sm ${
+                tab === t
+                  ? "bg-amber-500/15 font-semibold text-amber-300"
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+              onClick={() => setTab(t)}
             >
-              {t.hint}
+              {TAB_LABEL[t]}
             </button>
           ))}
         </div>
-        {dispatchLog.length > 0 && (
-          <ul className="mt-3 space-y-1 text-xs">
-            {dispatchLog.map((d, i) => (
-              <li
-                key={i}
-                className={d.ok ? "text-emerald-400" : "text-red-400"}
-              >
-                {d.tool} → {d.ok ? `v${d.version}` : `ROLLED BACK to v${d.rolled_back_to}`} · {d.detail}
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
 
-      <section className="card">
-        <h2 className="font-semibold">Human Review Gate — YouTube private draft</h2>
-        <div className="mt-2 grid gap-2">
-          <input
-            className="input"
-            placeholder="master path (e.g. output/pipeline/<id>/final.mp4)"
-            value={publish.video_path}
-            onChange={(e) => setPublish({ ...publish, video_path: e.target.value })}
-          />
-          <input
-            className="input"
-            placeholder="draft title"
-            value={publish.title}
-            onChange={(e) => setPublish({ ...publish, title: e.target.value })}
-          />
-          <textarea
-            className="input"
-            rows={2}
-            placeholder="description"
-            value={publish.base_description}
-            onChange={(e) => setPublish({ ...publish, base_description: e.target.value })}
-          />
-          <button
-            className="btn w-fit"
-            onClick={doPublish}
-            disabled={!publish.video_path || !publish.title}
-          >
-            Publish private draft
-          </button>
-          {publishResult && <p className="text-sm text-slate-300">{publishResult}</p>}
+        <div className="pt-3">
+          {tab === "subtitles" && <SubtitleGrid projectId={id} />}
+
+          {tab === "sources" && (
+            <div>
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs text-slate-500">
+                  every source feeding this case — the dossier is re-planned from them on refresh
+                </p>
+                <button className="btn-ghost" onClick={refreshAndReplan} disabled={sourcesBusy}>
+                  {sourcesBusy ? "Refreshing…" : "Refresh & re-plan"}
+                </button>
+              </div>
+
+              <div className="mt-3 grid gap-4 lg:grid-cols-2">
+                <div>
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    Sources ({sources.length})
+                  </h3>
+                  <ul className="mt-2 space-y-1">
+                    {sources.map((s) => (
+                      <li key={s.id} className="flex items-center gap-2 text-sm">
+                        <span
+                          className={`rounded px-2 py-0.5 text-xs uppercase tracking-wide ${
+                            SOURCE_KIND_BADGE[s.kind] ?? "bg-slate-800 text-slate-400"
+                          }`}
+                        >
+                          {s.kind}
+                        </span>
+                        <span className="min-w-0 flex-1 truncate text-slate-300" title={s.label}>
+                          {s.label || `${s.id.slice(0, 8)}…`}
+                        </span>
+                        <span
+                          className={`rounded px-2 py-0.5 text-xs uppercase tracking-wide ${
+                            SOURCE_STATUS_CHIP[s.status] ?? "bg-slate-800 text-slate-400"
+                          }`}
+                          title={s.status === "failed" && s.error ? s.error : undefined}
+                        >
+                          {s.status}
+                        </span>
+                      </li>
+                    ))}
+                    {sources.length === 0 && (
+                      <li className="text-sm text-slate-500">
+                        no sources yet — attach one below, or create a case with video URLs
+                      </li>
+                    )}
+                  </ul>
+                  {refreshNote && <p className="mt-2 text-xs text-emerald-400">{refreshNote}</p>}
+                  <div className="mt-3 space-y-2 border-t border-slate-800 pt-3">
+                    <div className="flex gap-2">
+                      <select
+                        className="input w-28"
+                        value={addSourceKind}
+                        onChange={(e) => setAddSourceKind(e.target.value as "url" | "text")}
+                      >
+                        <option value="url">URL</option>
+                        <option value="text">Notes</option>
+                      </select>
+                      <input
+                        className="input"
+                        placeholder={
+                          addSourceKind === "url"
+                            ? "https://court.example/case-doc (news, court page, direct .pdf)"
+                            : "label (e.g. sentencing update)"
+                        }
+                        value={addSourceKind === "url" ? addSourceUrl : addSourceLabel}
+                        onChange={(e) =>
+                          addSourceKind === "url"
+                            ? setAddSourceUrl(e.target.value)
+                            : setAddSourceLabel(e.target.value)
+                        }
+                      />
+                    </div>
+                    {addSourceKind === "text" && (
+                      <textarea
+                        className="input"
+                        rows={2}
+                        placeholder="paste notes — FOIA updates, sentencing, corrections"
+                        value={addSourceText}
+                        onChange={(e) => setAddSourceText(e.target.value)}
+                      />
+                    )}
+                    <button
+                      className="btn-ghost"
+                      onClick={addSourceLater}
+                      disabled={
+                        sourcesBusy ||
+                        (addSourceKind === "url" ? !addSourceUrl.trim() : !addSourceText.trim())
+                      }
+                    >
+                      Attach source
+                    </button>
+                  </div>
+                </div>
+
+                <div>
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    CaseDossier
+                  </h3>
+                  {dossier && !isEmptyDossier(dossier) ? (
+                    <DossierView dossier={dossier} />
+                  ) : (
+                    <p className="mt-2 text-sm text-slate-500">
+                      No dossier yet — add sources and refresh.
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              <div className="mt-4 border-t border-slate-800 pt-3">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                  Paste media URL
+                </h3>
+                <p className="mt-1 text-xs text-slate-500">
+                  FOIA portal / CDN link — the gateway downloads it (UA-aware) and the fleet
+                  advances ingest → perception → render. Watch the live console.
+                </p>
+                <div className="mt-2 flex gap-2">
+                  <input
+                    className="input"
+                    placeholder="https://portal.example/case/bodycam.mp4"
+                    value={ingestUrl}
+                    onChange={(e) => setIngestUrl(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && doIngest()}
+                  />
+                  <button className="btn" onClick={doIngest} disabled={ingestBusy || !ingestUrl.trim()}>
+                    {ingestBusy ? "Ingesting…" : "Ingest"}
+                  </button>
+                </div>
+                {ingestStatus && <p className="mt-2 text-sm text-slate-300">{ingestStatus}</p>}
+              </div>
+            </div>
+          )}
+
+          {tab === "tools" && (
+            <div>
+              <p className="text-xs text-slate-500">
+                checkpoint-first director tools — same engine the LLM director uses
+              </p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                {TOOLS.map((t) => (
+                  <button
+                    key={t.id}
+                    className="btn-ghost"
+                    onClick={() => dispatchTool(t.id, t.args)}
+                    title={t.id}
+                  >
+                    {t.hint}
+                  </button>
+                ))}
+              </div>
+              {dispatchLog.length > 0 && (
+                <ul className="mt-3 space-y-1 text-xs">
+                  {dispatchLog.map((d, i) => (
+                    <li key={i} className={d.ok ? "text-emerald-400" : "text-red-400"}>
+                      {d.tool} →{" "}
+                      {d.ok ? `v${d.version}` : `ROLLED BACK to v${d.rolled_back_to}`} · {d.detail}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+
+          {tab === "publish" && (
+            <div className="grid gap-2 md:max-w-xl">
+              <p className="text-xs text-slate-500">
+                Human Review Gate — approve the cut as a YouTube Private Draft
+              </p>
+              <input
+                className="input"
+                placeholder="master path (e.g. output/pipeline/<id>/final.mp4)"
+                value={publish.video_path}
+                onChange={(e) => setPublish({ ...publish, video_path: e.target.value })}
+              />
+              <input
+                className="input"
+                placeholder="draft title"
+                value={publish.title}
+                onChange={(e) => setPublish({ ...publish, title: e.target.value })}
+              />
+              <textarea
+                className="input"
+                rows={2}
+                placeholder="description"
+                value={publish.base_description}
+                onChange={(e) => setPublish({ ...publish, base_description: e.target.value })}
+              />
+              <button
+                className="btn w-fit"
+                onClick={doPublish}
+                disabled={!publish.video_path || !publish.title}
+              >
+                Publish private draft
+              </button>
+              {publishResult && <p className="text-sm text-slate-300">{publishResult}</p>}
+            </div>
+          )}
         </div>
       </section>
     </div>

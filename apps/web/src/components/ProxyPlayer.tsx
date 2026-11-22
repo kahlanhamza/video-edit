@@ -20,10 +20,13 @@ export default function ProxyPlayer({
   projectId,
   asset,
   onChanged,
+  onTimeUpdate,
 }: {
   projectId: string;
   asset: Asset;
   onChanged: () => void;
+  /** live playhead seconds — the studio timeline follows the video */
+  onTimeUpdate?: (t: number) => void;
 }) {
   const [regions, setRegions] = useState<Redaction[]>([]);
   const [draft, setDraft] = useState<Draft | null>(null);
@@ -36,6 +39,16 @@ export default function ProxyPlayer({
   // Studio NLE shortcuts (issue #19): Space/J/K/L/I/O/←/→/S/Ctrl+Z.
   // Disabled while a blur box is being drawn — the mouse owns the surface then.
   const { state: nle } = useNLEShortcuts({ videoRef, enabled: !drawMode });
+
+  // playhead feed for the studio timeline — a no-op when no consumer passed
+  const onTimeUpdateRef = useRef(onTimeUpdate);
+  onTimeUpdateRef.current = onTimeUpdate;
+  const handleTimeUpdate = useCallback(
+    (ev: React.SyntheticEvent<HTMLVideoElement>) => {
+      onTimeUpdateRef.current?.(ev.currentTarget.currentTime);
+    },
+    [],
+  );
 
   const reload = useCallback(async () => {
     try {
@@ -121,6 +134,7 @@ export default function ProxyPlayer({
           controls
           className="w-full"
           preload="metadata"
+          onTimeUpdate={handleTimeUpdate}
         />
         {nle.inS !== null && (
           <span

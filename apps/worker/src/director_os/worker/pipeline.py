@@ -64,6 +64,7 @@ from director_os.otio_engine.timeline import (
     save_otio,
     to_json_dict,
 )
+from director_os.worker.progress import RunTracker
 from sqlalchemy import select
 
 AUTO_CUT_MAX_SEGMENT_S = 8.0
@@ -111,6 +112,9 @@ class PipelineDeps:
     # caption burn run ONLY on the assembled deliverable, never the raw source
     post_fx: bool = False
     log: Callable[[str], None] = lambda _msg: None
+    # --- live observability (Studio full-visibility mandate): one RunTracker
+    # per run streams steps/logs/timeline revisions into job_* rows for SSE
+    tracker: RunTracker | None = None
 
 
 @dataclass
@@ -1440,6 +1444,8 @@ def _persist_timeline_version(
         project.active_otio_version_id = version
         _set_status(s, project_id, ProjectStatus.planned)
         s.commit()
+    if deps.tracker is not None:
+        deps.tracker.timeline(version, note)  # the Studio NLE refetches on this
     return version
 
 
@@ -2215,31 +2221,48 @@ def run_pipeline(
 
     deps.log(f"[pipeline] project={project_id} job={job_id}")
 
+    # Live observability: one tracker per run — every stage becomes a step with
+    # its own progress bar, every deps.log line streams to the sandbox console.
+    tracker = deps.tracker or RunTracker(deps.sessions, job_id, project_id)
+    deps.tracker = tracker
+    if deps.log is not tracker.log:
+        deps.log = tracker.log
+
     try:
-        _update_job(deps.sessions, job_id, JobStage.ingest, 5.0)
-        asset_id = stage_ingest(source, project_id, deps)
+        tracker.stage(JobStage.ingest.value, 5.0)
+        with tracker.step("ingest", "Ingest source — probe + 480p proxy bundle") as st:
+            st.pct(15, "probing source")
+            asset_id = stage_ingest(source, project_id, deps)
+            st.pct(92, "proxy bundle ready")
 
-        _update_job(deps.sessions, job_id, JobStage.perception, 22.0)
+        tracker.stage(JobStage.perception.value, 22.0)
         _check_stop(deps, project_id)
-        transcript = stage_perception(asset_id, source, project_id, deps)
+        with tracker.step("perception", "Transcribe audio (ASR)") as st:
+            st.pct(20, "audio in flight")
+            transcript = stage_perception(asset_id, source, project_id, deps)
+            st.pct(90, "transcript persisted")
 
-        _update_job(deps.sessions, job_id, JobStage.proofread, 26.0)
-        try:
-            proof = stage_proofread(asset_id, transcript, project_id, deps)
-            transcript = {**transcript, "proofread": proof}
-        except PipelineError:
-            raise
-        except Exception as e:  # noqa: BLE001 — captions survive on raw words
-            deps.log(f"  [proofread] skipped ({e}) — subtitles fall back to raw ASR")
+        tracker.stage(JobStage.proofread.value, 26.0)
+        with tracker.step("proofread", "Proofread captions — jargon + Officer/Suspect roles") as st:
+            try:
+                proof = stage_proofread(asset_id, transcript, project_id, deps)
+                transcript = {**transcript, "proofread": proof}
+            except PipelineError:
+                raise
+            except Exception as e:  # noqa: BLE001 — captions survive on raw words
+                st.skip(f"skipped ({e}) — subtitles fall back to raw ASR")
+                deps.log(f"  [proofread] skipped ({e}) — subtitles fall back to raw ASR")
 
         if deps.vision_enrich:
-            stage_vision_enrichment(asset_id, source, deps)
+            with tracker.step("vision", "Vision index — frames + VLM timeline + OCR"):
+                stage_vision_enrichment(asset_id, source, deps)
 
-        _update_job(deps.sessions, job_id, JobStage.planning, 40.0)
+        tracker.stage(JobStage.planning.value, 40.0)
         _check_stop(deps, project_id)
-        timeline, version = stage_planning(
-            asset_id, transcript, project_id, deps, force_replan=force_replan
-        )
+        with tracker.step("planning", "LLM Director — cut the story"):
+            timeline, version = stage_planning(
+                asset_id, transcript, project_id, deps, force_replan=force_replan
+            )
 
         # Stage 6.5 — the legacy Director autodrive re-cuts the v1 timeline
         # when enabled. The M5 story-map session already owns >= 15 min
@@ -2249,34 +2272,39 @@ def run_pipeline(
             _asset = s.get(MediaAssetRow, asset_id)
             documentary_planned = bool(_asset and _asset.duration_s >= DOCUMENTARY_MIN_SOURCE_S)
         if deps.llm_direct and not documentary_planned:
-            _update_job(deps.sessions, job_id, JobStage.planning, 42.0)
+            tracker.stage(JobStage.planning.value, 42.0)
             from director_os.worker.director import stage_director
 
-            try:
-                timeline, version, _director_report = stage_director(
-                    timeline, asset_id, transcript, project_id, deps
-                )
-            except Exception as e:  # noqa: BLE001 — the LLM is a director, not a dependency
-                deps.log(f"  [director] stage failed ({e}) — deterministic v1 cut rides on")
+            with tracker.step("director", "Director autodrive re-cut") as st:
+                try:
+                    timeline, version, _director_report = stage_director(
+                        timeline, asset_id, transcript, project_id, deps
+                    )
+                except Exception as e:  # noqa: BLE001 — the LLM is a director, not a dependency
+                    st.skip(f"failed ({e}) — deterministic v1 cut rides on")
+                    deps.log(f"  [director] stage failed ({e}) — deterministic v1 cut rides on")
 
         # Stage 6.7 — redaction AFTER the plan (post-plan scoping law, the
         # operator mandate): detection pays only for footage the edit kept.
         # A 43-min source keeping 8 min sweeps 8 min — not 77k raw frames —
         # and two queued jobs share one sweep via the ranges cache + lock.
         if deps.redact_backend:
-            _update_job(deps.sessions, job_id, JobStage.redaction, 44.0)
+            tracker.stage(JobStage.redaction.value, 44.0)
             _check_stop(deps, project_id)
-            stage_redaction(asset_id, source, project_id, deps, timeline=timeline)
+            with tracker.step("redaction", "Privacy redaction sweep — kept windows only"):
+                stage_redaction(asset_id, source, project_id, deps, timeline=timeline)
 
-        _update_job(deps.sessions, job_id, JobStage.narration, 46.0)
+        tracker.stage(JobStage.narration.value, 46.0)
         _check_stop(deps, project_id)
         narration_audio: dict[str, Path] | None = None
         narration_clips: list[dict] = []
-        try:
-            narration_clips = stage_narration(timeline, project_id, deps)
-        except Exception as e:  # noqa: BLE001 — a TTS outage must not kill the cut
-            deps.log(f"  [narration] skipped ({e}) — narration segments render silent")
-            narration_clips = []
+        with tracker.step("narration", "Narration TTS") as st:
+            try:
+                narration_clips = stage_narration(timeline, project_id, deps)
+            except Exception as e:  # noqa: BLE001 — a TTS outage must not kill the cut
+                st.skip(f"failed ({e}) — narration segments render silent")
+                deps.log(f"  [narration] skipped ({e}) — narration segments render silent")
+                narration_clips = []
         if narration_clips:
             from director_os.otio_engine.contract import NarratorClipMeta, parse_clip_meta
             from director_os.otio_engine.timeline import MASTER_TRACK, is_gap, track_by_name
@@ -2333,119 +2361,137 @@ def run_pipeline(
         # their master WAV at render time, exactly as before.
         enhance_info = None
         if deps.audio_mode == "isolate_2bus":
-            _update_job(deps.sessions, job_id, JobStage.audio_prep, 52.0)
+            tracker.stage(JobStage.audio_prep.value, 52.0)
             _check_stop(deps, project_id)
             from director_os.worker.audio_enhance import stage_audio_enhance
 
             kept = kept_windows_from_timeline(timeline, asset_id)
-            enhance_info = stage_audio_enhance(
-                asset_id,
-                source,
-                transcript,
+            with tracker.step("audio_prep", "2-bus speech enhancement — kept windows"):
+                enhance_info = stage_audio_enhance(
+                    asset_id,
+                    source,
+                    transcript,
+                    project_id,
+                    deps,
+                    enhancer=deps.speech_enhancer,
+                    kept_windows=kept or None,
+                    music_flagged_spans=music_spans,
+                )
+
+        tracker.stage(JobStage.render.value, 60.0)
+        _check_stop(deps, project_id)
+        with tracker.step("render", "Render master — segment cache, misses only") as st:
+            report, otio_path = stage_render(
+                timeline,
                 project_id,
+                source,
+                asset_id,
                 deps,
-                enhancer=deps.speech_enhancer,
-                kept_windows=kept or None,
-                music_flagged_spans=music_spans,
+                enhanced_audio=enhance_info.enhanced_audio_map() if enhance_info else None,
+                narration_audio=narration_audio if narration_clips else None,
             )
+            st.pct(96, f"{report.rendered} rendered / {report.cached} cached")
 
-        _update_job(deps.sessions, job_id, JobStage.render, 60.0)
+        tracker.stage(JobStage.subtitles.value, 85.0)
         _check_stop(deps, project_id)
-        report, otio_path = stage_render(
-            timeline,
-            project_id,
-            source,
-            asset_id,
-            deps,
-            enhanced_audio=enhance_info.enhanced_audio_map() if enhance_info else None,
-            narration_audio=narration_audio if narration_clips else None,
-        )
-
-        _update_job(deps.sessions, job_id, JobStage.subtitles, 85.0)
-        _check_stop(deps, project_id)
-        stage_subtitles(timeline, transcript, project_id, deps)
+        with tracker.step("subtitles", "Caption build — 2-row karaoke .ass + .srt"):
+            stage_subtitles(timeline, transcript, project_id, deps)
 
         # POST-FX (owner rule): blur + enhance + captions run ONLY now, on the
-        # assembled deliverable — never on the 43-min source. QA below audits
+        # assembled deliverable — never on the 43-min source. QA audits
         # THIS file.
         post_fx_report = None
         final_for_qa = report.final_path
         if deps.post_fx:
-            _update_job(deps.sessions, job_id, JobStage.qa, 88.0)
-            try:
-                from director_os.worker.post_fx import stage_post_fx
+            tracker.stage(JobStage.qa.value, 88.0)
+            with tracker.step(
+                "post_fx", "Post-FX on the deliverable — tracked blur + burn-in"
+            ) as st:
+                try:
+                    from director_os.worker.post_fx import stage_post_fx
 
-                post_fx_report = stage_post_fx(
-                    report.final_path,
-                    timeline,
-                    transcript,
-                    project_id,
-                    deps,
-                    narration_clips=narration_clips,
-                )
-                final_for_qa = post_fx_report.final_path or report.final_path
-            except Exception as e:  # noqa: BLE001
-                deps.log(f"  [post-fx] FAILED ({e}) — QA audits the un-post-fx'd master")
+                    post_fx_report = stage_post_fx(
+                        report.final_path,
+                        timeline,
+                        transcript,
+                        project_id,
+                        deps,
+                        narration_clips=narration_clips,
+                    )
+                    final_for_qa = post_fx_report.final_path or report.final_path
+                except Exception as e:  # noqa: BLE001
+                    st.skip(f"FAILED ({e}) — QA audits the un-post-fx'd master")
+                    deps.log(f"  [post-fx] FAILED ({e}) — QA audits the un-post-fx'd master")
 
-        _update_job(deps.sessions, job_id, JobStage.qa, 90.0)
+        tracker.stage(JobStage.qa.value, 90.0)
         _check_stop(deps, project_id)
         # expected duration = the DAG's frame-quantized total (what ffmpeg truly
         # renders), NOT the raw OTIO sum — unquantized sums accumulate per-segment
         # frame rounding and fail QA on long cuts (live: 4.92 s over 329 segments)
-        audit = stage_qa(
-            final_for_qa,
-            report.total_dur_s,
-            job_id,
-            project_id,
-            deps,
-            transcript=transcript,
-            enhance_info=enhance_info,
-            raw_source=source,
-            timeline=timeline,
-            source_duration_s=_source_duration(deps, asset_id),
-        )
-        if not audit.ok:
-            raise PipelineError(f"QA failed: {[c.detail for c in audit.failures]}")
+        with tracker.step("qa", "Technical QA audit — loudness, duration, retention"):
+            audit = stage_qa(
+                final_for_qa,
+                report.total_dur_s,
+                job_id,
+                project_id,
+                deps,
+                transcript=transcript,
+                enhance_info=enhance_info,
+                raw_source=source,
+                timeline=timeline,
+                source_duration_s=_source_duration(deps, asset_id),
+            )
+            if not audit.ok:
+                raise PipelineError(f"QA failed: {[c.detail for c in audit.failures]}")
 
         # Stage 10 — Creator Ship Pack (YouTube upload is disabled; this folder
         # is what the human ships). Soft-fail: a pack glitch never unpublishes
         # a QA-passed master. The JOB stays parked at human_gate — the pack is
         # a sub-product of the gate, not a stage beyond it.
-        _update_job(deps.sessions, job_id, JobStage.ship_pack, 97.0)
-        try:
-            from director_os.worker.ship_pack import build_ship_pack
+        tracker.stage(JobStage.ship_pack.value, 97.0)
+        with tracker.step("ship_pack", "Creator ship pack — chapters, SEO, thumbnails") as st:
+            try:
+                from director_os.worker.ship_pack import build_ship_pack
 
-            with deps.sessions() as s:
-                prow = s.get(PerceptionIndexRow, asset_id)
-            shots = (prow.shots_json or {}) if prow else {}
-            ocr = ((prow.redaction_tracks_json or {}).get("timestamp_ocr") or {}) if prow else {}
-            card_sub = f"CASE FILE — {ocr.get('iso')}" if ocr.get("iso") else None
-            pack = build_ship_pack(
-                project_id,
-                deps,
-                timeline,
-                report.final_path,
-                transcript=transcript,
-                insights=(shots.get("visual_timeline") or {}).get("insights", []),
-                card_subtitle=card_sub,
-                enhance_info=enhance_info,
-                duration_s=report.total_dur_s,
-            )
-            deps.log(
-                f"  [ship-pack] {pack.pack_dir} — chapters {len(pack.chapters)}, "
-                f"thumbnails {len(pack.seo.get('keywords', []))} kw, "
-                f"clean ends: {pack.verification.get('clean_first_last_frames')}"
-            )
-        except Exception as e:  # noqa: BLE001 — pack failure is never a QA failure
-            deps.log(f"  [ship-pack] skipped ({e})")
-        _update_job(deps.sessions, job_id, JobStage.human_gate, 100.0)
+                with deps.sessions() as s:
+                    prow = s.get(PerceptionIndexRow, asset_id)
+                shots = (prow.shots_json or {}) if prow else {}
+                ocr = (
+                    ((prow.redaction_tracks_json or {}).get("timestamp_ocr") or {}) if prow else {}
+                )
+                card_sub = f"CASE FILE — {ocr.get('iso')}" if ocr.get("iso") else None
+                pack = build_ship_pack(
+                    project_id,
+                    deps,
+                    timeline,
+                    report.final_path,
+                    transcript=transcript,
+                    insights=(shots.get("visual_timeline") or {}).get("insights", []),
+                    card_subtitle=card_sub,
+                    enhance_info=enhance_info,
+                    duration_s=report.total_dur_s,
+                )
+                deps.log(
+                    f"  [ship-pack] {pack.pack_dir} — chapters {len(pack.chapters)}, "
+                    f"thumbnails {len(pack.seo.get('keywords', []))} kw, "
+                    f"clean ends: {pack.verification.get('clean_first_last_frames')}"
+                )
+            except Exception as e:  # noqa: BLE001 — pack failure is never a QA failure
+                st.skip(f"skipped ({e})")
+                deps.log(f"  [ship-pack] skipped ({e})")
+        tracker.stage(JobStage.human_gate.value, 100.0)
     except Exception as e:
         # soft-failure persistence: the job row records WHERE it died, so the
         # operator (or the retry task) resumes instead of guessing. A HARD kill
         # (SIGKILL) persists nothing — resume works because every stage's
         # product lives in its domain table, never only in memory.
         stage, progress = _current_stage(deps.sessions, job_id)
-        _update_job(deps.sessions, job_id, stage, progress, error=str(e)[:2000])
+        error = str(e)[:2000]
+        if deps.tracker is not None:
+            deps.tracker.stage(stage.value, progress, error=error)
+            deps.tracker.error(f"pipeline failed at {stage.value}: {error}")
+        else:
+            _update_job(deps.sessions, job_id, stage, progress, error=error)
         raise
 
     shipped = post_fx_report.final_path if post_fx_report else report.final_path

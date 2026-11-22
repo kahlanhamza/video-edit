@@ -15,7 +15,15 @@ from director_os.agent_runtime.checkpoint import CheckpointStore
 from director_os.agent_runtime.editing_tools import DirectorToolbox, build_director_registry
 from director_os.agent_runtime.llm import LLMBackendError, build_backend_chain
 from director_os.api.channels import ChannelPublisher, MultiChannelPublisher
-from director_os.api.events import DEFAULT_MAX_S, DEFAULT_POLL_S, job_progress_stream, require_job
+from director_os.api.events import (
+    DEFAULT_LIVE_MAX_S,
+    DEFAULT_LIVE_POLL_S,
+    DEFAULT_MAX_S,
+    DEFAULT_POLL_S,
+    job_live_stream,
+    job_progress_stream,
+    require_job,
+)
 from director_os.api.youtube import (
     Chapter,
     DraftMetadata,
@@ -35,7 +43,10 @@ from director_os.core.db import (
     AgentToolLogRow,
     CaseDossierRow,
     CaseSourceRow,
+    JobEventRow,
+    JobLogRow,
     JobRow,
+    JobStepRow,
     MediaAssetRow,
     PerceptionIndexRow,
     ProjectRow,
@@ -590,6 +601,83 @@ def job_events(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ------------------------------------------------- live console (full-visibility Studio)
+@app.get("/projects/{project_id}/jobs/{job_id}/snapshot")
+def job_live_snapshot(project_id: str, job_id: str) -> JSONResponse:
+    """Initial console render: job state + every step + the log tail."""
+    require_job(session(), project_id, job_id)  # 404-safe
+    s = session()
+    try:
+        steps = s.execute(
+            select(JobStepRow).where(JobStepRow.job_id == job_id).order_by(JobStepRow.id)
+        ).scalars()
+        step_rows = [
+            {
+                "id": r.id,
+                "key": r.key,
+                "label": r.label,
+                "status": r.status,
+                "pct": r.pct,
+                "detail": r.detail,
+                "order": r.order,
+                "duration_ms": r.duration_ms,
+            }
+            for r in steps
+        ]
+        logs = s.execute(
+            select(JobLogRow)
+            .where(JobLogRow.job_id == job_id)
+            .order_by(JobLogRow.id.desc())
+            .limit(400)
+        ).scalars()
+        log_rows = [
+            {"id": r.id, "level": r.level, "message": r.message} for r in reversed(list(logs))
+        ]
+    finally:
+        s.close()
+    return JSONResponse({"steps": step_rows, "logs": log_rows})
+
+
+@app.get("/projects/{project_id}/jobs/{job_id}/live")
+def job_live(
+    project_id: str,
+    job_id: str,
+    poll_s: float = DEFAULT_LIVE_POLL_S,
+    max_seconds: float = DEFAULT_LIVE_MAX_S,
+) -> StreamingResponse:
+    """SSE stream of EVERY pipeline event — per-step progress bars, console
+    log lines, timeline revisions. Terminal `done` closes the stream."""
+    require_job(session(), project_id, job_id)  # 404 before the stream opens
+
+    async def gen():
+        async for frame in job_live_stream(
+            job_id, _session_factory, poll_s=poll_s, max_seconds=max_seconds
+        ):
+            yield frame
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/projects/{project_id}/timeline/nle")
+def timeline_nle(project_id: str) -> JSONResponse:
+    """The multi-track NLE snapshot: video clips, card overlays, narration
+    audio, captions, redaction windows — everything the timeline renders."""
+    from director_os.api.nle import ProjectNotFound, build_nle_snapshot
+
+    factory = _session_factory
+    if factory is None:  # session() above always initializes it; belt and braces
+        raise HTTPException(status_code=500, detail="session factory not initialized")
+    try:
+        snapshot = build_nle_snapshot(factory, project_id, get_settings().output_dir)
+    except ProjectNotFound as e:
+        raise HTTPException(status_code=404, detail="project not found") from e
+    return JSONResponse(snapshot)
 
 
 # ------------------------------------------------------------------ agent dispatch
@@ -1432,6 +1520,10 @@ def delete_project(project_id: str) -> Response:
             s.execute(
                 sa_delete(PerceptionIndexRow).where(PerceptionIndexRow.asset_id.in_(asset_ids))
             )
+        # observability tables reference jobs (FK) — purge before the jobs row
+        s.execute(sa_delete(JobEventRow).where(JobEventRow.project_id == project_id))
+        s.execute(sa_delete(JobLogRow).where(JobLogRow.project_id == project_id))
+        s.execute(sa_delete(JobStepRow).where(JobStepRow.project_id == project_id))
         s.execute(sa_delete(JobRow).where(JobRow.project_id == project_id))
         s.execute(sa_delete(MediaAssetRow).where(MediaAssetRow.project_id == project_id))
         s.execute(sa_delete(TimelineVersionRow).where(TimelineVersionRow.project_id == project_id))

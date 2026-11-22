@@ -26,6 +26,88 @@ export interface RunResult {
   progress_pct: number;
 }
 
+// --- full-visibility Studio: live steps + console logs + NLE timeline ---
+
+export interface JobStep {
+  id: number;
+  key: string;
+  label: string;
+  status: "running" | "done" | "failed" | "skipped";
+  pct: number;
+  detail: string;
+  order: number;
+  duration_ms: number;
+}
+
+export interface JobLog {
+  id: number;
+  level: "info" | "warn" | "error";
+  message: string;
+}
+
+export interface LiveJobSnapshot {
+  steps: JobStep[];
+  logs: JobLog[];
+}
+
+export interface NleClip {
+  track: string;
+  kind: string; // raw | narration | card | ...
+  name: string;
+  start_s: number;
+  dur_s: number;
+  end_s: number;
+  /** index on the master track INCLUDING gaps — the DirectorToolbox item_index */
+  master_index: number | null;
+  act: string | null;
+  script: string | null;
+  template: string | null;
+  audio_mode: string | null;
+  /** in-point in SOURCE footage seconds (trim math) */
+  source_start_s: number | null;
+}
+
+export interface NleCaption {
+  index: number;
+  start_ms: number;
+  end_ms: number;
+  text: string;
+  speaker: string;
+}
+
+export interface NleEffect {
+  id: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  sigma: number;
+  label: string;
+  mode: string;
+  t_start_s: number | null;
+  t_end_s: number | null;
+  created_by: string;
+}
+
+export interface NleAsset {
+  id: string;
+  duration_s: number;
+  fps: number;
+  width: number;
+  height: number;
+  has_proxy: boolean;
+}
+
+export interface NleTimeline {
+  project_id: string;
+  version: number | null;
+  duration_s: number;
+  asset: NleAsset | null;
+  clips: NleClip[];
+  captions: NleCaption[];
+  effects: NleEffect[];
+}
+
 export interface TimelineVersion {
   version_num: number;
   created_by: string;
@@ -243,6 +325,10 @@ export const api = {
     ),
   listJobs: (id: string) => req<Job[]>(`/projects/${id}/jobs`),
   timelineState: (id: string) => req<TimelineState>(`/projects/${id}/timeline`),
+  // --- full-visibility Studio: live console + NLE timeline ---
+  jobSnapshot: (id: string, jobId: string) =>
+    req<LiveJobSnapshot>(`/projects/${id}/jobs/${jobId}/snapshot`),
+  nleTimeline: (id: string) => req<NleTimeline>(`/projects/${id}/timeline/nle`),
   dispatchTool: (
     id: string,
     tool: string,
@@ -354,4 +440,8 @@ export function srtDownloadUrl(projectId: string): string {
 
 export function sseUrl(projectId: string, jobId: string): string {
   return `${API_BASE}/projects/${projectId}/jobs/${jobId}/events?poll_s=0.5&max_seconds=600`;
+}
+
+export function liveSseUrl(projectId: string, jobId: string): string {
+  return `${API_BASE}/projects/${projectId}/jobs/${jobId}/live?poll_s=0.4&max_seconds=7200`;
 }

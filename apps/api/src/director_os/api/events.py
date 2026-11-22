@@ -21,7 +21,7 @@ import json
 import time
 from collections.abc import AsyncIterator
 
-from director_os.core.db import JobRow
+from director_os.core.db import JobEventRow, JobRow
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -29,6 +29,8 @@ from sqlalchemy.orm import Session
 TERMINAL_PROGRESS = 100.0
 DEFAULT_POLL_S = 0.25
 DEFAULT_MAX_S = 20.0
+DEFAULT_LIVE_POLL_S = 0.4
+DEFAULT_LIVE_MAX_S = 1800.0
 
 
 def _job_snapshot(s: Session, job_id: str) -> dict:
@@ -98,3 +100,68 @@ def require_job(s: Session, project_id: str, job_id: str) -> dict:
         return snapshot
     finally:
         s.close()
+
+
+# ------------------------------------------------------------------ live event stream
+def _job_state(s: Session, job_id: str) -> dict | None:
+    row = s.get(JobRow, job_id)
+    if row is None:
+        return None
+    return {
+        "job_id": row.id,
+        "stage": row.current_stage,
+        "progress_pct": round(float(row.progress_pct or 0.0), 1),
+        "error": row.error_message,
+    }
+
+
+def _events_after(s: Session, job_id: str, seq: int) -> list[dict]:
+    rows = s.execute(
+        select(JobEventRow)
+        .where(JobEventRow.job_id == job_id, JobEventRow.id > seq)
+        .order_by(JobEventRow.id)
+        .limit(500)
+    ).scalars()
+    return [{"seq": r.id, "kind": r.kind, "payload": dict(r.payload or {})} for r in rows]
+
+
+def _terminal(state: dict | None) -> bool:
+    if state is None:
+        return False
+    return state["progress_pct"] >= TERMINAL_PROGRESS or state["error"] is not None
+
+
+async def job_live_stream(
+    job_id: str,
+    session_factory,
+    poll_s: float = DEFAULT_LIVE_POLL_S,
+    max_seconds: float = DEFAULT_LIVE_MAX_S,
+) -> AsyncIterator[str]:
+    """SSE frames for the full-visibility console: `job` / `step` / `log` /
+    `timeline` / `error` events off the append-only `job_events` feed, then a
+    terminal `done`. Cursor-based (`seq`) so reconnects resume without gaps."""
+    loop = asyncio.get_running_loop()
+
+    def read(seq: int) -> tuple[list[dict], dict | None]:
+        s = session_factory()
+        try:
+            return _events_after(s, job_id, seq), _job_state(s, job_id)
+        finally:
+            s.close()
+
+    seq = 0
+    state = None
+    deadline = time.monotonic() + max_seconds
+    while time.monotonic() < deadline:
+        events, state = await loop.run_in_executor(None, read, seq)
+        for ev in events:
+            seq = ev["seq"]
+            yield _sse(ev["kind"], {**ev["payload"], "seq": ev["seq"]})
+        if _terminal(state):
+            yield _sse("done", {**(state or {}), "seq": seq})
+            return
+        if len(events) >= 500:
+            continue  # full page — the producer is streaming fast, drain immediately
+        await asyncio.sleep(poll_s)
+
+    yield _sse("done", {**(state or {}), "seq": seq, "reason": "timeout"})

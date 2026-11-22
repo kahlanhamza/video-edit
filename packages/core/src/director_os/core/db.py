@@ -19,6 +19,7 @@ from sqlalchemy import (
     String,
     Text,
     create_engine,
+    event,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
@@ -129,6 +130,52 @@ class JobRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class JobStepRow(Base):
+    """One named pipeline step inside a job — the unit the Studio console shows
+    a live progress bar for. `status` lifecycle: running -> done | failed | skipped."""
+
+    __tablename__ = "job_steps"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(String(36), ForeignKey("jobs.id"), index=True)
+    project_id: Mapped[str] = mapped_column(String(36), index=True)
+    key: Mapped[str] = mapped_column(String(80))  # e.g. "perception.asr"
+    label: Mapped[str] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(20), default="running")
+    pct: Mapped[float] = mapped_column(Float, default=0.0)  # 0-100 sub-progress
+    detail: Mapped[str] = mapped_column(String(1000), default="")
+    order: Mapped[int] = mapped_column(Integer, default=0)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class JobLogRow(Base):
+    """One streamed pipeline log line (the embedded sandbox console feed)."""
+
+    __tablename__ = "job_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(String(36), ForeignKey("jobs.id"), index=True)
+    project_id: Mapped[str] = mapped_column(String(36), index=True)
+    level: Mapped[str] = mapped_column(String(10), default="info")  # info | warn | error
+    message: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class JobEventRow(Base):
+    """Append-only SSE stream the Studio console tails (monotonic id = cursor)."""
+
+    __tablename__ = "job_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(String(36), ForeignKey("jobs.id"), index=True)
+    project_id: Mapped[str] = mapped_column(String(36), index=True)
+    kind: Mapped[str] = mapped_column(String(20))  # job | step | log | timeline | error
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class CaseSourceRow(Base):
     """One attached case source (M5 multi-source bundle)."""
 
@@ -164,6 +211,9 @@ ALL_TABLES = (
     SegmentCacheRow,
     AgentToolLogRow,
     JobRow,
+    JobStepRow,
+    JobLogRow,
+    JobEventRow,
     CaseSourceRow,
     CaseDossierRow,
 )
@@ -176,7 +226,19 @@ def make_engine(database_url: str | None = None):
     kwargs: dict[str, Any] = {}
     if url.startswith("sqlite"):
         kwargs["connect_args"] = {"check_same_thread": False}
-    return create_engine(url, future=True, **kwargs)
+    engine = create_engine(url, future=True, **kwargs)
+    if url.startswith("sqlite"):
+        # The live tracker writes steps/logs/events from the pipeline thread
+        # while the gateway/tests poll from other connections — WAL + a busy
+        # timeout turn "database is locked" into orderly short waits.
+        @event.listens_for(engine, "connect")
+        def _sqlite_pragma(dbapi_conn, _record):  # noqa: ANN001
+            cur = dbapi_conn.cursor()
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA busy_timeout=10000")
+            cur.close()
+
+    return engine
 
 
 def make_session_factory(engine) -> sessionmaker:
