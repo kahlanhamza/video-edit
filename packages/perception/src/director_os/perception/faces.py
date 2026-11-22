@@ -119,6 +119,25 @@ def make_detector(model_path: Path | None = None) -> _DetectorProtocol:
 
 
 # -------------------------------------------------------------------- sweep
+def _merge_sweep_ranges(
+    ranges: list[tuple[float, float]] | None,
+) -> list[tuple[float, float | None]]:
+    """Sorted+merged sweep spans; None/empty = the whole source [(0.0, None)].
+
+    The post-plan scoping law: detection pays only for footage the edit kept.
+    """
+    if not ranges:
+        return [(0.0, None)]
+    spans = sorted((max(0.0, a), b) for a, b in ranges if b > a)
+    merged: list[tuple[float, float]] = []
+    for a, b in spans:
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    return [(a, b) for a, b in merged]
+
+
 def detect_faces(
     video_path: Path,
     sample_every_s: float = DEFAULT_SAMPLE_EVERY_S,
@@ -126,12 +145,16 @@ def detect_faces(
     score_threshold: float = 0.5,
     detector: _DetectorProtocol | None = None,
     progress: Callable[[int, int], None] | None = None,
+    ranges: list[tuple[float, float]] | None = None,
 ) -> FaceSweep:
     """Sample frames at `sample_every_s` and run the detector on each.
 
-    Decoding is capped by `max_samples` (a 43-min source at 1 fps still lands
-    under the default). Frame geometry comes from the video itself; boxes are
-    in RAW source pixels, directly consumable by the render pipeline.
+    Decoding is capped by `max_samples`. `ranges` scopes the sweep to kept
+    spans only — cut-out footage is never decoded, and t_s stays in SOURCE
+    time (spans merge+sort; seeks jump straight to each span). None sweeps
+    the whole source (legacy behavior, unchanged). Frame geometry comes from
+    the video itself; boxes are in RAW source pixels, directly consumable by
+    the render pipeline.
     """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -142,31 +165,38 @@ def detect_faces(
     decoded = 0
     failed = 0
     stride = max(1, int(round(fps * sample_every_s)))
-    idx = 0
-    while decoded < max_samples:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if idx % stride == 0:
-            try:
-                hits = det.detect(frame)
-            except Exception:
-                failed += 1
-                idx += 1
-                continue
-            decoded += 1
-            t_s = idx / fps if fps else 0.0
-            for x, y, w, h, score in hits:
-                if score < score_threshold:
+    for span_start, span_end in _merge_sweep_ranges(ranges):
+        if span_start > 0:
+            cap.set(cv2.CAP_PROP_POS_MSEC, span_start * 1000.0)
+        idx = 0
+        while decoded < max_samples:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            t_s = span_start + idx / fps if fps else 0.0
+            if span_end is not None and t_s >= span_end:
+                break
+            if idx % stride == 0:
+                try:
+                    hits = det.detect(frame)
+                except Exception:
+                    failed += 1
+                    idx += 1
                     continue
-                detections.append(
-                    FaceDetection(
-                        t_s=round(t_s, 3), bbox=BBox(x=x, y=y, w=w, h=h), score=round(score, 3)
+                decoded += 1
+                for x, y, w, h, score in hits:
+                    if score < score_threshold:
+                        continue
+                    detections.append(
+                        FaceDetection(
+                            t_s=round(t_s, 3), bbox=BBox(x=x, y=y, w=w, h=h), score=round(score, 3)
+                        )
                     )
-                )
-            if progress is not None and decoded % 100 == 0:
-                progress(decoded, max_samples)
-        idx += 1
+                if progress is not None and decoded % 100 == 0:
+                    progress(decoded, max_samples)
+            idx += 1
+        if decoded >= max_samples:
+            break
     cap.release()
     return FaceSweep(
         stats=FaceSweepStats(

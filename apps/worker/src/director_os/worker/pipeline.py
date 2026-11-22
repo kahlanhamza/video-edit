@@ -25,6 +25,7 @@ in tests. Nothing here talks to the network.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -495,97 +496,266 @@ def _atomic_json_write(path: Path, payload: dict) -> None:
     tmp.replace(path)
 
 
+# ------------------------------------------------- post-plan sweep scoping law
+def _kept_source_ranges(timeline: Any, asset_id: str) -> list[tuple[float, float]]:
+    """Kept (start_s, end_s) spans on the SOURCE timeline, merged.
+
+    The post-plan scoping law (operator mandate): detection pays only for
+    footage the edit kept. Gaps/cut-out footage are never swept; cards and
+    narration items carry no source span. Spans within 2.0s of each other
+    merge — a hairline cut should not split one face track (the repair
+    bridge window is ~2s).
+    """
+    from director_os.otio_engine.contract import RawClipMeta, parse_clip_meta
+    from director_os.otio_engine.timeline import (
+        MASTER_TRACK,
+        is_gap,
+        item_duration_s,
+        track_by_name,
+    )
+
+    master = track_by_name(timeline, MASTER_TRACK)
+    if master is None:
+        return []
+    spans: list[tuple[float, float]] = []
+    for item in master:
+        dur = item_duration_s(item)
+        if dur <= 0 or is_gap(item):
+            continue
+        try:
+            meta = parse_clip_meta(item)
+        except Exception:  # noqa: BLE001 — non-contract items have no source span
+            continue
+        if not isinstance(meta, RawClipMeta) or meta.asset_id != asset_id:
+            continue
+        start = item.source_range.start_time.to_seconds() if item.source_range else 0.0
+        spans.append((max(0.0, round(start, 3)), max(0.0, round(start + dur, 3))))
+    spans.sort()
+    merged: list[list[float]] = []
+    for a, b in spans:
+        if merged and a - merged[-1][1] <= 2.0:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return [(a, b) for a, b in merged]
+
+
+def _ranges_digest(backend: str, ranges: list[tuple[float, float]] | None) -> str:
+    """Sweep cache key: backend + normalized kept ranges (2dp)."""
+    import hashlib
+
+    norm = [[round(a, 2), round(b, 2)] for a, b in (ranges or [])]
+    return hashlib.sha256(json.dumps([backend, norm]).encode()).hexdigest()[:10]
+
+
+def _sweep_cache_path(deps: PipelineDeps, project_id: str, asset_id: str, digest: str) -> Path:
+    return (
+        deps.settings.output_dir
+        / "pipeline"
+        / project_id
+        / f"redact_sweep_{asset_id[:8]}_{digest}.json"
+    )
+
+
+def _persist_redaction_payload(deps: PipelineDeps, asset_id: str, payload: dict[str, Any]) -> None:
+    """Merge-persist a sweep payload (studio keep-toggles ride the same column)."""
+    with deps.sessions() as s:
+        row = s.get(PerceptionIndexRow, asset_id)
+        if row is None:
+            row = PerceptionIndexRow(asset_id=asset_id)
+            s.add(row)
+        row.redaction_tracks_json = {**(row.redaction_tracks_json or {}), **payload}
+        s.commit()
+
+
+@contextlib.contextmanager
+def _sweep_guard(lock_path: Path, *, stale_s: float = 1800.0, wait_s: float = 900.0):
+    """Cross-job sweep mutex.
+
+    A second queued job on the same asset waits for the winner, then reuses
+    its result (cache file / persisted payload) — the "swept the same 43-min
+    source twice" burn is impossible by construction. A lock older than
+    stale_s belongs to a crashed holder and is stolen; waiting longer than
+    wait_s degrades to a sweep-skip (canvas boxes still apply, the pipeline
+    never breaks on a lost race).
+    """
+    import time
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + wait_s
+    fd: int | None = None
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            try:
+                age = time.time() - lock_path.stat().st_mtime
+            except OSError:
+                age = 0.0
+            if age > stale_s:
+                lock_path.unlink(missing_ok=True)
+                continue
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"redaction sweep lock stuck: {lock_path.name}") from None
+            time.sleep(2.0)
+    try:
+        os.write(fd, str(os.getpid()).encode())
+        yield
+    finally:
+        os.close(fd)
+        lock_path.unlink(missing_ok=True)
+
+
 def stage_redaction(
-    asset_id: str, source: Path, project_id: str, deps: PipelineDeps, max_regions: int = 8
+    asset_id: str,
+    source: Path,
+    project_id: str,
+    deps: PipelineDeps,
+    max_regions: int = 8,
+    timeline: Any = None,
 ) -> list:
     """Auto-detect redaction regions — idempotent, pluggable backend (M4).
 
+    POST-PLAN SCOPING LAW (operator mandate): the sweep runs AFTER the LLM
+    plan and pays ONLY for footage the edit kept — a 43-min source that keeps
+    8 min sweeps 8 min, never 77k raw frames. `timeline` carries the kept
+    spans; None sweeps the whole source (legacy direct calls/tests).
+
     backend "tracked" (issue #14, the default when the YOLO model is present):
-    the deterministic 3-pass pipeline — CFR normalize, imgsz-960/conf-0.22 YOLO
-    + GMC tracking, One-Euro trajectory repair — persisted as a per-frame plan
-    PLUS the static regions the studio canvas already draws. backend "modal":
-    YOLOv8-face + plate + ByteTrack on the serverless GPU fleet (persistent
-    Person/Plate IDs, time-binned tracked regions). backend "yunet": the
-    zero-download CPU sweep used since the first real-footage run. A backend
+    the deterministic 3-pass pipeline — per-span CFR normalize, imgsz-960/
+    conf-0.22 YOLO + GMC tracking, One-Euro trajectory repair — persisted as
+    a per-frame plan PLUS the static regions the studio canvas already draws.
+    backend "modal": YOLOv8-face + plate + ByteTrack on the serverless GPU
+    fleet (the GPU lane absorbs the cost, sweep stays full-source).
+    backend "yunet": the zero-download CPU sweep (ranges-scoped). A backend
     that cannot run is a skipped stage, never a broken pipeline.
+
+    Cross-job dedupe: results are keyed by (backend, kept-ranges digest) — a
+    second queued job waits on the lock, then reuses the winner's sweep (cache
+    file + persisted payload), never re-decodes.
     """
+    backend = deps.redact_backend or "yunet"
+    keep_ranges = _kept_source_ranges(timeline, asset_id) if timeline is not None else None
+    ranges_digest = _ranges_digest(backend, keep_ranges)
+    if keep_ranges is not None and not keep_ranges:
+        deps.log("  [redaction] plan kept no raw footage — sweep skipped entirely")
+        return []
+
     with deps.sessions() as s:
         row = s.get(PerceptionIndexRow, asset_id)
-        existing = (row.redaction_tracks_json or {}).get("regions") if row else None
-        if existing:
-            deps.log(f"  [redaction] {len(existing)} region(s) already persisted — skip sweep")
-            return existing
+        payload_existing = dict(row.redaction_tracks_json or {}) if row else {}
+        existing = payload_existing.get("regions")
         asset = s.get(MediaAssetRow, asset_id)
+    if existing and payload_existing.get("ranges_digest") == ranges_digest:
+        deps.log(f"  [redaction] {len(existing)} region(s) already persisted — skip sweep")
+        return existing
     frame_w = int(asset.width or 0)
     frame_h = int(asset.height or 0)
     if frame_w <= 0 or frame_h <= 0:
         deps.log("  [redaction] asset geometry unknown — skipping auto sweep")
         return []
 
-    backend = deps.redact_backend or "yunet"
-    tracked_extra: dict[str, Any] = {}  # per_frame plan + digest (tracked backend only)
-    if backend == "tracked":
-        try:
-            tracked_payload = _tracked_redaction_payload(
-                source, project_id, deps, frame_w, frame_h, max_regions, asset_id=asset_id
-            )
-            regions = tracked_payload["regions"]
-            source_tag = tracked_payload["source"]
-            stats = tracked_payload["stats"]
-            tracked_extra = {
-                "per_frame": tracked_payload["per_frame"],
-                "plan_digest": tracked_payload["plan_digest"],
+    out_dir = deps.settings.output_dir / "pipeline" / project_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = _sweep_cache_path(deps, project_id, asset_id, ranges_digest)
+    payload_json: dict[str, Any]
+    try:
+        with _sweep_guard(out_dir / f"redact_sweep_{asset_id[:8]}.lock"):
+            # lock re-check: the winner may have finished while we waited
+            with deps.sessions() as s:
+                row = s.get(PerceptionIndexRow, asset_id)
+                won = (row.redaction_tracks_json or {}).get("regions") if row else None
+                won_digest = (row.redaction_tracks_json or {}).get("ranges_digest") if row else None
+            if won and won_digest == ranges_digest:
+                deps.log(
+                    f"  [redaction] co-running job already swept this asset — "
+                    f"reusing {len(won)} region(s), no re-decode"
+                )
+                return won
+            if cache_path.exists() and cache_path.stat().st_size > 0:
+                cached = json.loads(cache_path.read_text())
+                _persist_redaction_payload(deps, asset_id, cached)
+                deps.log(
+                    f"  [redaction] sweep cache hit ({ranges_digest}) — "
+                    f"{len(cached.get('regions', []))} region(s) reused, no re-decode"
+                )
+                return cached.get("regions", [])
+
+            tracked_extra: dict[str, Any] = {}  # per_frame plan + digest (tracked only)
+            if backend == "tracked":
+                try:
+                    tracked_payload = _tracked_redaction_payload(
+                        source,
+                        project_id,
+                        deps,
+                        frame_w,
+                        frame_h,
+                        max_regions,
+                        asset_id=asset_id,
+                        keep_ranges=keep_ranges,
+                    )
+                    regions = tracked_payload["regions"]
+                    source_tag = tracked_payload["source"]
+                    stats = tracked_payload["stats"]
+                    tracked_extra = {
+                        "per_frame": tracked_payload["per_frame"],
+                        "plan_digest": tracked_payload["plan_digest"],
+                    }
+                except Exception as e:  # model missing, sweep failure — degrade loudly
+                    deps.log(
+                        f"  [redaction] tracked 3-pass unavailable ({e}) — falling back to YuNet"
+                    )
+                    backend = "yunet"
+
+            if backend == "modal":
+                from director_os.perception.modal_redact import (
+                    ModalRedactError,
+                    parse_tracks_payload,
+                    redact_video_modal,
+                    tracks_to_regions,
+                )
+
+                try:
+                    deps.log("  [redaction] modal lane sweeps the FULL source (GPU fleet)")
+                    payload = redact_video_modal(str(source))
+                    tracks = parse_tracks_payload(payload)
+                    regions = tracks_to_regions(tracks, frame_w, frame_h)
+                    geo = payload.get("video", {})
+                    source_tag = "modal_yolo_bytetrack"
+                    stats = {"tracks": len(tracks), "gpu_video": geo}
+                except ModalRedactError as e:
+                    deps.log(f"  [redaction] Modal fleet unavailable ({e}) — falling back to YuNet")
+                    backend = "yunet"
+
+            if backend == "yunet":
+                from director_os.perception.faces import cluster_to_regions, detect_faces
+
+                sweep = detect_faces(source, sample_every_s=1.0, ranges=keep_ranges)
+                regions = cluster_to_regions(
+                    sweep, max_regions=max_regions, frame_w=frame_w, frame_h=frame_h
+                )
+                source_tag = f"yunet_autodetect:{sweep.stats.detector}"
+                stats = {
+                    "frames_sampled": sweep.stats.frames_sampled,
+                    "detections": sweep.stats.detections,
+                    "kept_ranges": keep_ranges,
+                }
+
+            payload_json = {
+                "regions": [r.model_dump(mode="json") for r in regions],
+                "source": source_tag,
+                "stats": stats,
+                "ranges_digest": ranges_digest,
+                **tracked_extra,
             }
-        except Exception as e:  # model missing, sweep failure — degrade loudly
-            deps.log(f"  [redaction] tracked 3-pass unavailable ({e}) — falling back to YuNet")
-            backend = "yunet"
-
-    if backend == "modal":
-        from director_os.perception.modal_redact import (
-            ModalRedactError,
-            parse_tracks_payload,
-            redact_video_modal,
-            tracks_to_regions,
+            cache_path.write_text(json.dumps(payload_json))
+            _persist_redaction_payload(deps, asset_id, payload_json)
+    except TimeoutError as e:
+        deps.log(
+            f"  [redaction] sweep lock timeout ({e}) — stage skipped, canvas boxes still apply"
         )
-
-        try:
-            payload = redact_video_modal(str(source))
-            tracks = parse_tracks_payload(payload)
-            regions = tracks_to_regions(tracks, frame_w, frame_h)
-            geo = payload.get("video", {})
-            source_tag = "modal_yolo_bytetrack"
-            stats = {"tracks": len(tracks), "gpu_video": geo}
-        except ModalRedactError as e:
-            deps.log(f"  [redaction] Modal fleet unavailable ({e}) — falling back to YuNet")
-            backend = "yunet"
-
-    if backend == "yunet":
-        from director_os.perception.faces import cluster_to_regions, detect_faces
-
-        sweep = detect_faces(source, sample_every_s=1.0)
-        regions = cluster_to_regions(
-            sweep, max_regions=max_regions, frame_w=frame_w, frame_h=frame_h
-        )
-        source_tag = f"yunet_autodetect:{sweep.stats.detector}"
-        stats = {
-            "frames_sampled": sweep.stats.frames_sampled,
-            "detections": sweep.stats.detections,
-        }
-
-    payload_json: dict[str, Any] = {
-        "regions": [r.model_dump(mode="json") for r in regions],
-        "source": source_tag,
-        "stats": stats,
-        **tracked_extra,
-    }
-    with deps.sessions() as s:
-        row = s.get(PerceptionIndexRow, asset_id)
-        if row is None:
-            row = PerceptionIndexRow(asset_id=asset_id)
-            s.add(row)
-        # fresh rows hold None until flush (SQL column default applies at INSERT)
-        row.redaction_tracks_json = {**(row.redaction_tracks_json or {}), **payload_json}
-        s.commit()
+        return existing or []
     deps.log(
         f"  [redaction] {len(regions)} region(s) via {source_tag} "
         f"({', '.join(sorted({r.track_id or 'box' for r in regions}))[:4]}...)"
@@ -622,6 +792,83 @@ def _resolve_keep_track_ids(deps: PipelineDeps, asset_id: str) -> tuple[set[str]
     return keep, policy
 
 
+def _cfr_range(source: Path, out_dir: Path, start: float, end: float) -> Path:
+    """Exact-CFR clip for ONE kept span — cached, video-only (detection input).
+
+    `fps=30` re-encode gives the strict frame cadence the tracker expects;
+    only kept% of the source is ever decoded. The name carries the span, so a
+    moved cut gets a fresh clip and an unchanged cut reuses its bytes.
+    """
+    dst = out_dir / f"_sweep_cfr_{int(start * 1000):07d}_{int((end - start) * 1000):06d}.mp4"
+    if dst.exists() and dst.stat().st_size > 0:
+        return dst
+    _run_ffmpeg(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            f"{start:.3f}",
+            "-t",
+            f"{end - start:.3f}",
+            "-i",
+            str(source),
+            "-map",
+            "0:v:0",
+            "-an",
+            "-vf",
+            "fps=30",
+            "-fps_mode",
+            "cfr",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "16",
+            "-pix_fmt",
+            "yuv420p",
+            str(dst),
+        ],
+        f"CFR sweep clip [{start:.1f}s .. {end:.1f}s]",
+    )
+    return dst
+
+
+def _sweep_kept_ranges(
+    backend: Any,
+    source: Path,
+    out_dir: Path,
+    keep_ranges: list[tuple[float, float]],
+) -> tuple[list, list, int]:
+    """Detect faces+plates ONLY inside the kept spans; hits re-indexed to
+    SOURCE time (t_s += span start) so the per-frame plan keeps the exact
+    source-time contract the render bake slices by (`_clip_plan`).
+
+    Each span is detected independently — tracker state resets at a cut,
+    because continuity across removed footage is fiction. Returns
+    (face_tracks, plate_tracks, n_frames_spanned).
+    """
+    face_tracks: list = []
+    plate_tracks: list = []
+    max_end = 0.0
+    for start, end in keep_ranges:
+        cfr = _cfr_range(source, out_dir, start, end)
+        span_faces = backend.detect_faces(cfr)
+        span_plates = backend.detect_plates(cfr) if backend.capabilities().get("plates") else []
+        for tr in [*span_faces, *span_plates]:
+            tr = tr.model_copy(
+                update={
+                    "hits": [h.model_copy(update={"t_s": round(h.t_s + start, 3)}) for h in tr.hits]
+                }
+            )
+            (plate_tracks if tr.track_id.startswith("plate_") else face_tracks).append(tr)
+        max_end = max(max_end, end)
+    return face_tracks, plate_tracks, int(round(max_end * 30))
+
+
 def _tracked_redaction_payload(
     source: Path,
     project_id: str,
@@ -630,6 +877,7 @@ def _tracked_redaction_payload(
     frame_h: int,
     max_regions: int,
     asset_id: str = "",
+    keep_ranges: list[tuple[float, float]] | None = None,
 ) -> dict[str, Any]:
     """Pass 1+2 of the 3-pass pipeline — the plan the render stage bakes in.
 
@@ -642,6 +890,11 @@ def _tracked_redaction_payload(
     honored BEFORE Pass 2 — kept tracks never enter the trajectory plan, so
     the bake, the static regions and the zero-leak audit all agree on what is
     blurred. Plates are exempt from keeping (PII law).
+
+    Post-plan scoping law: `keep_ranges` set -> detection decodes ONLY the
+    kept spans (per-span exact-CFR clips, hits re-indexed to SOURCE time) —
+    the per-frame plan keeps the same source-time contract the render bake
+    slices by (`_clip_plan`).
     """
     import hashlib
 
@@ -663,17 +916,25 @@ def _tracked_redaction_payload(
 
     out_dir = deps.settings.output_dir / "pipeline" / project_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    cfr_path = normalize_cfr(source, out_dir / "source_cfr.mp4")
-    n_frames = video_n_frames(cfr_path)
-    if not n_frames:
-        raise RuntimeError("CFR source frame count unknown — refusing to plan blind")
-
-    tracks = backend.detect_faces(cfr_path)  # imgsz 960, conf 0.22, GMC + buffer 60
+    tracks: list = []
     plate_tracks: list = []
-    if caps.get("plates"):
-        # plates ride the same 3-pass law (issue #12): same sweep, same GMC
-        # tracker, same Pass-2 repair. Absent model -> faces-only, never a blocker.
-        plate_tracks = backend.detect_plates(cfr_path)
+    n_frames = 0
+    if keep_ranges:
+        # post-plan scoping law: only kept spans are decoded; hits re-indexed
+        # to SOURCE time so the render contract (`_clip_plan`) stays intact
+        tracks, plate_tracks, n_frames = _sweep_kept_ranges(backend, source, out_dir, keep_ranges)
+    else:
+        cfr_path = normalize_cfr(source, out_dir / "source_cfr.mp4")
+        legacy_n = video_n_frames(cfr_path)
+        if not legacy_n:
+            raise RuntimeError("CFR source frame count unknown — refusing to plan blind")
+        n_frames = legacy_n
+
+        tracks = backend.detect_faces(cfr_path)  # imgsz 960, conf 0.22, GMC + buffer 60
+        if caps.get("plates"):
+            # plates ride the same 3-pass law (issue #12): same sweep, same GMC
+            # tracker, same Pass-2 repair. Absent model -> faces-only, never a blocker.
+            plate_tracks = backend.detect_plates(cfr_path)
 
     # keep-primary heuristic BEFORE the merge (id collision handling intact):
     # the primary subject = the face track with the most sampled detections
@@ -1944,10 +2205,6 @@ def run_pipeline(
         _update_job(deps.sessions, job_id, JobStage.ingest, 5.0)
         asset_id = stage_ingest(source, project_id, deps)
 
-        if deps.redact_backend:
-            _update_job(deps.sessions, job_id, JobStage.redaction, 15.0)
-            stage_redaction(asset_id, source, project_id, deps)
-
         _update_job(deps.sessions, job_id, JobStage.perception, 22.0)
         transcript = stage_perception(asset_id, source, project_id, deps)
 
@@ -1985,6 +2242,14 @@ def run_pipeline(
                 )
             except Exception as e:  # noqa: BLE001 — the LLM is a director, not a dependency
                 deps.log(f"  [director] stage failed ({e}) — deterministic v1 cut rides on")
+
+        # Stage 6.7 — redaction AFTER the plan (post-plan scoping law, the
+        # operator mandate): detection pays only for footage the edit kept.
+        # A 43-min source keeping 8 min sweeps 8 min — not 77k raw frames —
+        # and two queued jobs share one sweep via the ranges cache + lock.
+        if deps.redact_backend:
+            _update_job(deps.sessions, job_id, JobStage.redaction, 44.0)
+            stage_redaction(asset_id, source, project_id, deps, timeline=timeline)
 
         _update_job(deps.sessions, job_id, JobStage.narration, 46.0)
         narration_audio: dict[str, Path] | None = None
