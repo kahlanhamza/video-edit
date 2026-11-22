@@ -19,11 +19,21 @@ up:
 down:
 	docker compose down
 
+# load the repo .env when present (shell env still wins), so a bare
+# `make api` really is a working Studio - Gladia/LLM keys wire themselves
+define uv_run_env
+@if [ -f .env ]; then \
+	uv run --env-file .env $(1); \
+else \
+	uv run $(1); \
+fi
+endef
+
 api:
-	uv run uvicorn director_os.api.main:app --reload --port 8000
+	$(call uv_run_env,uvicorn director_os.api.main:app --reload --port 8000)
 
 worker:
-	uv run celery -A director_os.worker.celery_app.celery_app worker -l info
+	$(call uv_run_env,celery -A director_os.worker.celery_app.celery_app worker -l info)
 
 render-fixture:
 	uv run director render tests/fixtures/fixture_30s.mp4 --max-seconds 12 --preset 360p

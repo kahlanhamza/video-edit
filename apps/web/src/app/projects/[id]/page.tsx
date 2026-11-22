@@ -505,8 +505,8 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
               ))}
               {sources.length === 0 && (
                 <li className="text-sm text-slate-500">
-                  no sources yet — create a case with video URLs (auto-discover
-                  on), or POST /projects/{id}/sources
+                  no sources yet — attach one below (a link, pasted notes or a
+                  file), or create a case with video URLs (auto-discover on)
                 </li>
               )}
             </ul>
