@@ -41,9 +41,26 @@ Director Studio (Next.js 16, M3)  →  FastAPI gateway + Celery/Redis orchestrat
 ```bash
 uv sync                      # resolve + install the whole workspace
 make lint type test          # ruff + mypy + pytest (unit + integration)
+cp .env.example .env         # fill in the keys you have (all optional except
+                             # DATABASE_URL when not using docker-compose)
 docker compose up -d         # postgres(pgvector) + redis + minio + api + worker
 uv run director render tests/fixtures/fixture_30s.mp4 --max-seconds 12
 ```
+
+### Run the web app locally (Director Studio)
+
+```bash
+docker compose up -d         # stack: db + redis + minio + api + worker
+cd apps/web
+npm ci                       # verified clean install (tsc 0 errors, 20/20 tests)
+npm run dev                  # -> http://localhost:3000 (Next dev server)
+```
+
+The studio talks to the API at `NEXT_PUBLIC_API_BASE` (default
+`http://localhost:8000`; served by the compose `api` service, or run it
+yourself with `make api`). Alternative without docker:
+`make api` + `make worker` still need postgres+redis — the compose stack is
+the supported local path.
 
 ## The hard-won guardrails (PLAN §9) are executable
 
