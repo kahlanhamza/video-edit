@@ -95,7 +95,7 @@ def build_nle_snapshot(sessions: sessionmaker, project_id: str, output_dir: Path
     captions = apply_caption_overrides(
         _captions(output_dir / "pipeline" / project_id), fold.caption_overrides
     )
-    clips = _clips_from_otio(otio_json)
+    clips = _clips_from_otio(otio_json, _tts_durations(output_dir / "pipeline" / project_id))
     duration = asset_facts["duration_s"] if asset_facts else 0.0
     for c in clips:
         duration = max(duration, c["end_s"])
@@ -115,7 +115,31 @@ def build_nle_snapshot(sessions: sessionmaker, project_id: str, output_dir: Path
     }
 
 
-def _clips_from_otio(otio_json: dict[str, Any] | None) -> list[dict[str, Any]]:
+def _tts_durations(pipeline_dir: Path) -> dict[str, float]:
+    """script_text -> measured TTS duration (stage_narration manifest).
+
+    Missing/corrupt manifest just means "not synthesized yet" — every clip
+    then reports tts_duration_s=None and the Studio shows the script, not a
+    wrong audio length.
+    """
+    path = pipeline_dir / "narration" / "clips.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8") or "{}")
+    except Exception:  # noqa: BLE001 — corrupt manifest must not 500 the studio
+        return {}
+    out: dict[str, float] = {}
+    for c in data.get("clips", []):
+        if isinstance(c, dict) and c.get("script_text") and c.get("duration_s"):
+            out[str(c["script_text"])] = float(c["duration_s"])
+    return out
+
+
+def _clips_from_otio(
+    otio_json: dict[str, Any] | None,
+    tts_durations: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
     """Walk EVERY track of the active version — the NLE shows all of them.
 
     `master_index` mirrors the DirectorToolbox item indexing (position on the
@@ -173,6 +197,13 @@ def _clips_from_otio(otio_json: dict[str, Any] | None) -> list[dict[str, Any]]:
                     "template": meta.get("template"),
                     "audio_mode": meta.get("audio_mode"),
                     "source_start_s": round(source_start, 3) if source_start is not None else None,
+                    # A1 audio trim: the vo window + measured stem length —
+                    # the Studio's audio trim handles do their math here
+                    "vo_in_s": meta.get("vo_in_s", 0.0) if meta else 0.0,
+                    "vo_out_s": meta.get("vo_out_s") if meta else None,
+                    "tts_duration_s": (tts_durations or {}).get(
+                        str(meta.get("script_text")) if meta else "", None
+                    ),
                 }
             )
     return clips

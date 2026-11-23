@@ -308,8 +308,8 @@ def test_openai_schemas_available(timeline):
     reg = build_director_registry(DirectorToolbox(timeline, PROJECT))
     schemas = reg.openai_schemas()
     assert (
-        len(schemas) == 15
-    )  # 12 legacy (incl. M5 insert_raw/add_narration) + zoom/freeze/audio-mode polish
+        len(schemas) == 16
+    )  # 12 legacy (incl. M5 insert_raw/add_narration) + 3 polish + trim_audio
     fn = next(s for s in schemas if s["function"]["name"] == "timeline.switch_camera")
     assert fn["function"]["parameters"]["properties"]["angle_asset_id"]["type"] == "string"
     add_fn = next(s for s in schemas if s["function"]["name"] == "narration.add")

@@ -99,6 +99,10 @@ class SegmentRenderSpec(BaseModel):
     # windows concatenated under ONE continuous TTS block; the list rides the
     # cache key so a re-planned cut re-renders exactly these segments.
     broll_windows: list[tuple[float, float]] | None = None
+    # --- A1 audio trim: the VO window inside the TTS stem. Part of the cache
+    # key (plain model fields) so a trim re-renders exactly this block.
+    vo_in_s: float = Field(default=0.0, ge=0.0)
+    vo_out_s: float | None = Field(default=None, ge=0.0)
 
 
 def segment_hash(spec: SegmentRenderSpec) -> str:

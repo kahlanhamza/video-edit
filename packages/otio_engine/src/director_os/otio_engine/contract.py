@@ -22,10 +22,14 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from director_os.core.models import BBox, BlurRegion, ZoomKeyframe
-from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError, model_validator
 
 METADATA_KEY = "director_os"
 SCHEMA_VERSION = 1
+
+# A1 audio trim law: the shortest voiceover window a trim may leave behind.
+# Under this the block cannot carry intelligible narration (one word ≈ 0.3s).
+VO_MIN_WINDOW_S = 0.5
 
 
 class JLCut(BaseModel):
@@ -79,6 +83,34 @@ class NarratorClipMeta(BaseModel):
     broll_audio_volume: float = 0.0
     jl_cut: JLCut | None = None
     act_name: str | None = None  # 6-act documentary marker (M5 Director session)
+    # A1 audio-block trim law: the in/out points WITHIN the synthesized TTS
+    # stem. None (vo_out_s) rides the full clip. Trimming re-cuts the
+    # voiceover itself — dead air, false starts, trailing tails — while the
+    # b-roll windows re-cycle underneath; the segment hash changes, so only
+    # this block re-renders. The window is the single source of truth for
+    # `retime_narration_to_tts` (block duration = vo window + tail pad).
+    vo_in_s: float = Field(default=0.0, ge=0.0)
+    vo_out_s: float | None = Field(default=None, ge=0.0)
+
+    @model_validator(mode="after")
+    def _vo_window_sane(self) -> NarratorClipMeta:
+        if self.vo_out_s is not None and self.vo_out_s <= self.vo_in_s:
+            raise ValueError(f"vo_out_s ({self.vo_out_s}s) must be > vo_in_s ({self.vo_in_s}s)")
+        if self.vo_out_s is not None and (self.vo_out_s - self.vo_in_s) < VO_MIN_WINDOW_S:
+            raise ValueError(
+                f"vo window [{self.vo_in_s}, {self.vo_out_s}]s is shorter than the "
+                f"{VO_MIN_WINDOW_S}s minimum — a block that short cannot carry narration"
+            )
+        return self
+
+    def vo_window(self, tts_duration_s: float) -> tuple[float, float]:
+        """Effective (in, out) window inside a TTS stem of `tts_duration_s`.
+
+        Untrimmed blocks ride [0, full]; out is clamped to the stem so a
+        stale trim on a re-synthesized (shorter) clip can never overrun.
+        """
+        out = self.vo_out_s if self.vo_out_s is not None else tts_duration_s
+        return (min(self.vo_in_s, max(0.0, tts_duration_s)), min(out, tts_duration_s))
 
 
 class CardMeta(BaseModel):

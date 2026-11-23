@@ -73,6 +73,30 @@ def _broll_concat_prelude(
     return cmd, graph
 
 
+def narration_trim_chain(spec: SegmentRenderSpec, dur: float) -> str:
+    """Exact VO window filter chain for a trimmed A1 audio block.
+
+    atrim cuts the stem sample-exact at both edges (input-seek cannot: mp3
+    frames are ~26ms and a mid-word start would click), asetpts re-bases
+    timestamps so the trimmed stem rides from 0, and 10ms in/out fades kill
+    the click a hard cut leaves at a waveform discontinuity. The out fade
+    sits at min(vo_len, block dur) - fade: the block may carry a tail pad
+    longer than the trimmed window, and the fade must land on the AUDIO's
+    last sample, not on the block's.
+    """
+    vo_len = (spec.vo_out_s if spec.vo_out_s is not None else dur) - spec.vo_in_s
+    fade = 0.01
+    parts = []
+    if spec.vo_out_s is not None:
+        parts.append(f"atrim=start={spec.vo_in_s:.6f}:end={spec.vo_out_s:.6f}")
+    else:
+        parts.append(f"atrim=start={spec.vo_in_s:.6f}")
+    parts.append("asetpts=N/SR/TB")
+    parts.append(f"afade=t=in:st=0:d={fade}")
+    parts.append(f"afade=t=out:st={max(0.0, min(vo_len, dur) - fade):.6f}:d={fade}")
+    return ",".join(parts)
+
+
 def build_segment_cmd(
     spec: SegmentRenderSpec,
     src_path: str | None,
@@ -131,6 +155,7 @@ def build_segment_cmd(
     #      (stage_narration, content-addressed) when one was persisted.
     two_bus = bool(spec.enhanced_audio_path) and spec.kind == "raw"
     narration_audio = bool(spec.narration_audio_path) and spec.kind == "narration"
+    narration_vo_trim = narration_audio and (spec.vo_out_s is not None or spec.vo_in_s > 0.0)
     silence_needed = (spec.kind == "narration" and not narration_audio) or (
         not src_has_audio and not two_bus and spec.kind == "raw"
     )
@@ -142,7 +167,10 @@ def build_segment_cmd(
         audio_input_idx = enhanced_idx
     elif narration_audio:
         # voiceover stem rides from 0 — narration segments are authored to the
-        # TTS clip's timeline (the persisted clip IS the source of truth)
+        # TTS clip's timeline (the persisted clip IS the source of truth).
+        # A trimmed VO window (A1 audio trim) decode-trims the stem instead of
+        # input-seeking: mp3 input-seek lands on frame boundaries (~26ms) and
+        # atrim is sample-exact at both edges.
         audio_input_idx = n_inputs
         cmd += ["-i", str(spec.narration_audio_path)]
     elif silence_needed:
@@ -170,6 +198,8 @@ def build_segment_cmd(
     if two_bus:
         # anti-click micro-fades at the cut seams of this slice
         cmd += ["-af", segment_fade_chain(dur)]
+    elif narration_audio and narration_vo_trim:
+        cmd += ["-af", narration_trim_chain(spec, dur)]
     elif spec.audio_filters and spec.kind == "raw":
         cmd += ["-af", ",".join(spec.audio_filters)]
     cmd += ["-ar", str(a.sample_rate), "-ac", str(a.channels)]

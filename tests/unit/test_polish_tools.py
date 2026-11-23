@@ -171,4 +171,4 @@ def test_registry_now_has_15_tools(registry):
         "timeline.set_freeze_callout",
         "timeline.set_audio_mode",
     } <= names
-    assert len(names) == 15  # 12 legacy + 3 polish
+    assert len(names) == 16  # 12 legacy + 3 polish + timeline.trim_audio

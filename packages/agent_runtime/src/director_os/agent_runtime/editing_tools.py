@@ -302,6 +302,50 @@ class DirectorToolbox:
         meta["script_text"] = script_text
         return {"ok": True, "detail": f"narration {item_index} -> {script_text[:48]!r}"}
 
+    def trim_audio(
+        self,
+        item_index: int,
+        vo_in_s: float = 0.0,
+        vo_out_s: float | None = None,
+    ) -> dict[str, Any]:
+        """Trim an A1 audio block: set the VO window INSIDE the TTS stem.
+
+        This is the audio track's trim (the V1 twin is `trim_clip`): the
+        in-point skips leading dead air / false starts, the out-point cuts
+        trailing tails. The window rides the clip metadata (segment hash
+        changes), so only this block re-renders; `retime_narration_to_tts`
+        sizes the block to the window + tail pad at the next render prep.
+        Pass vo_out_s=None to release a previous out-point (rides to the
+        stem end); vo_in_s=0 + vo_out_s=None restores the full stem.
+        """
+        clip = _master_clip(self.timeline, item_index)
+        meta = clip.metadata.get("director_os")
+        if not meta or meta.get("kind") != "narration":
+            raise ToolOperationError(
+                f"clip {item_index} is a {meta.get('kind') if meta else 'bare'} clip, "
+                "not a narration clip — audio trim only applies to A1 VO blocks"
+            )
+        if vo_in_s < 0:
+            raise ToolOperationError("vo_in_s must be >= 0")
+        if vo_out_s is not None and vo_out_s <= 0:
+            raise ToolOperationError("vo_out_s must be > 0 (None rides to the stem end)")
+        window = NarratorClipMeta(
+            script_text=str(meta.get("script_text", "")),
+            vo_in_s=round(float(vo_in_s), 3),
+            vo_out_s=round(float(vo_out_s), 3) if vo_out_s is not None else None,
+        )
+        # merged re-validation (NOT model_copy(update=) — that skips validators
+        # and could smuggle a stale window past the contract law)
+        narr = NarratorClipMeta.model_validate(
+            {**meta, "vo_in_s": window.vo_in_s, "vo_out_s": window.vo_out_s}
+        )
+        attach(clip, narr)
+        out = "end" if narr.vo_out_s is None else f"{narr.vo_out_s:.2f}"
+        return {
+            "ok": True,
+            "detail": f"audio {item_index} vo window -> [{narr.vo_in_s:.2f}, {out}]s",
+        }
+
     def add_narration(
         self, item_index: int, script_text: str, broll_audio_volume: float = 0.0
     ) -> dict[str, Any]:
@@ -754,6 +798,15 @@ def build_director_registry(toolbox: DirectorToolbox) -> ToolRegistry:
         lambda **kw: toolbox.set_narration_text(**kw),
     )
     reg.register(
+        "timeline.trim_audio",
+        "Trim an A1 audio block's VO window (in/out points INSIDE the TTS stem). "
+        "vo_in_s skips leading dead air / false starts; vo_out_s cuts the tail; "
+        "vo_out_s null rides to the stem end. The block re-sizes to the window "
+        "+ tail pad on the next render — only this segment re-renders.",
+        _TrimAudioInput,
+        lambda **kw: toolbox.trim_audio(**kw),
+    )
+    reg.register(
         "narration.add",
         "Convert a raw master clip into a NARRATION clip: your voiceover script "
         "replaces the clip's source audio while the same window plays as muted "
@@ -843,6 +896,12 @@ class _SplitInput(BaseModel):
 class _MoveInput(BaseModel):
     from_index: int = Field(ge=0)
     to_index: int = Field(ge=0)
+
+
+class _TrimAudioInput(BaseModel):
+    item_index: int = Field(..., ge=0)
+    vo_in_s: float = Field(default=0.0, ge=0.0)
+    vo_out_s: float | None = Field(default=None, ge=0.0)
 
 
 class _NarrationInput(BaseModel):

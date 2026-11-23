@@ -260,6 +260,8 @@ def compile_timeline(
                 narration_text=meta.script_text,
                 narration_audio_path=narr_path,
                 narration_audio_digest=narr_digest,
+                vo_in_s=meta.vo_in_s,
+                vo_out_s=meta.vo_out_s,
                 broll_windows=(
                     [(float(w0), float(w1)) for w0, w1 in meta.broll_windows]
                     if meta.broll_windows

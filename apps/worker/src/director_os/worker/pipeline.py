@@ -385,7 +385,15 @@ def retime_narration_to_tts(timeline, narration_clips: list[dict]) -> int:
         if sr is None:
             continue
         pad = min(max(0.2, NARR_TAIL_PAD_S), 3.0)
-        new_dur = max(2.0, tts_dur + pad)
+        if meta.vo_out_s is not None or meta.vo_in_s > 0:
+            # A1 audio trim: the block rides the TRIMMED vo window, never the
+            # full stem (a trim that cuts the block to 1s must stay 1s — the
+            # 2s floor below exists only to rescue short UNtrimmed estimates).
+            vo_in, vo_out = meta.vo_window(tts_dur)
+            win = max(0.0, vo_out - vo_in)
+            new_dur = max(0.1, win + pad)
+        else:
+            new_dur = max(2.0, tts_dur + pad)
         rate = sr.duration.rate
         item.source_range = ot_time.TimeRange(
             start_time=sr.start_time,
