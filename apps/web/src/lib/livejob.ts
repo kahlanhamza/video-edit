@@ -66,8 +66,10 @@ function upsertStep(steps: JobStep[], incoming: JobStep): JobStep[] {
 export function liveJobReducer(state: LiveJobState, ev: LiveEvent): LiveJobState {
   switch (ev.type) {
     case "connected":
-      if (state.connected) return state;
-      return { ...state, connected: true };
+      // a (re)opened stream means a run is in flight again — the terminal
+      // `done` latch from a previous failed run must clear (resume law)
+      if (state.connected && !state.done) return state;
+      return { ...state, connected: true, done: false };
     case "disconnected":
       if (!state.connected) return state;
       return { ...state, connected: false };

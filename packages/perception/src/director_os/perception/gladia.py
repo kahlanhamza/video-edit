@@ -72,9 +72,31 @@ class GladiaClient:
         if not audio_path.exists():
             raise GladiaError(f"audio file missing: {audio_path}")
 
-        audio_url = self._upload(audio_path)
-        job_id = self._create_job(audio_url, language=language)
-        payload = self._poll_result(job_id)
+        audio_url = self.upload(audio_path)
+        job_id = self.create_job(audio_url, language=language)
+        payload = self.fetch_result(job_id)
+        return self.normalize(payload, asset_id)
+
+    # --- public primitives (the ASR cache composes these so a retry adopts an
+    # existing transcription instead of re-uploading the same bytes) ---
+    def upload(self, audio_path: Path) -> str:
+        """`POST /v2/upload` -> {audio_url}."""
+        return self._upload(Path(audio_path))
+
+    def create_job(self, audio_url: str, language: str | None = None) -> str:
+        """`POST /v2/transcription` -> {id} (async job)."""
+        return self._create_job(audio_url, language=language)
+
+    def fetch_result(self, transcription_id: str) -> dict:
+        """Poll an EXISTING transcription id until done; return the raw payload.
+
+        This is the 'gladia already has it' path: given a persisted id, the
+        finished result is fetched without any new upload.
+        """
+        return self._poll_result(str(transcription_id))
+
+    def normalize(self, payload: dict, asset_id: str) -> Transcript:
+        """Provider payload -> canonical `Transcript` (reusable per asset)."""
         return self._normalize(payload, asset_id)
 
     def _upload(self, audio_path: Path) -> str:

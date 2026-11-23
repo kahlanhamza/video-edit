@@ -13,6 +13,7 @@ editor agent needs against the measured post-FX artifacts of a project:
   audio.speech_spans            VAD speech spans (cached compute, resumable)
   captions.propose_tag_window   owner-law proposals -> proposals_v1.json
   timeline.list_items           master-track inventory of the working timeline
+  frame.grab                    ONE frame of the master at t_s as JPEG (LRU-cached)
   agent.finish                  terminal session summary marker
 
 Every input is a Pydantic model (the registry validates BEFORE the tool runs).
@@ -98,6 +99,36 @@ def _probe_dur(path: Path) -> float | None:
         return None
 
 
+def _probe_fps(path: Path) -> float | None:
+    """Stream frame rate as a float (parses ffprobe's `30000/1001` form)."""
+    try:
+        out = (
+            subprocess.check_output(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=r_frame_rate",
+                    "-of",
+                    "csv=p=0",
+                    str(path),
+                ],
+                timeout=30,
+            )
+            .decode()
+            .strip()
+        )
+        if "/" in out:
+            num, den = out.split("/", 1)
+            return round(float(num) / float(den), 3)
+        return round(float(out), 3)
+    except Exception:  # noqa: BLE001 — missing binary/file: report None
+        return None
+
+
 def _load_or_compute_spans(work_dir: Path) -> list[tuple[float, float]]:
     """VAD speech spans, cached to vad_spans_cache.json (resumable)."""
     cache = work_dir / "vad_spans_cache.json"
@@ -132,6 +163,13 @@ def _load_or_compute_spans(work_dir: Path) -> list[tuple[float, float]]:
 # ---------------------------------------------------------------- inputs
 class _Empty(BaseModel):
     pass
+
+
+class _FrameGrab(BaseModel):
+    """Frame-addressable evidence: ONE frame at a timestamp, as an image."""
+
+    t_s: float = Field(ge=0.0, le=24 * 3600.0)
+    width: int = Field(default=640, ge=64, le=1920)
 
 
 class _Window(BaseModel):
@@ -280,6 +318,40 @@ def register_inspection_tools(registry: ToolRegistry, work_dir: Path) -> None:
             )
         return items[item_index]
 
+    def frame_grab(t_s: float, width: int) -> dict[str, Any]:
+        """Frame-addressable evidence — the owner's frame-by-frame law.
+
+        Extracts ONE frame of the working master at `t_s` as a JPEG (LRU
+        cache: repeated grabs of the same frame are free). Use it to LOOK at
+        a specific frame before acting on it — an edit proposal that names a
+        frame must be grounded in that frame, not guessed from a time range.
+        """
+        master = work_dir / "master_postfx_v4.mp4"
+        if not master.exists():
+            # fall back to any assembled master in the work dir
+            candidates = sorted(work_dir.glob("master*.mp4"))
+            if not candidates:
+                raise ToolOperationError(
+                    f"no master video in work dir to grab frames from ({work_dir})"
+                )
+            master = candidates[0]
+        from director_os.core.frames import FrameGrabError, grab_frame
+
+        try:
+            frame = grab_frame(master, t_s, cache_dir=work_dir / "frames", width=width)
+        except FrameGrabError as e:
+            raise ToolOperationError(str(e)) from e
+        fps = _probe_fps(master) or 30.0
+        return {
+            "frame_path": str(frame),
+            "t_s": round(t_s, 3),
+            "frame_no": int(t_s * fps) + 1,  # 1-indexed like an NLE timecode
+            "fps": fps,
+            "width": width,
+            "bytes": frame.stat().st_size,
+            "note": "frame extracted; open frame_path to inspect pixels before editing",
+        }
+
     def _master_inventory() -> list[dict[str, Any]]:
         if not REG_TIMELINE:
             raise ToolOperationError("no working timeline bound")
@@ -393,6 +465,15 @@ def register_inspection_tools(registry: ToolRegistry, work_dir: Path) -> None:
         "narration script, blur regions, audio mode) — read before mutating.",
         _Index,
         lambda **kw: timeline_get_item(**kw),
+    )
+    registry.register(
+        "frame.grab",
+        "Extract ONE frame of the working master at timestamp t_s as a JPEG "
+        "(LRU-cached, cheap). Use it to LOOK at the exact frame an edit "
+        "targets — frame-grounded decisions, not blind time-range guesses. "
+        "Returns frame_path + frame_no (1-indexed NLE timecode).",
+        _FrameGrab,
+        lambda **kw: frame_grab(**kw),
     )
     registry.register(
         "agent.finish",

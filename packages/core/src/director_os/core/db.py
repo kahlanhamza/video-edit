@@ -203,6 +203,32 @@ class CaseDossierRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class ASRCacheRow(Base):
+    """Content-addressed external-ASR job cache — never upload the same bytes twice.
+
+    Gladia keeps a finished transcription addressable by id for a retention
+    window, so re-uploading identical media to re-run ASR is pure waste (and
+    re-billed). This row remembers (content sha256 -> provider job id, status,
+    normalized payload) so a retry ADOPTS the existing transcription instead
+    of paying for the upload again:
+
+    - status=processing + external_id  -> next run polls THAT id (no upload)
+    - status=done + transcript_json    -> next run is a pure local cache hit
+    - status=error                    -> provider-side failure: re-upload once
+    """
+
+    __tablename__ = "asr_cache"
+
+    provider: Mapped[str] = mapped_column(String(40), primary_key=True)
+    content_sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
+    external_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="processing")  # processing|done|error
+    language: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    transcript_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 ALL_TABLES = (
     ProjectRow,
     MediaAssetRow,
@@ -216,6 +242,7 @@ ALL_TABLES = (
     JobEventRow,
     CaseSourceRow,
     CaseDossierRow,
+    ASRCacheRow,
 )
 
 

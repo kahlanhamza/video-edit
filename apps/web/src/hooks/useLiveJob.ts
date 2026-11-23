@@ -2,8 +2,13 @@
 
 // useLiveJob — SSE subscription to /jobs/{id}/live with snapshot bootstrap and
 // exponential reconnect. Feeds every frame through the pure liveJobReducer.
+//
+// The resume law (owner 2026-11-23): Run reuses the SAME job id, so a plain
+// [jobId] dependency would never re-run the effect after a failure closed the
+// stream — "run again does nothing". `reconnect()` bumps an epoch that reopens
+// the EventSource even when the job id is unchanged.
 
-import { useCallback, useEffect, useReducer, useRef } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { api, liveSseUrl } from "@/lib/api";
 import { initialLiveJobState, liveJobReducer, LiveEvent, LiveJobState } from "@/lib/livejob";
 
@@ -14,6 +19,8 @@ export interface LiveJobHandle {
   state: LiveJobState;
   /** force a fresh snapshot (e.g. after Run dispatches a new job) */
   resync: () => void;
+  /** reopen the SSE stream even for the SAME job id (Run-again after failure) */
+  reconnect: () => void;
 }
 
 export function useLiveJob(
@@ -22,6 +29,10 @@ export function useLiveJob(
   onTimelineRevision?: (version: number, note: string) => void,
 ): LiveJobHandle {
   const [state, dispatch] = useReducer(liveJobReducer, initialLiveJobState);
+  // epoch: bumped by reconnect() to force the effect to re-run (the stream
+  // latches closed on `done` — including the failure path — and a resumed job
+  // keeps its id, so the id alone can never retrigger it)
+  const [epoch, setEpoch] = useState(0);
   const esRef = useRef<EventSource | null>(null);
   const retriesRef = useRef(0);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -40,6 +51,10 @@ export function useLiveJob(
         /* project/job may not exist yet — the SSE stream will populate */
       });
   }, [projectId, jobId]);
+
+  const reconnect = useCallback(() => {
+    setEpoch((e) => e + 1);
+  }, []);
 
   useEffect(() => {
     if (!projectId || !jobId) return;
@@ -99,9 +114,9 @@ export function useLiveJob(
       esRef.current?.close();
       esRef.current = null;
     };
-  }, [projectId, jobId, resync]);
+  }, [projectId, jobId, epoch, resync]);
 
-  return { state, resync };
+  return { state, resync, reconnect };
 }
 
 /** Map an SSE frame to a reducer event; unknown shapes are ignored loudly-ish. */

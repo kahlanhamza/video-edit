@@ -2579,19 +2579,31 @@ def make_deps(
     )
 
 
-def production_transcribe(settings: Settings | None = None) -> Callable[[Path, str], Any] | None:
+def production_transcribe(
+    settings: Settings | None = None, sessions: Any = None
+) -> Callable[[Path, str], Any] | None:
     """Gladia transcriber when GLADIA_API_KEY is configured, else None.
 
     The fleet entrypoint (`advance_job`) uses this so a real worker run
     transcribes instead of dying at perception with "no transcribe callable".
     Tests inject their own stub; production env provides the key.
+
+    With `sessions` (the pipeline's own sessionmaker) the client is wrapped in
+    the content-addressed ASR cache: identical media is NEVER re-uploaded —
+    a retry adopts the transcription Gladia already has, or serves the stored
+    payload outright.
     """
     resolved = settings or get_settings()
     if not resolved.gladia_api_key:
         return None
     from director_os.perception.gladia import GladiaClient
 
-    return GladiaClient(resolved.gladia_api_key).transcribe
+    client = GladiaClient(resolved.gladia_api_key)
+    if sessions is None:
+        return client.transcribe
+    from director_os.perception.asr_cache import CachedTranscriber
+
+    return CachedTranscriber(client, sessions).transcribe
 
 
 def advance_job(
@@ -2607,7 +2619,14 @@ def advance_job(
     Registered as a Celery task in `director_os.worker.tasks`; kept as a plain
     function here so tests and a future Temporal workflow call it unchanged.
     """
-    deps = make_deps(database_url, transcribe=production_transcribe())
+    # deps FIRST: make_deps applies the Studio credential overlay (a fresh
+    # worker process must see vault keys BEFORE any provider client resolves —
+    # the old `make_deps(..., transcribe=production_transcribe())` evaluated
+    # the transcriber before the overlay landed, so a cold worker's first job
+    # died at perception with "Gladia not configured" even with a saved key).
+    deps = make_deps(database_url)
+    if deps.transcribe is None:
+        deps.transcribe = production_transcribe(deps.settings, deps.sessions)
     # source stays a str: run_pipeline detects http(s) URLs and downloads
     # through the guardrail UA layer — Path()-wrapping here would turn a URL
     # into a bogus relative path and kill URL ingest on the fleet path.

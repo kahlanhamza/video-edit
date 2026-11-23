@@ -283,7 +283,11 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     reloadNle();
     refresh();
   }, [reloadNle, refresh]);
-  const { state: live } = useLiveJob(id, latestJob?.id ?? null, onTimelineRevision);
+  const { state: live, reconnect: reconnectLive } = useLiveJob(
+    id,
+    latestJob?.id ?? null,
+    onTimelineRevision,
+  );
 
   const prevDoneRef = useRef(false);
   useEffect(() => {
@@ -304,6 +308,9 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
           ? `Resumed job ${r.job_id.slice(0, 8)}… from where it stopped — finished stages are never redone.`
           : `Started job ${r.job_id.slice(0, 8)}… (${r.detail}).`,
       );
+      // Run reuses the failed job's id on resume — the SSE stream latched
+      // closed on the failure, so force it open even when the id is unchanged
+      reconnectLive();
       await refresh();
     } catch (e) {
       setRunNote(e instanceof Error ? e.message : String(e));

@@ -58,7 +58,7 @@ from director_os.core.db import (
 )
 from director_os.core.http import download
 from director_os.core.models import ProjectStatus
-from fastapi import FastAPI, File, HTTPException, Response, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -1090,6 +1090,61 @@ def asset_scrubsheet(asset_id: str) -> FileResponse:
     )
 
 
+@app.get("/assets/{asset_id}/frame")
+def asset_frame(
+    asset_id: str,
+    t: float = Query(default=0.0, ge=0.0),
+    w: int = Query(default=640, ge=64, le=1920),
+    src: Literal["auto", "proxy", "full"] = "auto",
+) -> FileResponse:
+    """Frame-accurate JPEG of ANY frame — the frame-by-frame primitive.
+
+    The owner law (2026-11-23): the editor (human scrubber or agent edit)
+    addresses individual frames; nothing re-renders until Export. Serves the
+    480p proxy by default (cheap, scrub-grade); `src=full` decodes the
+    original media at up to its native width. Every (t, width) is LRU-cached
+    per asset, so stepping back and forth over the same frames is free.
+    """
+    from director_os.core.frames import FrameGrabError, grab_frame
+    from director_os.core.proxy import PROXY_HEIGHT
+
+    s = session()
+    row = s.get(MediaAssetRow, asset_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="asset not found")
+    s.close()
+
+    settings = get_settings()
+    t_clamped = min(t, max(0.0, float(row.duration_s) - 0.001))
+    cache_dir = settings.output_dir / "pipeline" / row.project_id / "assets" / asset_id / "frames"
+
+    media: Path
+    width: int | None
+    if src == "full":
+        if not row.source_url or not Path(row.source_url).exists():
+            raise HTTPException(status_code=404, detail="full-res source not on disk")
+        media, width = Path(row.source_url), min(w, row.width or w)
+    else:
+        media = _proxy_file(row.r2_proxy_key, "proxy")
+        # never upscale the 480p proxy: decode native when the request covers it
+        proxy_w = (
+            int(round((row.width or 854) * PROXY_HEIGHT / (row.height or 480)))
+            if row.height
+            else 854
+        )
+        width = w if w < proxy_w else None
+
+    try:
+        frame = grab_frame(media, t_clamped, cache_dir=cache_dir, width=width)
+    except FrameGrabError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return FileResponse(
+        frame,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 # ------------------------------------------------------------------ subtitle grid (M3 close-out)
 class CueOut(BaseModel):
     index: int
@@ -1417,11 +1472,35 @@ def run_project(project_id: str, body: RunRequest | None = None) -> RunResponse:
                 .order_by(MediaAssetRow.id)
                 .limit(1)
             ).scalar_one_or_none()
-            unfinished = last is not None and (
-                last.error_message is not None or (last.progress_pct or 0.0) < 100.0
-            )
-            if unfinished and asset is not None and asset.source_url:
-                job_id, source_str, reused = last.id, asset.source_url, True  # type: ignore[union-attr]
+            # resume path: newest unfinished job + its registered media asset
+            # (inline `last is not None` keeps mypy's narrowing flowing)
+            if (
+                last is not None
+                and asset is not None
+                and asset.source_url
+                and (last.error_message is not None or (last.progress_pct or 0.0) < 100.0)
+            ):
+                job_id, source_str, reused = last.id, asset.source_url, True
+                if last.error_message is not None:
+                    # Resume = fresh attempt: clear the terminal error BEFORE
+                    # dispatch so (a) the SSE live stream does not insta-close
+                    # on the stale error and (b) the Studio shows the run as
+                    # live again. The worker's RunTracker takes over from here.
+                    last.error_message = None
+                    s.add(
+                        JobEventRow(
+                            job_id=last.id,
+                            project_id=project_id,
+                            kind="job",
+                            payload={
+                                "stage": last.current_stage,
+                                "progress_pct": round(float(last.progress_pct or 0.0), 1),
+                                "error": None,
+                                "resumed": True,
+                            },
+                        )
+                    )
+                    s.commit()
             elif asset is not None and asset.source_url:
                 # finished pipeline but a finished job exists: re-advance is
                 # harmless (every stage short-circuits) — but a fresh job is
