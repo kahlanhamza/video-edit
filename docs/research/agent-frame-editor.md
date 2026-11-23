@@ -310,6 +310,18 @@ Design rules (all inherited from verified research + our own live sessions):
    count, exported-at-rev — wired to the same run machinery (per-segment
    progress via RunTracker SSE, dirty-segment re-bake via the step-4 digest).
 
+Post-roadmap increments under the same four laws:
+
+7. **Manual box adjust** — *shipped:* `POST /ops/{op_id}/adjust` makes every
+   static blur/inpaint op human-refinable AFTER the agent (or the human) drew
+   it — a NEW op supersedes the old (append-only, `params.adjusts_op_id`
+   chain), the corrected region dual-writes BEFORE the superseded one drops
+   (privacy coverage never gaps), tracked ops honestly refuse. The Studio
+   monitor gained click-select / drag-move / corner-resize / Alt+arrow nudge
+   on top of the pure `adjustedBox()` clamp math (tape bounds, minimum
+   coverage box). The dual-modality law now covers the full op lifecycle:
+   draw → adjust → track → revoke — every hop on the log.
+
 ---
 
 ## 5. References
