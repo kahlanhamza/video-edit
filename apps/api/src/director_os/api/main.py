@@ -693,6 +693,73 @@ def timeline_nle(project_id: str) -> JSONResponse:
     return JSONResponse(snapshot)
 
 
+# --- export gate (roadmap step 6): preview is overlay-only; Export is the only render ---
+
+
+@app.get("/projects/{project_id}/export/gate")
+def export_gate(project_id: str) -> JSONResponse:
+    """The export gate state: is the program dirtier than the last bake?
+
+    `baked_ops_rev` is stamped by the RENDER ITSELF (the bake reads the ops it
+    consumed — never client-trusted); `dirty` = the op log has advanced past
+    it. One button semantics: the Studio renders this state next to Export.
+    """
+    from director_os.core.db import PerceptionIndexRow
+
+    s = session()
+    try:
+        if s.get(ProjectRow, project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        from director_os.core.db import TimelineOpRow
+        from sqlalchemy import func, select
+
+        ops_rev = int(
+            s.execute(
+                select(func.max(TimelineOpRow.rev)).where(TimelineOpRow.project_id == project_id)
+            ).scalar_one()
+            or 0
+        )
+        asset = (
+            s.execute(
+                select(MediaAssetRow)
+                .where(MediaAssetRow.project_id == project_id)
+                .order_by(MediaAssetRow.id)
+                .limit(1)
+            )
+            .scalars()
+            .first()
+        )
+        baked_ops_rev = None
+        if asset is not None:
+            prow = s.get(PerceptionIndexRow, asset.id)
+            baked_raw = (prow.redaction_tracks_json or {}).get("baked_ops_rev") if prow else None
+            baked_ops_rev = int(baked_raw) if baked_raw is not None else None
+        pending = 0
+        if baked_ops_rev is not None and ops_rev > baked_ops_rev:
+            pending = int(
+                s.execute(
+                    select(func.count(TimelineOpRow.id)).where(
+                        TimelineOpRow.project_id == project_id,
+                        TimelineOpRow.rev > baked_ops_rev,
+                        TimelineOpRow.kind != "revoke",
+                    )
+                ).scalar_one()
+                or 0
+            )
+        dirty = baked_ops_rev is None or ops_rev > baked_ops_rev
+        return JSONResponse(
+            {
+                "ops_rev": ops_rev,
+                "baked_ops_rev": baked_ops_rev,
+                "dirty": dirty,
+                "pending_ops": pending,
+                "exported_once": baked_ops_rev is not None,
+            }
+        )
+    finally:
+        s.close()
+
+
 # --- chat agent v2 (roadmap step 5): one bounded orchestrator turn -------------
 
 

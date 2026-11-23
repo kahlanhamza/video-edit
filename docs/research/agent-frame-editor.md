@@ -302,8 +302,13 @@ Design rules (all inherited from verified research + our own live sessions):
    dispatched), never-an-empty-reply (deterministic fallback), critic gate =
    qa.self_audit. API `POST /projects/{id}/agent/chat`; Studio ChatPanel shows
    every call with ok badges + critic verdict (no black box).
-6. **Export gate UI**: one button, dirty-segment compile, progress per
-   segment (RunTracker steps already give per-step bars).
+6. **Export gate** — *shipped:* the bake STAMPS its op cursor server-side
+   (`redaction_tracks_json.baked_ops_rev` — written by the render that
+   consumed the ops, never client-trusted); `GET /projects/{id}/export/gate`
+   reports dirty/pending (tombstones advance the cursor, never count as
+   pending); the Studio top bar shows ONE Export button — dirty state, pending
+   count, exported-at-rev — wired to the same run machinery (per-segment
+   progress via RunTracker SSE, dirty-segment re-bake via the step-4 digest).
 
 ---
 

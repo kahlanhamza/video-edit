@@ -1035,7 +1035,7 @@ def _tracked_redacted_source(
         render_tracked_redaction,
     )
 
-    with_ops = _render_plan_with_ops(deps, project_id, payload)
+    with_ops = _render_plan_with_ops(deps, project_id, payload, asset_id)
     if with_ops is None:
         return None
     plan, digest = with_ops
@@ -1075,6 +1075,7 @@ def _render_plan_with_ops(
     deps: PipelineDeps,
     project_id: str,
     payload: dict,
+    asset_id: str = "",
 ) -> tuple[PerFrameRedaction, str] | None:
     """The plan the render bakes: sweep plan + tracked op paths (step 4).
 
@@ -1112,8 +1113,33 @@ def _render_plan_with_ops(
             .all()
         )
         op_rows = [(str(r.id), dict(r.params or {})) for r in rows]
+        # the export gate cursor: the highest op rev in the project (ANY kind)
+        # — every later op event (propose/revoke/caption) makes it stale
+        from sqlalchemy import func
+
+        max_rev = int(
+            s.execute(
+                select(func.max(TimelineOpRow.rev)).where(TimelineOpRow.project_id == project_id)
+            ).scalar_one()
+            or 0
+        )
 
     merged, changed = merge_op_params(plan, [params for _id, params in op_rows])
+
+    # export-gate stamp: THIS render consumed the op state up to max_rev —
+    # the Studio's Export button reads it (dirty = fold rev > stamped rev)
+    if asset_id and max_rev:
+        with deps.sessions() as s:
+            prow = s.get(PerceptionIndexRow, asset_id)
+            if prow is None:
+                prow = PerceptionIndexRow(asset_id=asset_id)
+                s.add(prow)
+            prow.redaction_tracks_json = {
+                **(prow.redaction_tracks_json or {}),
+                "baked_ops_rev": max_rev,
+            }
+            s.commit()
+
     if not changed:
         return plan, digest
     op_fingerprint = hashlib.sha256(
@@ -1268,7 +1294,7 @@ def _baked_clip_sources(
         payload = (row.redaction_tracks_json or {}) if row else {}
     if deps.redact_backend != "tracked":
         return {}, {}
-    with_ops = _render_plan_with_ops(deps, project_id, payload)
+    with_ops = _render_plan_with_ops(deps, project_id, payload, asset_id)
     if with_ops is None:
         return {}, {}
     plan, digest = with_ops

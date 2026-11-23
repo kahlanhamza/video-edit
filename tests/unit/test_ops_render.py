@@ -201,3 +201,25 @@ def test_render_plan_op_edit_changes_digest(deps, sessions):
         s.commit()
     d2 = _render_plan_with_ops(deps, "p1", _payload())[1]
     assert d1 != d2
+
+
+def test_render_plan_stamps_baked_ops_rev(deps, sessions, tmp_path):
+    """The bake stamps the export-gate cursor INTO the payload — never client-trusted."""
+    from director_os.core.db import PerceptionIndexRow
+
+    with sessions() as s:
+        s.add(
+            TimelineOpRow(
+                project_id="p1",
+                kind="blur",
+                params=_op_params([(100, 60, 28, 28)] * 10),
+                origin="agent",
+            )
+        )
+        s.add(PerceptionIndexRow(asset_id="a1", redaction_tracks_json={"regions": []}))
+        s.commit()
+    out = _render_plan_with_ops(deps, "p1", _payload(), asset_id="a1")
+    assert out is not None
+    with sessions() as s:
+        prow = s.get(PerceptionIndexRow, "a1")
+        assert prow.redaction_tracks_json["baked_ops_rev"] == 1

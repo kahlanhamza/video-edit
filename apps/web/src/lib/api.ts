@@ -138,6 +138,14 @@ export interface OpRecord {
   created_at: string;
 }
 
+export interface ExportGate {
+  ops_rev: number;
+  baked_ops_rev: number | null;
+  dirty: boolean;
+  pending_ops: number;
+  exported_once: boolean;
+}
+
 export interface OpsState {
   project_id: string;
   rev: number;
@@ -525,6 +533,15 @@ export const api = {
       body: JSON.stringify(body),
     }),
   getOp: (opId: string) => req<OpRecord>(`/ops/${opId}`),
+  // --- export gate (step 6): the render stamps the cursor server-side ---
+  exportGate: (id: string) =>
+    req<{
+      ops_rev: number;
+      baked_ops_rev: number | null;
+      dirty: boolean;
+      pending_ops: number;
+      exported_once: boolean;
+    }>(`/projects/${id}/export/gate`),
   selectionBackends: () =>
     req<Record<string, boolean>>(`/selection/backends`),
   // --- WS4: multi-source case ingest + CaseDossier

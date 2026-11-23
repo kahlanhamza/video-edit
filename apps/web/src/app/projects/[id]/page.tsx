@@ -33,6 +33,7 @@ import {
   DispatchResult,
   Job,
   NleTimeline,
+  ExportGate,
   Project,
   TimelineState,
 } from "@/lib/api";
@@ -197,6 +198,7 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
   const [timeline, setTimeline] = useState<TimelineState | null>(null);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [nle, setNle] = useState<NleTimeline | null>(null);
+  const [gate, setGate] = useState<ExportGate | null>(null);
   const [playheadS, setPlayheadS] = useState(0);
   const [view, setView] = useState<LeftView>("media");
   const [dispatchLog, setDispatchLog] = useState<DispatchResult[]>([]);
@@ -253,6 +255,12 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
       setNle(await api.nleTimeline(id));
     } catch {
       setNle(null); // 404 = no timeline yet
+    }
+    // export gate rides the same refetch cycle (ops stream + live.done)
+    try {
+      setGate(await api.exportGate(id));
+    } catch {
+      /* gate state is additive — never blocks the page */
     }
   }, [id]);
 
@@ -531,6 +539,25 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
 
         <div className="flex-1" />
 
+        {/* export gate (step 6): the ONLY render — dirty state lives on the
+            server (baked_ops_rev stamped by the bake), never client-trusted */}
+        <button
+          className={gate?.dirty ? "btn" : "btn-ghost"}
+          onClick={runOrResume}
+          disabled={runBusy || running}
+          title={
+            gate?.exported_once
+              ? gate?.dirty
+                ? `${gate.pending_ops} op event(s) since the last export — re-export re-bakes only the dirty segments`
+                : `Exported at op rev ${gate.baked_ops_rev} — the program on screen is what is on disk`
+              : "First export: bakes the program (tracked ops + blur regions) into the deliverable"
+          }
+        >
+          <Icon name="media" size={11} />
+          {gate?.dirty || !gate?.exported_once
+            ? `Export${gate && gate.exported_once && gate.pending_ops > 0 ? ` · ${gate.pending_ops} new` : ""}`
+            : "Exported ✓"}
+        </button>
         <button className="btn" onClick={runOrResume} disabled={runBusy}>
           <Icon name="play" size={11} />
           {runBusy
