@@ -2,7 +2,7 @@
 // No DOM, no React: components/studio/Timeline.tsx renders what these
 // functions derive, so zoom/geometry semantics stay unit-tested.
 
-import { NleClip } from "./api";
+import { NleCaption, NleClip, NleTimeline } from "./api";
 
 export interface NleLane {
   id: string;
@@ -330,4 +330,86 @@ export function effectWindowFrames(
   const frame_start = current.start ?? 0;
   if (frame_end <= frame_start) return null;
   return { frame_start, frame_end };
+}
+
+// --- program-monitor engine (timeline-true preview) ---------------------------
+//
+// The monitor plays the 480p proxy of the SAME source asset, but the tape it
+// follows is the TIMELINE: program seconds map into each master clip's source
+// window, narration blocks ride their muted b-roll windows, and the raw audio
+// is ducked by the block's broll_audio_volume — a preview that lies about the
+// cut is worse than no preview (studio acceptance: the raw 43-min proxy used
+// to play whatever the source had at that second).
+
+const EPS = 1e-6;
+
+/** Master-track clips with a source window (raw + narration), timeline order.
+ *  Cards are overlays, not the program video; clips without a source window
+ *  cannot be played and are skipped (the gap engine handles the hole). */
+export function programClips(nle: NleTimeline | null | undefined): NleClip[] {
+  if (!nle) return [];
+  return nle.clips
+    .filter((c) => c.track === "V1_master" && c.source_start_s != null)
+    .sort((a, b) => a.start_s - b.start_s);
+}
+
+/** The master clip whose window contains program time t (null = a gap). */
+export function clipAt(clips: NleClip[], t: number): NleClip | null {
+  for (const c of clips) if (t >= c.start_s - EPS && t < c.end_s - EPS) return c;
+  return null;
+}
+
+/** The first master clip starting at or after t (null = nothing ahead). */
+export function clipAfter(clips: NleClip[], t: number): NleClip | null {
+  for (const c of clips) if (c.start_s >= t - EPS) return c;
+  return null;
+}
+
+/** Source-footage seconds for program time t inside `clip` (null = outside). */
+export function sourceTimeAt(clip: NleClip, t: number): number | null {
+  if (t < clip.start_s - EPS || t > clip.end_s + EPS) return null;
+  const srcIn = clip.source_start_s ?? 0;
+  return srcIn + clamp(t - clip.start_s, 0, clip.dur_s);
+}
+
+/**
+ * Source-footage seconds at program time t, following the renderer's
+ * multi-b-roll cycle for narration blocks (renderer.build_segment_cmd):
+ * with >= 2 meta windows the concat plays broll_windows[0] (input 0 is
+ * sliced at the META window, not the clip range), then windows[1..N],
+ * the sequence repeating `cycles = ceil(dur / max(0.5, total))` times and
+ * hard-cut at dur. With fewer windows the clip's own source range plays.
+ */
+export function brollSourceAt(clip: NleClip, t: number): number | null {
+  if (sourceTimeAt(clip, t) === null) return null;
+  const tau = clamp(t - clip.start_s, 0, clip.dur_s);
+  const meta = clip.broll_windows ?? [];
+  const windows: [number, number][] =
+    meta.length >= 2
+      ? meta
+      : [[clip.source_start_s ?? 0, (clip.source_start_s ?? 0) + clip.dur_s]];
+  const total = windows.reduce((a, [w0, w1]) => a + Math.max(0.1, w1 - w0), 0);
+  const cycles = Math.max(1, Math.ceil(clip.dur_s / Math.max(0.5, total)));
+  let acc = 0;
+  for (let c = 0; c < cycles; c++) {
+    for (const [w0, w1] of windows) {
+      const len = Math.max(0.1, w1 - w0);
+      if (tau < acc + len) return w0 + (tau - acc);
+      acc += len;
+    }
+  }
+  const [w0] = windows[windows.length - 1];
+  return w0 + (tau - acc); // tail past the sequence: hold the last window
+}
+
+/** The caption cue on screen at program time t (ms compare, null = none). */
+export function captionAt(
+  captions: NleCaption[],
+  t: number,
+): NleCaption | null {
+  const ms = t * 1000;
+  for (const cue of captions) {
+    if (ms >= cue.start_ms - 1 && ms <= cue.end_ms + 1) return cue;
+  }
+  return null;
 }

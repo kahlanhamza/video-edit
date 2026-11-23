@@ -276,19 +276,44 @@ def test_full_pipeline_two_bus_render_is_clean_and_proven(noisy_bodycam, project
         )
 
 
-def test_missing_enhancer_fails_loudly_never_silently(noisy_bodycam, project, deps, monkeypatch):
-    """No neural enhancer available + auto resolution => stage refuses, job parks."""
+def test_missing_enhancer_skips_loudly_never_silently(
+    noisy_bodycam, project, deps, monkeypatch
+):
+    """No neural enhancer available + auto resolution => the audio_prep step
+    is SKIPPED (loudly — the step row + console say why and how to upgrade),
+    the raw clips downgrade to loudnorm, and the job still reaches the human
+    gate. The operator installs deep-filter (scripts/fetch_deep_filter.py)
+    and presses Run again — finished stages are never redone. The old law
+    (hard pipeline death at 52%) made every machine without the binary
+    unusable; the skip keeps the no-SILENT-fallback promise via visibility,
+    not via a dead render."""
     from director_os.audio_engine.enhance import EnhancerUnavailableError
+    from director_os.core.db import JobStepRow
 
     monkeypatch.setenv("DEEPFILTER_BIN", "/definitely/not/here")
     monkeypatch.setattr(shutil, "which", lambda _name: None)
     deps.speech_enhancer = None
-    with pytest.raises(EnhancerUnavailableError):
-        run_pipeline(noisy_bodycam, project, deps)
+
+    def _no_enhancer(*_a, **_kw):
+        raise EnhancerUnavailableError("deep-filter CLI not found (test machine)")
+
+    import director_os.audio_engine.enhance as enhance_mod
+
+    monkeypatch.setattr(enhance_mod, "resolve_enhancer", _no_enhancer)
+
+    result = run_pipeline(noisy_bodycam, project, deps)
+    assert result.audit.ok, "the cut must complete without an enhancer"
     with deps.sessions() as s:
         job = s.execute(select(JobRow)).scalars().one()
-        assert job.current_stage == "audio_prep"
-        assert "refusing to silently pass afftdn" in (job.error_message or "")
+        assert job.current_stage == "human_gate"
+        assert job.error_message is None
+        step = (
+            s.execute(select(JobStepRow).where(JobStepRow.key == "audio_prep"))
+            .scalars()
+            .one()
+        )
+        assert step.status == "skipped"
+        assert "loudnorm fallback" in (step.detail or "")
 
 
 def test_isolate_2bus_compile_requires_master_wav(deps, tmp_path):

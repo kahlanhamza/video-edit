@@ -104,6 +104,38 @@ endpoint: never starts a paid job), and **Save** into the server-side vault.
 Prove the whole contract in one command: `uv run python scripts/live_api_smoke.py`
 (real HTTP surface: create → run → live Gladia ASR → render → human gate).
 
+### The editor is a real NLE (timeline-true preview)
+
+- **FOLLOW mode preview**: the program monitor plays *the timeline*, not the
+  raw source — clip cuts hard-cut exactly like the render, narration blocks
+  ride their muted b-roll windows (the renderer's cycle, mirrored frame-true)
+  with the synthesized TTS stem on a parallel audio bus, captions burn in
+  from the cue store, and gaps show black. Toggle `raw source` to scrub the
+  untouched footage instead.
+- **Edit everything**: select a clip → trim edges (V1), drag the VO window
+  (A1), `S` split at playhead, `Delete` removes the selected clip, the `+`
+  toolbar button inserts a raw clip / narration VO / card at the playhead.
+- **Undo / Redo**: every edit checkpoints a timeline version server-side —
+  the undo arrows (and redo) move the active pointer through that history;
+  nothing is ever destroyed.
+- **B-roll is visible**: narration A1 blocks badge their b-roll windows, and
+  V1 shows the muted b-roll ghost under every voiceover.
+
+### Missing an enhancer never kills the render
+
+The 2-bus neural speech isolation needs the `deep-filter` binary. Docker
+images ship it; on a host install, run:
+
+```bash
+uv run python scripts/fetch_deep_filter.py   # downloads the release binary for YOUR OS
+# then put the printed DEEPFILTER_BIN=... line into .env and press Run again
+```
+
+Without it the pipeline still completes — the `audio_prep` step is *skipped
+loudly* (visible in the pipeline panel + console, raw clips fall back to
+loudnorm) and installing the binary later upgrades the audio without redoing
+finished stages.
+
 ### Developer path (no Docker, hot reload)
 
 ```bash
@@ -150,6 +182,7 @@ Every R&D bug is a CI test — see `tests/unit/test_g1..g8`:
 | Script | Purpose |
 | --- | --- |
 | `scripts/live_api_smoke.py` | **Studio-flow e2e**: real HTTP surface — create case with video link + HTML/PDF sources → `POST /run` (inline dispatch) → live Gladia ASR → render → human gate |
+| `scripts/fetch_deep_filter.py` | One-shot installer for the `deep-filter` neural speech enhancer on host installs (Windows/Linux/macOS, prints the `DEEPFILTER_BIN` .env line) |
 | `scripts/e2e_real_video.py` | Full pipeline on REAL footage (resumable): ingest → YuNet face sweep → live Gladia ASR → render → subtitles → QA → burn-in |
 | `scripts/download_real_video.sh` | Rate-limit-aware Wikimedia download with backoff + checksum validation |
 | `scripts/demo_zoom_freeze.py` | Keyframed punch-in + freeze-callout demo over the real-footage master |

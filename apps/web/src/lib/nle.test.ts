@@ -1,20 +1,26 @@
 // Pure NLE timeline math — lane routing, timecodes, adaptive ticks, zoom.
 
 import { describe, expect, it } from "vitest";
-import { NleClip } from "./api";
+import { NleCaption, NleClip, NleTimeline } from "./api";
 import {
   buildLanes,
+  captionAt,
   clamp,
   clampZoom,
+  clipAfter,
+  clipAt,
   formatTimecode,
   formatTimecodeFrames,
   formatTimecodeShort,
   laneForClip,
+  programClips,
   rulerTicks,
   scrubBackground,
   scrubFrameCount,
   scrubFrameIndex,
   snapTime,
+  sourceTimeAt,
+  brollSourceAt,
   tickStep,
   timelineWidth,
 } from "./nle";
@@ -172,5 +178,121 @@ describe("scrubsheet math", () => {
     expect(last.backgroundPosition).toBe("100% 0%");
     const single = scrubBackground(0, 1, "/s.jpg");
     expect(single.backgroundPosition).toBe("0% 0%");
+  });
+});
+
+// --- program-monitor engine (timeline-true preview) ---------------------------
+
+function nleWith(clips: NleClip[], captions: NleCaption[] = []): NleTimeline {
+  return {
+    project_id: "p",
+    version: 1,
+    duration_s: clips.reduce((a, c) => Math.max(a, c.end_s), 0),
+    asset: null,
+    clips,
+    captions,
+    effects: [],
+  };
+}
+
+describe("programClips", () => {
+  it("keeps only master clips with a source window, in timeline order", () => {
+    const raw = clip({ name: "raw_0", start_s: 0, dur_s: 5, end_s: 5, source_start_s: 100 });
+    const narr = clip({
+      kind: "narration",
+      track: "V1_master",
+      name: "narr_1",
+      start_s: 5,
+      dur_s: 10,
+      end_s: 15,
+      source_start_s: 200,
+    });
+    const card = clip({ track: "V2_overlay_cards", kind: "card", name: "card", source_start_s: null });
+    const noSrc = clip({ name: "mystery", source_start_s: null });
+    const out = programClips(nleWith([noSrc, narr, card, raw]));
+    expect(out.map((c) => c.name)).toEqual(["raw_0", "narr_1"]);
+  });
+  it("null nle yields empty", () => {
+    expect(programClips(null)).toEqual([]);
+  });
+});
+
+describe("clipAt / clipAfter / sourceTimeAt", () => {
+  const clips = [
+    clip({ name: "a", start_s: 0, dur_s: 10, end_s: 10, source_start_s: 100 }),
+    clip({ name: "b", start_s: 20, dur_s: 5, end_s: 25, source_start_s: 0 }),
+  ];
+  it("finds the clip containing t, null in gaps", () => {
+    expect(clipAt(clips, 0)?.name).toBe("a");
+    expect(clipAt(clips, 9.9)?.name).toBe("a");
+    expect(clipAt(clips, 10)).toBeNull();
+    expect(clipAt(clips, 22)?.name).toBe("b");
+    expect(clipAt(clips, 25)).toBeNull();
+  });
+  it("finds the next clip at/after t", () => {
+    expect(clipAfter(clips, 11)?.name).toBe("b");
+    expect(clipAfter(clips, 25)).toBeNull();
+    expect(clipAfter(clips, 0)?.name).toBe("a");
+  });
+  it("maps program time into the source window, clamped at the edges", () => {
+    expect(sourceTimeAt(clips[0], 0)).toBe(100);
+    expect(sourceTimeAt(clips[0], 5)).toBe(105);
+    expect(sourceTimeAt(clips[0], 10)).toBe(110); // clamped end
+    expect(sourceTimeAt(clips[0], 20)).toBeNull(); // outside
+  });
+});
+
+describe("brollSourceAt", () => {
+  it("single-window narration rides the clip's own source window", () => {
+    const narr = clip({
+      kind: "narration",
+      start_s: 0,
+      dur_s: 10,
+      end_s: 10,
+      source_start_s: 50,
+      broll_windows: [[50, 60]],
+    });
+    expect(brollSourceAt(narr, 0)).toBe(50);
+    expect(brollSourceAt(narr, 9.5)).toBe(59.5);
+  });
+  it("cycles multi-window b-roll exactly like the renderer", () => {
+    // window0 (input0) = clip's own range [0,10]; windows[1..] = meta windows
+    const narr = clip({
+      kind: "narration",
+      start_s: 0,
+      dur_s: 30,
+      end_s: 30,
+      source_start_s: 0,
+      broll_windows: [
+        [0, 10],
+        [100, 110],
+        [200, 210],
+      ],
+    });
+    // tau 0..10 -> window0, 10..20 -> [100..110), 20..30 -> [200..210)
+    expect(brollSourceAt(narr, 0)).toBe(0);
+    expect(brollSourceAt(narr, 9.9)).toBeCloseTo(9.9, 5);
+    expect(brollSourceAt(narr, 10)).toBe(100);
+    expect(brollSourceAt(narr, 19.5)).toBeCloseTo(109.5, 5);
+    expect(brollSourceAt(narr, 20)).toBe(200);
+    expect(brollSourceAt(narr, 29)).toBeCloseTo(209, 5);
+  });
+  it("returns null outside the clip", () => {
+    const narr = clip({ kind: "narration", start_s: 5, dur_s: 10, end_s: 15, source_start_s: 0 });
+    expect(brollSourceAt(narr, 4.9)).toBeNull();
+    expect(brollSourceAt(narr, 15.1)).toBeNull();
+  });
+});
+
+describe("captionAt", () => {
+  const cues: NleCaption[] = [
+    { index: 0, start_ms: 0, end_ms: 2000, text: "hello", speaker: "Officer" },
+    { index: 1, start_ms: 3000, end_ms: 5000, text: "world", speaker: "" },
+  ];
+  it("finds the on-screen cue and null between cues", () => {
+    expect(captionAt(cues, 1)?.text).toBe("hello");
+    expect(captionAt(cues, 2.5)).toBeNull();
+    expect(captionAt(cues, 4)?.text).toBe("world");
+    expect(captionAt(cues, 9)).toBeNull();
   });
 });

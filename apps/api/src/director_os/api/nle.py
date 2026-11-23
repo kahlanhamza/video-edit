@@ -136,6 +136,17 @@ def _tts_durations(pipeline_dir: Path) -> dict[str, float]:
     return out
 
 
+def _narration_key(script_text: str) -> str | None:
+    """sha256(script_text) hex prefix — the stable key the program monitor uses
+    to stream this block's synthesized TTS stem (GET /projects/{id}/narration/
+    {key}.mp3). Survives timeline edits; a script edit simply changes the key."""
+    import hashlib
+
+    if not script_text:
+        return None
+    return hashlib.sha256(str(script_text).encode("utf-8")).hexdigest()[:24]
+
+
 def _clips_from_otio(
     otio_json: dict[str, Any] | None,
     tts_durations: dict[str, float] | None = None,
@@ -183,6 +194,29 @@ def _clips_from_otio(
                 meta = dict(getattr(item, "metadata", {}).get("director_os", {}) or {})
             except Exception:  # noqa: BLE001 — metadata-less item: empty meta
                 meta = {}
+            # B-roll truth for narration blocks: the muted source windows the
+            # renderer cycles under the voiceover. The timeline A1 lane and the
+            # program monitor both render from this — an edit without visible
+            # b-roll is indistinguishable from a bug (studio acceptance CR).
+            broll_windows: list[list[float]] | None = None
+            if kind == "narration":
+                windows: list[list[float]] = []
+                for w in meta.get("broll_windows") or []:
+                    try:
+                        w0, w1 = float(w[0]), float(w[1])
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                    if w1 > w0:
+                        windows.append([round(w0, 3), round(w1, 3)])
+                if not windows and meta.get("broll_range"):
+                    try:
+                        r0, r1 = meta["broll_range"][0], meta["broll_range"][1]
+                        if float(r1) > float(r0):
+                            windows = [[round(float(r0), 3), round(float(r1), 3)]]
+                    except (TypeError, ValueError, IndexError):
+                        windows = []
+                if windows:
+                    broll_windows = windows
             clips.append(
                 {
                     "track": track.name,
@@ -203,6 +237,19 @@ def _clips_from_otio(
                     "vo_out_s": meta.get("vo_out_s") if meta else None,
                     "tts_duration_s": (tts_durations or {}).get(
                         str(meta.get("script_text")) if meta else "", None
+                    ),
+                    # b-roll (narration): muted source windows + their volume
+                    "broll_windows": broll_windows,
+                    "broll_audio_volume": (
+                        float(meta.get("broll_audio_volume", 0.0) or 0.0)
+                        if kind == "narration"
+                        else None
+                    ),
+                    # program-monitor audio: the TTS stem streaming key
+                    "narration_key": (
+                        _narration_key(str(meta.get("script_text") or ""))
+                        if kind == "narration"
+                        else None
                     ),
                 }
             )

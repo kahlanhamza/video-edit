@@ -7,6 +7,7 @@ M2 adds SSE job progress, agent tool dispatch endpoints and the Human Review Gat
 from __future__ import annotations
 
 import contextlib
+import json
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -778,6 +779,84 @@ def timeline_nle(project_id: str) -> JSONResponse:
     except ProjectNotFound as e:
         raise HTTPException(status_code=404, detail="project not found") from e
     return JSONResponse(snapshot)
+
+
+# --- timeline history: every dispatch checkpoints a version (PlannerExecutor),
+# --- so undo/redo is moving the active pointer, never destroying history.
+# --- The version LIST already rides GET /timeline (TimelineStateOut); this is
+# --- the missing WRITE side of that history.
+
+
+class TimelineActivateRequest(BaseModel):
+    version_num: int = Field(ge=1)
+
+
+@app.post("/projects/{project_id}/timeline/activate")
+def timeline_activate(project_id: str, body: TimelineActivateRequest) -> dict[str, Any]:
+    """Point the project at an existing timeline version (undo / redo / browse).
+
+    Non-destructive by design: the version rows stay; a new edit after an undo
+    checkpoints forward from the activated state, exactly like a real NLE.
+    """
+    s = session()
+    try:
+        project = s.get(ProjectRow, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        row = s.execute(
+            select(TimelineVersionRow).where(
+                TimelineVersionRow.project_id == project_id,
+                TimelineVersionRow.version_num == body.version_num,
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"version {body.version_num} not found")
+        previous = project.active_otio_version_id
+        project.active_otio_version_id = row.version_num
+        s.commit()
+        return {
+            "ok": True,
+            "active_version": row.version_num,
+            "previous_version": previous,
+            "checkpoint_note": row.checkpoint_note,
+        }
+    finally:
+        s.close()
+
+
+@app.get("/projects/{project_id}/narration/{clip_key}.mp3")
+def narration_clip(project_id: str, clip_key: str) -> FileResponse:
+    """Stream one synthesized TTS narration stem (program-monitor audio).
+
+    `clip_key` is the sha256(script_text) hex prefix carried by the NLE
+    snapshot's narration clips — stable across timeline edits, no row ids in
+    URLs, and a wrong/edited script simply misses (the monitor plays silence
+    and re-fetches after the next TTS render).
+    """
+    import hashlib
+    import re
+
+    if not re.fullmatch(r"[0-9a-f]{8,64}", clip_key):
+        raise HTTPException(status_code=400, detail="bad narration key")
+    manifest = get_settings().output_dir / "pipeline" / project_id / "narration" / "clips.json"
+    if not manifest.exists():
+        raise HTTPException(status_code=404, detail="no narration manifest yet")
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8") or "{}")
+    except Exception:  # noqa: BLE001 — corrupt manifest is a 404, not a 500
+        raise HTTPException(status_code=404, detail="narration manifest unreadable") from None
+    for c in data.get("clips", []):
+        if not isinstance(c, dict) or not c.get("script_text"):
+            continue
+        digest = hashlib.sha256(str(c["script_text"]).encode("utf-8")).hexdigest()
+        if digest.startswith(clip_key):
+            path = Path(str(c.get("clip", "")))
+            if not path.is_absolute():
+                path = manifest.parent / path
+            if path.exists():
+                return FileResponse(path, media_type="audio/mpeg", filename=f"{clip_key}.mp3")
+            break
+    raise HTTPException(status_code=404, detail="narration clip not synthesized yet")
 
 
 # --- export gate (roadmap step 6): preview is overlay-only; Export is the only render ---

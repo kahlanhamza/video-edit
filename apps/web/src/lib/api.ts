@@ -74,6 +74,12 @@ export interface NleClip {
   vo_in_s?: number;
   vo_out_s?: number | null;
   tts_duration_s?: number | null;
+  /** narration: the muted b-roll source windows under the voiceover + their
+   *  bed volume (the renderer cycles them; the monitor plays them) */
+  broll_windows?: [number, number][] | null;
+  broll_audio_volume?: number | null;
+  /** narration: streaming key for the synthesized TTS stem (program monitor) */
+  narration_key?: string | null;
 }
 
 export interface NleCaption {
@@ -442,6 +448,15 @@ export const api = {
     ),
   listJobs: (id: string) => req<Job[]>(`/projects/${id}/jobs`),
   timelineState: (id: string) => req<TimelineState>(`/projects/${id}/timeline`),
+  // --- timeline history: undo/redo = moving the active-version pointer ---
+  activateVersion: (id: string, versionNum: number) =>
+    req<{ ok: boolean; active_version: number; previous_version: number | null }>(
+      `/projects/${id}/timeline/activate`,
+      {
+        method: "POST",
+        body: JSON.stringify({ version_num: versionNum }),
+      },
+    ),
   // --- full-visibility Studio: live console + NLE timeline ---
   jobSnapshot: (id: string, jobId: string) =>
     req<LiveJobSnapshot>(`/projects/${id}/jobs/${jobId}/snapshot`),
@@ -675,6 +690,11 @@ export function assetScrubUrl(assetId: string): string {
 
 export function srtDownloadUrl(projectId: string): string {
   return `${API_BASE}/projects/${projectId}/subtitles/srt`;
+}
+
+/** Streaming URL for one synthesized narration TTS stem (program monitor). */
+export function narrationClipUrl(projectId: string, key: string): string {
+  return `${API_BASE}/projects/${projectId}/narration/${key}.mp3`;
 }
 
 export function sseUrl(projectId: string, jobId: string): string {

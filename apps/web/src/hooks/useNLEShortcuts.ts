@@ -25,6 +25,14 @@ export interface UseNLEShortcutsOptions {
    * revoke); false falls through to the local marker undo. Latest-callback
    * ref — safe to pass an inline closure. */
   onUndo?: () => boolean;
+  /** Timeline-true preview: when set, I/O/S markers and ←/→ stepping use
+   * THIS clock (program seconds) instead of the video element's raw source
+   * clock, and seeks go through `seekTo`. Latest-ref semantics. */
+  timeSource?: () => number;
+  /** Program-time seek (follow mode): replaces raw currentTime writes. */
+  seekTo?: (t: number) => void;
+  /** Upper bound for program seeks (the timeline duration). */
+  maxTime?: number;
 }
 
 const EDITABLE = new Set(["INPUT", "TEXTAREA", "SELECT"]);
@@ -41,13 +49,16 @@ export function useNLEShortcuts({
   onInOut,
   enabled = true,
   onUndo,
+  timeSource,
+  seekTo,
+  maxTime,
 }: UseNLEShortcutsOptions) {
   const [state, dispatch] = useReducer(nleReducer, initialNLEState);
   const [active, setActive] = useState(false);
   const rafRef = useRef<number | null>(null);
   // Latest-callback refs so the key handler never goes stale.
-  const cbs = useRef({ onSplit, onInOut, onUndo });
-  cbs.current = { onSplit, onInOut, onUndo };
+  const cbs = useRef({ onSplit, onInOut, onUndo, timeSource, seekTo, maxTime });
+  cbs.current = { onSplit, onInOut, onUndo, timeSource, seekTo, maxTime };
 
   const lastMarkers = useRef<{ inS: number | null; outS: number | null }>({
     inS: state.inS,
@@ -124,7 +135,7 @@ export function useNLEShortcuts({
 
     const applyMarkers = (kind: "in" | "out" | "split") => {
       const v = videoRef.current;
-      const time = v ? v.currentTime : 0;
+      const time = cbs.current.timeSource ? cbs.current.timeSource() : v ? v.currentTime : 0;
       if (kind === "in") dispatch({ type: "markIn", t: time });
       else if (kind === "out") dispatch({ type: "markOut", t: time });
       else {
@@ -170,13 +181,20 @@ export function useNLEShortcuts({
         case "ArrowLeft":
         case "ArrowRight":
           e.preventDefault();
-          if (v) {
-            v.playbackRate = 1;
+          {
             const delta = e.code === "ArrowLeft" ? -step : step;
-            v.currentTime = Math.min(
-              Math.max(0, v.currentTime + delta),
-              v.duration || Number.MAX_SAFE_INTEGER,
-            );
+            if (cbs.current.timeSource && cbs.current.seekTo) {
+              // program-time stepping (timeline-true preview)
+              const cur = cbs.current.timeSource();
+              const hi = cbs.current.maxTime ?? Number.MAX_SAFE_INTEGER;
+              cbs.current.seekTo(Math.min(Math.max(0, cur + delta), hi));
+            } else if (v) {
+              v.playbackRate = 1;
+              v.currentTime = Math.min(
+                Math.max(0, v.currentTime + delta),
+                v.duration || Number.MAX_SAFE_INTEGER,
+              );
+            }
           }
           break;
         case "KeyZ":

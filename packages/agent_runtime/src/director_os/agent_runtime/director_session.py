@@ -37,6 +37,7 @@ timeline again.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -829,7 +830,14 @@ class DirectorSession:
         Returns (None, error) only for UNPARSEABLE plans after all retries — a
         parseable-but-truncated plan is returned as best effort so Phase B's
         repair loop (and the deterministic fallback behind it) can fix it.
+
+        Provider OUTAGES (LLMBackendError — empty body, 5xx, dead socket) are
+        retried with backoff like any other bad completion: a flaky proxy on
+        the operator's machine used to bubble up and kill the whole planning
+        stage, which the deterministic fallback exists to prevent.
         """
+        from director_os.agent_runtime.llm import LLMBackendError
+
         system = compose_agent_prompt(
             agent="director_agent", role="director", niche="bodycam_documentary"
         )
@@ -838,9 +846,20 @@ class DirectorSession:
         last_err = ""
         best: MacroPlan | None = None
         for _attempt in range(self.phase_a_retries + 1):
-            text = self.backend.complete_json(
-                system, user + (f"\n\n## Previous attempt failed\n{feedback}" if feedback else "")
-            )
+            if _attempt:
+                # backoff before every retry (provider hiccups are usually
+                # transient: empty 200s, gateway 502s, socket resets)
+                time.sleep(min(8.0, 1.5 * (2 ** min(_attempt - 1, 3))))
+            try:
+                text = self.backend.complete_json(
+                    system,
+                    user + (f"\n\n## Previous attempt failed\n{feedback}" if feedback else ""),
+                )
+            except LLMBackendError as e:
+                # transport/provider failure — retryable, and the operator log
+                # must name it (an empty retry loop with no reason is a maze)
+                feedback = last_err = f"provider error ({e})"
+                continue
             try:
                 plan = parse_macro_plan(text)
                 plan, _pieces = snap_plan_to_speech(plan, self.transcript, self.source_duration_s)
@@ -863,7 +882,11 @@ class DirectorSession:
                         last_err = refine_note
                 return plan, ""
             except (ValueError, ValidationError, json.JSONDecodeError) as e:
-                feedback, last_err = f"unparseable plan ({e})", str(e)
+                # quote the raw head so the log says WHY it did not parse —
+                # "Expecting value (char 0)" alone hides the actual body (an
+                # HTML error page, a rate-limit notice, an empty string)
+                head = " ".join((text or "").split())[:160] or "(empty response)"
+                feedback = last_err = f"unparseable plan ({e}) — got: {head!r}"
                 continue
         if best is not None:
             return best, last_err  # structurally valid but truncated: Phase B repairs

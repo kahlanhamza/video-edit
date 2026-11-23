@@ -59,6 +59,15 @@ export interface TimelineProps {
   onDeleteEffect?: (effectId: string) => void;
   /** Drag an op-backed effect block's edge → new frame window (raw frames). */
   onAdjustEffectWindow?: (opId: string, frameStart: number, frameEnd: number) => void;
+  /** Delete the selected master clip (raw or narration) — server checkpoints. */
+  onDeleteClip?: (clip: NleClip) => void;
+  /** Open the insert popover (raw clip / narration / card at the playhead). */
+  onInsert?: () => void;
+  /** Version-pointer undo/redo (checkpoint history — nothing is destroyed). */
+  canUndo?: boolean;
+  canRedo?: boolean;
+  onUndo?: () => void;
+  onRedo?: () => void;
 }
 
 interface TrackDef {
@@ -79,6 +88,12 @@ export default function Timeline({
   onSplitAtPlayhead,
   onDeleteEffect,
   onAdjustEffectWindow,
+  onDeleteClip,
+  onInsert,
+  canUndo,
+  canRedo,
+  onUndo,
+  onRedo,
 }: TimelineProps) {
   const [pxPerS, setPxPerS] = useState(24);
   const [selected, setSelected] = useState<string | null>(null);
@@ -250,6 +265,22 @@ export default function Timeline({
   const scrubN = nle?.asset ? scrubFrameCount(nle.asset.duration_s) : 0;
   const scrubUrl = nle?.asset ? assetScrubUrl(nle.asset.id) : "";
 
+  // A real NLE timeline is editable: Delete removes the selected master clip
+  // (server checkpoint = undoable), and the same key never fires while typing.
+  useEffect(() => {
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key !== "Delete" && ev.key !== "Backspace") return;
+      const el = ev.target;
+      if (el instanceof HTMLElement && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable))
+        return;
+      if (!selectedClip || !onDeleteClip) return;
+      ev.preventDefault();
+      onDeleteClip(selectedClip);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selectedClip, onDeleteClip]);
+
   function zoomFit() {
     const el = scrollRef.current;
     if (el && duration > 0) {
@@ -274,6 +305,42 @@ export default function Timeline({
           onClick={() => onSplitAtPlayhead?.(playheadS)}
         >
           <Icon name="scissors" />
+        </button>
+        <button
+          className="icon-btn"
+          disabled={!onDeleteClip || !selectedClip || selectedClip.master_index == null}
+          title={
+            selectedClip
+              ? `Delete "${selectedClip.name}" (${selectedClip.dur_s.toFixed(1)}s) — checkpointed, Ctrl+Z-capable via history`
+              : "select a clip, then Delete"
+          }
+          onClick={() => selectedClip && onDeleteClip?.(selectedClip)}
+        >
+          <Icon name="trash" />
+        </button>
+        <button
+          className="icon-btn"
+          disabled={!onUndo || !canUndo}
+          title="Undo — activate the previous timeline checkpoint (Ctrl+Z when the video surface has focus)"
+          onClick={() => onUndo?.()}
+        >
+          <Icon name="undo" />
+        </button>
+        <button
+          className="icon-btn"
+          disabled={!onRedo || !canRedo}
+          title="Redo — activate the next timeline checkpoint"
+          onClick={() => onRedo?.()}
+        >
+          <Icon name="redo" />
+        </button>
+        <button
+          className="icon-btn"
+          disabled={!onInsert}
+          title="Add to the timeline at the playhead — raw clip from the source, narration VO, or a card"
+          onClick={() => onInsert?.()}
+        >
+          <Icon name="plus" />
         </button>
         <button
           className="icon-btn"
@@ -407,6 +474,33 @@ export default function Timeline({
                           onDragEndEdge={(fx) => setDrag({ kind: "fx-end", fx })}
                         />
                       )}
+                      {/* V1 also renders narration blocks as muted B-ROLL
+                          ghosts — the b-roll the renderer cuts under every VO
+                          is part of the program and must be visible in the
+                          timeline, not hidden behind the A1 lane */}
+                      {track.kind === "video" &&
+                        lanes
+                          .find((l) => l.tone === "narration")
+                          ?.clips.map((c) => (
+                            <ClipBlock
+                              key={`broll:${c.track}:${c.name}:${c.start_s}`}
+                              clip={c}
+                              kind={track.kind}
+                              zoom={zoom}
+                              selected={false}
+                              locked
+                              scrubN={scrubN}
+                              scrubUrl={scrubUrl}
+                              sourceDuration={nle.asset?.duration_s ?? duration}
+                              onSelect={() => onSeek(c.start_s)}
+                              onSeek={onSeek}
+                              onTrimStart={() => {}}
+                              onTrimEnd={() => {}}
+                              canEdit={false}
+                              isAudio={false}
+                              isBroll
+                            />
+                          ))}
                       {lane &&
                         lane.clips.map((c) => (
                           <ClipBlock
@@ -600,6 +694,7 @@ function ClipBlock({
   onTrimEnd,
   canEdit,
   isAudio,
+  isBroll,
 }: {
   clip: NleClip;
   kind: TrackDef["kind"];
@@ -615,11 +710,21 @@ function ClipBlock({
   onTrimEnd: (clip: NleClip) => void;
   canEdit: boolean;
   isAudio?: boolean;
+  /** V1 ghost of a narration block: the muted b-roll the renderer cuts
+   *  under the voiceover — dashed, dimmed, seek-on-click only. */
+  isBroll?: boolean;
 }) {
   const key = `${clip.track}:${clip.name}:${clip.start_s}`;
   const w = Math.max(3, clip.dur_s * zoom);
-  const label =
-    kind === "audio" ? `VO · ${clip.name}` : kind === "card" ? `CARD · ${clip.name}` : clip.name;
+  const label = isBroll
+    ? `B-ROLL · muted · ${clip.name}`
+    : kind === "audio"
+      ? `VO · ${clip.name}`
+      : kind === "card"
+        ? `CARD · ${clip.name}`
+        : clip.name;
+  // A1: which b-roll windows ride under this VO (the renderer cycles them)
+  const brollList = clip.broll_windows ?? null;
   // A1 audio trim truth: the audio extent inside the block (tail pad renders
   // darker so the operator sees exactly how much VO is there)
   const audioLen =
@@ -634,7 +739,7 @@ function ClipBlock({
 
   // filmstrip cells: one scrubsheet frame per 2 s of SOURCE time
   const cells: React.ReactNode[] = [];
-  if (kind === "video" && scrubN > 0 && w > 24) {
+  if ((kind === "video" || isBroll) && scrubN > 0 && w > 24) {
     const cellWS = SCRUB_CELL_S * zoom;
     const nCells = Math.min(80, Math.ceil(w / cellWS) + 1);
     for (let i = 0; i < nCells; i++) {
@@ -667,12 +772,26 @@ function ClipBlock({
         left: clip.start_s * zoom,
         width: w,
         background: `var(--clip-${kind === "video" ? "video" : kind === "card" ? "card" : "audio"})`,
+        ...(isBroll
+          ? {
+              borderStyle: "dashed",
+              borderColor: "rgba(114,208,165,.55)",
+              background: "rgba(38,68,56,.45)",
+              opacity: 0.88,
+            }
+          : {}),
       }}
       title={`${clip.name} · ${clip.dur_s.toFixed(2)}s${
         isAudio && trimmed
           ? ` · VO ${(clip.vo_in_s ?? 0).toFixed(2)}–${
               clip.vo_out_s != null ? clip.vo_out_s.toFixed(2) : "end"
             }s`
+          : ""
+      }${
+        brollList
+          ? ` · b-roll ${brollList
+              .map(([a, b]) => `${formatTimecodeShort(a)}–${formatTimecodeShort(b)}`)
+              .join(" → ")}`
           : ""
       }${clip.act ? ` · ${clip.act}` : ""}${clip.script ? ` · ${clip.script.slice(0, 70)}` : ""}`}
       onClick={(e) => {
@@ -693,6 +812,26 @@ function ClipBlock({
       {isAudio && trimmed && (
         <span className="absolute right-1 top-1 z-10 rounded bg-black/55 px-1 text-[8px] font-bold tracking-wide text-white/85">
           VO TRIM
+        </span>
+      )}
+      {/* A1 b-roll badge: the muted source windows under this voiceover —
+          invisible b-roll is indistinguishable from missing b-roll */}
+      {isAudio && (
+        <span
+          className={`absolute left-1 top-1 z-10 rounded px-1 text-[8px] font-bold tracking-wide ${
+            brollList
+              ? "bg-[rgba(20,66,46,.8)] text-[#9fe3c0]"
+              : "bg-[rgba(96,48,20,.8)] text-[#f0c084]"
+          }`}
+          title={
+            brollList
+              ? `b-roll windows: ${brollList
+                  .map(([a, b]) => `${formatTimecodeShort(a)}–${formatTimecodeShort(b)}`)
+                  .join(" → ")}`
+              : "no b-roll windows in metadata — the render will be black here"
+          }
+        >
+          {brollList ? `B-ROLL ×${brollList.length}` : "NO B-ROLL"}
         </span>
       )}
       {/* label bar over the filmstrip */}

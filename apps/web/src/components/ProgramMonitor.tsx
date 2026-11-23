@@ -1,24 +1,56 @@
 "use client";
 
-// ProgramMonitor — the NLE program viewer: letterboxed proxy on true black,
-// mouse-drawn blur boxes over it, and a professional transport bar
-// (go-start / step-back / play / step-fwd / go-end + hero timecode).
-// Keyboard: Space play · J/K/L shuttle · I/O in-out · arrows frame-step.
+// ProgramMonitor — the NLE program viewer. TWO clocks, one truth:
+//
+//   RAW mode     the 480p proxy plays like a source viewer (pre-pipeline).
+//   FOLLOW mode  (default once a cut exists) the proxy is driven BY THE
+//                TIMELINE: program seconds map into each master clip's
+//                source window, narration blocks ride their muted b-roll
+//                windows (the renderer's cycle, mirrored frame-true in
+//                lib/nle.brollSourceAt) with the synthesized TTS stem on a
+//                parallel <audio> element, captions burn in from the cue
+//                store, and clip boundaries hard-cut exactly like the render.
+//
+// The preview must never lie about the cut (studio acceptance): a monitor
+// that plays the raw 43-minute source while the timeline says otherwise is
+// worse than no monitor. Blur boxes stay RAW-frame addressed (they ride the
+// source footage), so they keep using the video element's raw clock.
+//
+// Keyboard: Space play · J/K/L shuttle · I/O in-out · arrows frame-step
+// (program time in follow mode) · S split at playhead · Ctrl+Z undo op.
 
 import {
   forwardRef,
   useCallback,
   useEffect,
   useImperativeHandle,
+  useMemo,
   useRef,
   useState,
 } from "react";
-import { Asset, NleEffect, OpRecord, SelectionOut, TrackHit, api, assetProxyUrl, assetScrubUrl } from "@/lib/api";
+import {
+  Asset,
+  NleCaption,
+  NleEffect,
+  NleTimeline,
+  OpRecord,
+  SelectionOut,
+  TrackHit,
+  api,
+  assetProxyUrl,
+  assetScrubUrl,
+  narrationClipUrl,
+} from "@/lib/api";
 import {
   AdjustDrag,
   TrackedBox,
   adjustedBox,
+  brollSourceAt,
+  captionAt,
+  clipAfter,
+  clipAt,
   formatTimecodeFrames,
+  programClips,
   scrubBackground,
   scrubFrameCount,
   scrubFrameIndex,
@@ -48,11 +80,13 @@ export const ProgramMonitor = forwardRef<
      * tab, an undo elsewhere) the monitor refetches the fold so blur boxes
      * converge LIVE, not just the timeline. */
     opsRev?: number | null;
+    /** The edited timeline — powers FOLLOW mode (timeline-true preview). */
+    nle?: NleTimeline | null;
     onTimeUpdate: (t: number) => void;
     onChanged: () => void;
   }
 >(function ProgramMonitor(
-  { projectId, asset, fps, opsRev, onTimeUpdate, onChanged },
+  { projectId, asset, fps, opsRev, nle, onTimeUpdate, onChanged },
   ref,
 ) {
   const [regions, setRegions] = useState<NleEffect[]>([]);
@@ -68,30 +102,191 @@ export const ProgramMonitor = forwardRef<
   const [adjustDrag, setAdjustDrag] = useState<AdjustDrag | null>(null);
   const [preview, setPreview] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
   const [playing, setPlaying] = useState(false);
+  // `time` is the DISPLAY clock: program seconds in follow mode, raw source
+  // seconds otherwise. `rawT` is always the video element's source clock —
+  // blur boxes and tracked paths are raw-footage addressed.
   const [time, setTime] = useState(0);
+  const [rawT, setRawT] = useState(0);
+  const [followOn, setFollowOn] = useState(true);
   const [videoReady, setVideoReady] = useState(false);
   const [tracking, setTracking] = useState<string | null>(null);
   const [trackedPaths, setTrackedPaths] = useState<Record<string, TrackHit[]>>({});
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
 
-  const { state: nle } = useNLEShortcuts({
+  const pClips = useMemo(() => programClips(nle), [nle]);
+  const hasProgram = pClips.length > 0;
+  const follow = followOn && hasProgram;
+  const programDuration = follow ? (nle?.duration_s ?? asset.duration_s) : asset.duration_s;
+
+  // latest-ref mirrors for the video element event handlers (they must not
+  // re-bind on every clock tick)
+  const pClipsRef = useRef(pClips);
+  pClipsRef.current = pClips;
+  const followRef = useRef(follow);
+  followRef.current = follow;
+  const playingRef = useRef(playing);
+  playingRef.current = playing;
+  const timeRef = useRef(time);
+  timeRef.current = time;
+  const rawTRef = useRef(rawT);
+  rawTRef.current = rawT;
+  const progDurRef = useRef(programDuration);
+  progDurRef.current = programDuration;
+  const activeClipRef = useRef<number>(-1); // index into pClips, -1 = gap
+  const onTimeUpdateRef = useRef(onTimeUpdate);
+  onTimeUpdateRef.current = onTimeUpdate;
+
+  /** Map a program time into the proxy video (follow) or straight (raw). */
+  const seek = useCallback(
+    (t: number) => {
+      const v = videoRef.current;
+      const clamped = Math.min(Math.max(0, t), progDurRef.current);
+      setTime(clamped);
+      timeRef.current = clamped;
+      if (!followRef.current) {
+        if (v) v.currentTime = clamped;
+        setRawT(clamped);
+        return;
+      }
+      const clips = pClipsRef.current;
+      const c = clipAt(clips, clamped);
+      if (v) {
+        if (c) {
+          const src = brollSourceAt(c, clamped) ?? c.source_start_s ?? 0;
+          v.currentTime = Math.min(Math.max(0, src), Math.max(0, asset.duration_s - 0.05));
+          activeClipRef.current = clips.indexOf(c);
+        } else {
+          activeClipRef.current = -1; // gap: freeze the tape, black overlay shows
+        }
+      }
+      syncAudio(clamped);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [asset.duration_s, projectId],
+  );
+
+  useImperativeHandle(ref, () => ({ seek }));
+
+  /** FOLLOW ENGINE — the program clock owns playback (rAF ticker).
+   *
+   * The video element is a commanded display device: each tick advances the
+   * PROGRAM clock at the tape's playbackRate, drives the proxy to the
+   * b-roll-cycled source position for that program second, hard-cuts at clip
+   * boundaries (exactly like the render), skips gaps, and re-syncs the TTS
+   * bus. Deriving the program time from video timeupdate instead breaks on
+   * multi-window b-roll: the tape plays OUTSIDE the clip's own source range
+   * (windows [1..N] live anywhere in the source), so there is no linear map
+   * from tape seconds to program seconds — the clock must lead, not follow. */
+  useEffect(() => {
+    if (!follow || !playing) return;
+    let raf = 0;
+    let last = performance.now();
+    const tick = (now: number) => {
+      const v = videoRef.current;
+      if (v) {
+        const rate = v.playbackRate || 1;
+        let pt = timeRef.current + ((now - last) / 1000) * rate;
+        const clips = pClipsRef.current;
+        let c = activeClipRef.current >= 0 ? clips[activeClipRef.current] : null;
+        if (!c || pt >= c.end_s - 1e-6 || pt < c.start_s - 1e-6) {
+          if (rate < 0 && c) {
+            // reverse shuttle past this clip's head: land on the PREVIOUS
+            // clip's out-point (or the program start when none is left)
+            const prevIdx = activeClipRef.current - 1;
+            const prev = prevIdx >= 0 ? clips[prevIdx] : null;
+            if (!prev) {
+              pt = 0;
+              timeRef.current = pt;
+              setTime(pt);
+              onTimeUpdateRef.current?.(pt);
+              v.pause();
+              return;
+            }
+            c = prev;
+            activeClipRef.current = prevIdx;
+            pt = Math.min(pt, prev.end_s);
+          } else {
+            // forward boundary (or resuming in a gap): next clip at/after here
+            const next = clipAfter(clips, c ? c.end_s : pt);
+            if (!next) {
+              pt = progDurRef.current;
+              timeRef.current = pt;
+              setTime(pt);
+              onTimeUpdateRef.current?.(pt);
+              v.pause();
+              return; // program over — ticker dies with the pause
+            }
+            c = next;
+            activeClipRef.current = clips.indexOf(next);
+            pt = Math.max(pt, next.start_s);
+          }
+        }
+        timeRef.current = pt;
+        setTime(pt);
+        onTimeUpdateRef.current?.(pt);
+        const expected = brollSourceAt(c, pt) ?? c.source_start_s ?? 0;
+        if (Math.abs(v.currentTime - expected) > 0.35) {
+          v.currentTime = expected; // hard cut / drift re-sync
+        }
+        syncAudio(pt);
+      }
+      last = now;
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [follow, playing]);
+
+  /** Keep the narration TTS stem glued to the program clock. Called on every
+   * seek and every follow tick — cheap (one clipAt walk) and self-correcting
+   * (drift > 180 ms re-seeks the audio element). */
+  function syncAudio(pt: number) {
+    const a = audioRef.current;
+    const v = videoRef.current;
+    if (!a || !v) return;
+    if (!followRef.current) {
+      a.pause();
+      v.volume = 1;
+      return;
+    }
+    const c = clipAt(pClipsRef.current, pt);
+    if (c && c.kind === "narration" && c.narration_key) {
+      const url = narrationClipUrl(projectId, c.narration_key);
+      if (!a.src.endsWith(url)) a.src = url;
+      const voIn = c.vo_in_s ?? 0;
+      const voOut = c.vo_out_s ?? c.tts_duration_s ?? null;
+      let target = voIn + (pt - c.start_s);
+      if (voOut != null) target = Math.min(target, voOut);
+      target = Math.max(0, target);
+      if (a.readyState >= 1 && Math.abs(a.currentTime - target) > 0.18) {
+        a.currentTime = target;
+      }
+      a.playbackRate = v.playbackRate || 1;
+      if (playingRef.current) void a.play().catch(() => {});
+      else a.pause();
+      v.volume = Math.min(1, Math.max(0, c.broll_audio_volume ?? 0));
+    } else {
+      a.pause();
+      v.volume = c && c.audio_mode === "silence" ? 0 : 1;
+    }
+  }
+
+  const { state: markers } = useNLEShortcuts({
     videoRef,
     fps,
     enabled: !drawMode,
     onUndo: undoNewestOp,
-  });
-
-  useImperativeHandle(ref, () => ({
-    seek: (t: number) => {
+    timeSource: () =>
+      followRef.current ? timeRef.current : (videoRef.current?.currentTime ?? timeRef.current),
+    seekTo: (t) => {
       const v = videoRef.current;
-      if (v) v.currentTime = t;
-      setTime(t);
+      if (v) v.pause();
+      seek(t);
     },
-  }));
-
-  const onTimeUpdateRef = useRef(onTimeUpdate);
-  onTimeUpdateRef.current = onTimeUpdate;
+    maxTime: programDuration,
+  });
 
   const reload = useCallback(async () => {
     try {
@@ -134,6 +329,13 @@ export const ProgramMonitor = forwardRef<
     // fires on mount, project change, and every op-log advance the page
     // reports (SSE → reloadNle → ops_rev) — the monitor converges live
   }, [reload, opsRev]);
+
+  // The cut changed (dispatch, agent run, undo): re-anchor the tape to the
+  // SAME program second so the monitor instantly reflects the new edit.
+  useEffect(() => {
+    if (follow) seek(timeRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pClips]);
 
   function toDisplayCoords(ev: React.MouseEvent): { x: number; y: number } {
     const rect = wrapRef.current!.getBoundingClientRect();
@@ -269,8 +471,8 @@ export const ProgramMonitor = forwardRef<
   }, [selectedOp, drawMode, regions, projectId, asset.width, asset.height, onChanged]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /** Ctrl+Z = undo the NEWEST op (revoke — history kept). The fold sorts by
-   * rev, so repeated undos naturally walk back one op at a time; returns
-   * false when no op-backed box exists, falling through to marker undo. */
+   *  rev, so repeated undos naturally walk back one op at a time; returns
+   *  false when no op-backed box exists, falling through to marker undo. */
   function undoNewestOp(): boolean {
     const latest = regions.reduce<NleEffect | null>((acc, r) => {
       if (!r.op_id) return acc;
@@ -309,7 +511,7 @@ export const ProgramMonitor = forwardRef<
     if (!r.op_id) return; // legacy regions have no op to upgrade
     setTracking(r.op_id);
     setError(null);
-    const anchor = Math.min(Math.max(0, Math.round(time * fps)), Math.max(0, Math.round(asset.duration_s * fps) - 1));
+    const anchor = Math.min(Math.max(0, Math.round(rawTRef.current * fps)), Math.max(0, Math.round(asset.duration_s * fps) - 1));
     const span = Math.min(12, Math.max(1, asset.duration_s - anchor / fps));
     try {
       const sel: SelectionOut = await api.createSelection(asset.id, {
@@ -344,11 +546,31 @@ export const ProgramMonitor = forwardRef<
     if (videoRef.current) fn(videoRef.current);
   };
 
+  const activeClip = follow ? clipAt(pClips, time) : null;
+  const inGap = follow && activeClip === null;
+  const cue: NleCaption | null = follow ? captionAt(nle?.captions ?? [], time) : null;
+  const narrationLive = activeClip?.kind === "narration";
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       {/* ---- viewer toolbar ---- */}
       <div className="flex h-9 shrink-0 items-center gap-2 border-b border-[var(--line-1)] bg-[var(--bg-2)] px-2.5">
         <span className="micro-label">Program</span>
+        {hasProgram && (
+          <button
+            className="chip"
+            data-active={follow}
+            title={
+              follow
+                ? "FOLLOW mode: the preview plays the TIMELINE — clip cuts, narration b-roll, captions. Click to scrub the raw source instead."
+                : "RAW mode: the preview scrubs the raw source. Click to follow the edited timeline."
+            }
+            onClick={() => setFollowOn((v) => !v)}
+            style={follow ? { background: "var(--acc-bg)", color: "var(--acc)" } : undefined}
+          >
+            {follow ? "following timeline" : "raw source"}
+          </button>
+        )}
         <div className="flex-1" />
         <button
           className="icon-btn"
@@ -400,12 +622,32 @@ export const ProgramMonitor = forwardRef<
             onLoadedData={() => setVideoReady(true)}
             onCanPlay={() => setVideoReady(true)}
             onTimeUpdate={(ev) => {
-              const t = ev.currentTarget.currentTime;
-              setTime(t);
-              onTimeUpdateRef.current?.(t);
+              // raw clock only — blur boxes + tracked paths are raw-footage
+              // addressed; the FOLLOW program clock lives in the rAF engine
+              const r = ev.currentTarget.currentTime;
+              setRawT(r);
+              rawTRef.current = r;
+              if (!followRef.current) {
+                setTime(r);
+                timeRef.current = r;
+                onTimeUpdateRef.current?.(r);
+              }
             }}
-            onPlay={() => setPlaying(true)}
-            onPause={() => setPlaying(false)}
+            onPlay={() => {
+              setPlaying(true);
+              playingRef.current = true;
+              syncAudio(timeRef.current);
+            }}
+            onPause={() => {
+              setPlaying(false);
+              playingRef.current = false;
+              syncAudio(timeRef.current);
+            }}
+            onRateChange={(ev) => {
+              if (audioRef.current) {
+                audioRef.current.playbackRate = ev.currentTarget.playbackRate || 1;
+              }
+            }}
             onClick={() => {
               const v = videoRef.current;
               if (!v) return;
@@ -416,6 +658,10 @@ export const ProgramMonitor = forwardRef<
               v.paused ? v.play() : v.pause();
             }}
           />
+          {/* the narration TTS bus — a parallel element the engine keeps
+              sample-glued to the program clock (muted b-roll on the video) */}
+          {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
+          <audio ref={audioRef} preload="auto" className="hidden" />
           {/* poster overlay — the real first scrub frame until the video decodes */}
           {!videoReady && (
             <div
@@ -432,26 +678,58 @@ export const ProgramMonitor = forwardRef<
               />
             </div>
           )}
-          {nle.inS !== null && (
+          {/* gap overlay: follow mode outside any clip — the render is black here */}
+          {follow && inGap && (
+            <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/92">
+              <span className="text-[12px] font-medium text-[var(--tx-2)]">gap</span>
+              <span className="text-[10px] text-[var(--tx-3)]">
+                nothing on V1 here — the render is black
+              </span>
+            </div>
+          )}
+          {/* narration badge: which bus is live */}
+          {follow && narrationLive && (
+            <div className="pointer-events-none absolute left-2 top-2 flex items-center gap-1.5 rounded bg-black/65 px-2 py-1 text-[10px] font-medium text-[var(--ok)] backdrop-blur-sm">
+              <span className="h-1.5 w-1.5 rounded-full bg-[var(--ok)]" />
+              narration VO · b-roll muted
+            </div>
+          )}
+          {/* captions (follow mode): the cue store is the baked truth */}
+          {follow && cue && (
+            <div className="pointer-events-none absolute inset-x-3 bottom-2.5 flex justify-center">
+              <p
+                className="max-w-[92%] rounded bg-black/70 px-2.5 py-1 text-center text-[13px] font-medium leading-snug text-white [text-shadow:0_1px_2px_rgba(0,0,0,.9)]"
+                title={`cue ${cue.index}${cue.speaker ? ` · ${cue.speaker}` : ""}`}
+              >
+                {cue.speaker && (
+                  <span className="mr-1.5 text-[10px] uppercase tracking-wider text-[var(--acc)]">
+                    {cue.speaker}
+                  </span>
+                )}
+                {cue.text}
+              </p>
+            </div>
+          )}
+          {markers.inS !== null && (
             <span
               className="pointer-events-none absolute inset-y-1 border-l-2 border-[var(--ok)]"
-              title={`in ${nle.inS.toFixed(2)}s`}
-              style={{ left: `${Math.min(100, (nle.inS / asset.duration_s) * 100)}%` }}
+              title={`in ${markers.inS.toFixed(2)}s`}
+              style={{ left: `${Math.min(100, (markers.inS / programDuration) * 100)}%` }}
             />
           )}
-          {nle.outS !== null && (
+          {markers.outS !== null && (
             <span
               className="pointer-events-none absolute inset-y-1 border-r-2 border-[var(--acc)]"
-              title={`out ${nle.outS.toFixed(2)}s`}
-              style={{ left: `${Math.min(100, (nle.outS / asset.duration_s) * 100)}%` }}
+              title={`out ${markers.outS.toFixed(2)}s`}
+              style={{ left: `${Math.min(100, (markers.outS / programDuration) * 100)}%` }}
             />
           )}
-          {nle.splits.map((t) => (
+          {markers.splits.map((t) => (
             <span
               key={t}
               title={`split ${t.toFixed(2)}s`}
               className="pointer-events-none absolute top-1 h-2.5 w-0.5 bg-[var(--warn)]"
-              style={{ left: `${Math.min(100, (t / asset.duration_s) * 100)}%` }}
+              style={{ left: `${Math.min(100, (t / programDuration) * 100)}%` }}
             />
           ))}
           {showExisting &&
@@ -459,10 +737,11 @@ export const ProgramMonitor = forwardRef<
             regions.map((r) => {
               // tracked selections draw the box AT THE PLAYHEAD (it follows
               // the object as you scrub); static boxes draw their stored rect
-              // — or the LIVE adjust preview while one is being dragged
+              // — or the LIVE adjust preview while one is being dragged.
+              // Raw-footage clock: rawT, never the program clock.
               const path = r.op_id ? trackedPaths[r.op_id] : undefined;
               const tb: TrackedBox | null =
-                r.mode === "tracked" && path && path.length > 0 ? trackedBoxAt(path, time) : null;
+                r.mode === "tracked" && path && path.length > 0 ? trackedBoxAt(path, rawT) : null;
               const isDragged = adjustDrag?.opId === r.op_id && !!preview;
               const bx = isDragged ? preview!.x : tb ? tb.x : r.x;
               const by = isDragged ? preview!.y : tb ? tb.y : r.y;
@@ -532,20 +811,20 @@ export const ProgramMonitor = forwardRef<
         <button
           className="icon-btn"
           title="go to start (Home)"
-          onClick={transport((v) => {
-            v.currentTime = 0;
-            onTimeUpdate(0);
-          })}
+          onClick={() => {
+            videoRef.current?.pause();
+            seek(0);
+          }}
         >
           <Icon name="goStart" />
         </button>
         <button
           className="icon-btn"
           title="step back one frame (←)"
-          onClick={transport((v) => {
-            v.pause();
-            v.currentTime = Math.max(0, v.currentTime - 1 / fps);
-          })}
+          onClick={() => {
+            videoRef.current?.pause();
+            seek(timeRef.current - 1 / fps);
+          }}
         >
           <Icon name="stepBack" />
         </button>
@@ -559,19 +838,20 @@ export const ProgramMonitor = forwardRef<
         <button
           className="icon-btn"
           title="step forward one frame (→)"
-          onClick={transport((v) => {
-            v.pause();
-            v.currentTime = Math.min(asset.duration_s, v.currentTime + 1 / fps);
-          })}
+          onClick={() => {
+            videoRef.current?.pause();
+            seek(timeRef.current + 1 / fps);
+          }}
         >
           <Icon name="stepFwd" />
         </button>
         <button
           className="icon-btn"
           title="go to end (End)"
-          onClick={transport((v) => {
-            v.currentTime = asset.duration_s;
-          })}
+          onClick={() => {
+            videoRef.current?.pause();
+            seek(programDuration);
+          }}
         >
           <Icon name="goEnd" />
         </button>
@@ -579,7 +859,7 @@ export const ProgramMonitor = forwardRef<
           {formatTimecodeFrames(time, fps)}
         </span>
         <span className="tcode text-[12px] text-[var(--tx-3)]">
-          / {formatTimecodeFrames(asset.duration_s, fps)}
+          / {formatTimecodeFrames(programDuration, fps)}
         </span>
         <div className="flex-1" />
         <span className="chip" title="source resolution and frame rate">

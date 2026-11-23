@@ -32,6 +32,8 @@ export type IconName =
   | "x"
   | "dot"
   | "clapper"
+  | "undo"
+  | "redo"
   | "media";
 
 export function Icon({
@@ -265,6 +267,20 @@ export function Icon({
         <svg {...p}>
           <rect x="2" y="3" width="12" height="10" rx="1.6" />
           <path d="M6.6 6 9.8 8l-3.2 2V6Z" fill="currentColor" stroke="none" />
+        </svg>
+      );
+    case "undo":
+      return (
+        <svg {...p}>
+          <path d="M3.2 6.6h6.6a3.2 3.2 0 1 1 0 6.4H6.4" />
+          <path d="M5.8 3.8 3 6.6l2.8 2.8" />
+        </svg>
+      );
+    case "redo":
+      return (
+        <svg {...p}>
+          <path d="M12.8 6.6H6.2a3.2 3.2 0 1 0 0 6.4h3.4" />
+          <path d="M10.2 3.8 13 6.6l-2.8 2.8" />
         </svg>
       );
   }

@@ -33,10 +33,12 @@ import {
   Deliverables,
   DispatchResult,
   Job,
+  NleClip,
   NleTimeline,
   ExportGate,
   Project,
   TimelineState,
+  TimelineVersion,
 } from "@/lib/api";
 
 // --- WS4: Case Sources & Dossier --------------------------------------------
@@ -205,6 +207,16 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
   const [error, setError] = useState<string | null>(null);
   const [editBusy, setEditBusy] = useState(false);
   const monitorRef = useRef<MonitorHandle>(null);
+  // insert popover (raw clip / narration / card at the playhead); the undo
+  // history rides the existing `timeline` state (GET /timeline versions)
+  const [insertOpen, setInsertOpen] = useState(false);
+  const [insertTab, setInsertTab] = useState<"raw" | "narration" | "card">("raw");
+  const [insertSrcStart, setInsertSrcStart] = useState("0");
+  const [insertDur, setInsertDur] = useState("8");
+  const [insertScript, setInsertScript] = useState("");
+  const [insertBrollStart, setInsertBrollStart] = useState("");
+  const [insertCardTitle, setInsertCardTitle] = useState("");
+  const [insertCardSubtitle, setInsertCardSubtitle] = useState("");
 
   useEffect(() => {
     params.then((p) => setId(p.id));
@@ -534,6 +546,123 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     } finally {
       setEditBusy(false);
     }
+  }
+
+  // --- timeline editing v2: delete / add / undo / redo (all server-checkpointed) ---
+
+  async function handleDeleteClip(clip: NleClip) {
+    if (clip.master_index == null) return;
+    setEditBusy(true);
+    await dispatchTool("timeline.remove_clip", { item_index: clip.master_index });
+    setEditBusy(false);
+  }
+
+  const activeVersion = timeline?.active_version ?? nle?.version ?? null;
+  const versions: TimelineVersion[] = timeline?.versions ?? [];
+  const canUndo =
+    activeVersion != null && versions.some((v) => v.version_num < activeVersion);
+  const canRedo =
+    activeVersion != null && versions.some((v) => v.version_num > activeVersion);
+
+  async function activateRelative(dir: -1 | 1) {
+    if (!id || activeVersion == null) return;
+    const candidates = versions
+      .map((v) => v.version_num)
+      .filter((n) => (dir === -1 ? n < activeVersion : n > activeVersion));
+    if (candidates.length === 0) return;
+    const target = dir === -1 ? Math.max(...candidates) : Math.min(...candidates);
+    setEditBusy(true);
+    try {
+      const r = await api.activateVersion(id, target);
+      setRunNote(
+        dir === -1
+          ? `Undo — activated timeline v${r.active_version} (was v${r.previous_version ?? "—"}). Nothing is deleted; Redo walks forward again.`
+          : `Redo — activated timeline v${r.active_version}.`,
+      );
+      await reloadNle();
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setEditBusy(false);
+    }
+  }
+
+  /** master item index under the playhead (insert BEFORE it), null = append */
+  function insertIndexAtPlayhead(): number | null {
+    if (!nle) return null;
+    const c = nle.clips.find(
+      (x) => x.track === "V1_master" && playheadS >= x.start_s && playheadS < x.end_s,
+    );
+    return c?.master_index ?? null;
+  }
+
+  async function handleInsertRaw() {
+    const start = Number(insertSrcStart);
+    const dur = Number(insertDur);
+    if (!Number.isFinite(start) || start < 0 || !Number.isFinite(dur) || dur <= 0) {
+      setError("source start must be >= 0 s and duration > 0 s");
+      return;
+    }
+    setEditBusy(true);
+    await dispatchTool("timeline.insert_raw_clip", {
+      source_start_s: start,
+      dur_s: dur,
+      at_index: insertIndexAtPlayhead(),
+    });
+    setEditBusy(false);
+    setInsertOpen(false);
+  }
+
+  async function handleInsertNarration() {
+    const dur = Number(insertDur);
+    const script = insertScript.trim();
+    if (!script) {
+      setError("write the narration script first");
+      return;
+    }
+    if (!Number.isFinite(dur) || dur < 1 || dur > 120) {
+      setError("narration duration must be 1..120 s");
+      return;
+    }
+    const broll = insertBrollStart.trim();
+    setEditBusy(true);
+    await dispatchTool("timeline.add_narration", {
+      script_text: script,
+      dur_s: dur,
+      at_index: insertIndexAtPlayhead(),
+      ...(broll !== "" && Number.isFinite(Number(broll))
+        ? { broll_source_start_s: Number(broll) }
+        : {}),
+    });
+    setEditBusy(false);
+    setInsertOpen(false);
+    setInsertScript("");
+  }
+
+  async function handleInsertCard() {
+    const title = insertCardTitle.trim();
+    const dur = Number(insertDur);
+    if (!title) {
+      setError("card title is required");
+      return;
+    }
+    if (!Number.isFinite(dur) || dur < 0.5 || dur > 60) {
+      setError("card duration must be 0.5..60 s");
+      return;
+    }
+    setEditBusy(true);
+    await dispatchTool("cards.add", {
+      template: "evidence_fact",
+      title,
+      subtitle: insertCardSubtitle.trim(),
+      start_s: playheadS,
+      dur_s: dur,
+    });
+    setEditBusy(false);
+    setInsertOpen(false);
+    setInsertCardTitle("");
+    setInsertCardSubtitle("");
   }
 
   const seek = useCallback((t: number) => {
@@ -1069,6 +1198,7 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
               asset={playable}
               fps={fps}
               opsRev={nle?.ops_rev ?? null}
+              nle={nle}
               onTimeUpdate={setPlayheadS}
               onChanged={() => reloadNle()}
             />
@@ -1092,7 +1222,102 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
       </div>
 
       {/* ================= timeline dock ================= */}
-      <section className="flex h-[268px] shrink-0 flex-col border-t border-[var(--line-1)] bg-[var(--bg-1)]">
+      <section className="relative flex h-[268px] shrink-0 flex-col border-t border-[var(--line-1)] bg-[var(--bg-1)]">
+        {/* insert popover — Add (+) on the timeline toolbar opens it; lives
+            here so it can overlay the timeline without clipping */}
+        {insertOpen && (
+          <div className="absolute bottom-[270px] left-1/2 z-50 w-[420px] -translate-x-1/2 rounded-lg border border-[var(--line-2)] bg-[var(--bg-2)] p-3 shadow-2xl">
+            <div className="mb-2.5 flex items-center gap-1.5">
+              <span className="micro-label">Insert at {playheadS.toFixed(1)}s</span>
+              <div className="flex-1" />
+              {(["raw", "narration", "card"] as const).map((t) => (
+                <button
+                  key={t}
+                  className={`chip ${insertTab === t ? "chip-acc" : ""}`}
+                  onClick={() => setInsertTab(t)}
+                >
+                  {t === "raw" ? "Raw clip" : t === "narration" ? "Narration VO" : "Card"}
+                </button>
+              ))}
+              <button className="icon-btn !h-5 !w-5" onClick={() => setInsertOpen(false)} title="close">
+                <Icon name="x" size={11} />
+              </button>
+            </div>
+
+            {insertTab === "raw" && (
+              <div className="space-y-2">
+                <p className="text-[11px] leading-relaxed text-[var(--tx-3)]">
+                  Pull a stretch of the SOURCE into the cut at the playhead —
+                  e.g. a cold-open climax from later in the tape. Seconds are
+                  source footage time.
+                </p>
+                <div className="flex gap-2">
+                  <label className="flex-1">
+                    <span className="micro-label">source start (s)</span>
+                    <input className="input mt-1" value={insertSrcStart} onChange={(e) => setInsertSrcStart(e.target.value)} inputMode="decimal" />
+                  </label>
+                  <label className="flex-1">
+                    <span className="micro-label">duration (s)</span>
+                    <input className="input mt-1" value={insertDur} onChange={(e) => setInsertDur(e.target.value)} inputMode="decimal" />
+                  </label>
+                </div>
+                <button className="btn w-full" disabled={editBusy} onClick={handleInsertRaw}>
+                  <Icon name="plus" size={12} /> Insert raw clip
+                </button>
+              </div>
+            )}
+
+            {insertTab === "narration" && (
+              <div className="space-y-2">
+                <p className="text-[11px] leading-relaxed text-[var(--tx-3)]">
+                  A voiceover block over muted b-roll. Leave b-roll empty to ride
+                  the scene the previous clip showed. TTS is synthesized on the
+                  next render/export.
+                </p>
+                <textarea
+                  className="input"
+                  rows={3}
+                  placeholder="narration script — what the viewer hears"
+                  value={insertScript}
+                  onChange={(e) => setInsertScript(e.target.value)}
+                />
+                <div className="flex gap-2">
+                  <label className="flex-1">
+                    <span className="micro-label">duration (s, 1–120)</span>
+                    <input className="input mt-1" value={insertDur} onChange={(e) => setInsertDur(e.target.value)} inputMode="decimal" />
+                  </label>
+                  <label className="flex-1">
+                    <span className="micro-label">b-roll source start (optional)</span>
+                    <input className="input mt-1" placeholder="previous clip's scene" value={insertBrollStart} onChange={(e) => setInsertBrollStart(e.target.value)} inputMode="decimal" />
+                  </label>
+                </div>
+                <button className="btn w-full" disabled={editBusy || !insertScript.trim()} onClick={handleInsertNarration}>
+                  <Icon name="plus" size={12} /> Add narration VO
+                </button>
+              </div>
+            )}
+
+            {insertTab === "card" && (
+              <div className="space-y-2">
+                <p className="text-[11px] leading-relaxed text-[var(--tx-3)]">
+                  A graphic card (evidence fact) overlaid at the playhead.
+                </p>
+                <input className="input" placeholder="card title" value={insertCardTitle} onChange={(e) => setInsertCardTitle(e.target.value)} />
+                <div className="flex gap-2">
+                  <input className="input flex-1" placeholder="subtitle (optional)" value={insertCardSubtitle} onChange={(e) => setInsertCardSubtitle(e.target.value)} />
+                  <label className="w-28">
+                    <span className="micro-label">duration (s)</span>
+                    <input className="input mt-1" value={insertDur} onChange={(e) => setInsertDur(e.target.value)} inputMode="decimal" />
+                  </label>
+                </div>
+                <button className="btn w-full" disabled={editBusy || !insertCardTitle.trim()} onClick={handleInsertCard}>
+                  <Icon name="plus" size={12} /> Add card
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
         <Timeline
           nle={nle}
           playheadS={playheadS}
@@ -1102,6 +1327,12 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
           onSplitAtPlayhead={handleSplitAtPlayhead}
           onDeleteEffect={handleDeleteEffect}
           onAdjustEffectWindow={handleAdjustEffectWindow}
+          onDeleteClip={handleDeleteClip}
+          onInsert={() => setInsertOpen((v) => !v)}
+          canUndo={canUndo}
+          canRedo={canRedo}
+          onUndo={() => activateRelative(-1)}
+          onRedo={() => activateRelative(1)}
         />
       </section>
     </div>

@@ -1794,6 +1794,34 @@ def _apply_audio_mode(timeline, deps: PipelineDeps) -> None:
             meta["audio_mode"] = mode
 
 
+def _downgrade_2bus_audio_mode(timeline) -> int:
+    """isolate_2bus -> loudnorm_48k on every raw master clip; returns the count.
+
+    The renderer hard-refuses an isolate_2bus clip without its enhanced master
+    WAV (the no-silent-fallback law) — a machine with no neural enhancer would
+    die at audio_prep and never render anything. This downgrade keeps the
+    render HONEST instead of dead: leveled raw audio, named in the receipt,
+    and re-running after `scripts/fetch_deep_filter.py` restores 2-bus without
+    redoing finished stages. In-memory only — the persisted version keeps the
+    operator's audio law for the next, upgraded run.
+    """
+    from director_os.otio_engine.timeline import MASTER_TRACK, is_gap, track_by_name
+
+    master = track_by_name(timeline, MASTER_TRACK)
+    if master is None:
+        return 0
+    n = 0
+    for item in master:
+        if is_gap(item):
+            continue
+        meta = dict(item.metadata.get("director_os") or {})
+        if meta.get("audio_mode") == "isolate_2bus":
+            meta["audio_mode"] = "loudnorm_48k"
+            item.metadata.update({"director_os": meta})
+            n += 1
+    return n
+
+
 def _documentary_scaffold(
     asset_id: str, dur: float, fps: int, w: int, h: int, audio_mode: str
 ) -> Any:
@@ -2580,20 +2608,56 @@ def run_pipeline(
         if deps.audio_mode == "isolate_2bus":
             tracker.stage(JobStage.audio_prep.value, 52.0)
             _check_stop(deps, project_id)
+            from director_os.audio_engine.enhance import EnhancerUnavailableError, resolve_enhancer
             from director_os.worker.audio_enhance import stage_audio_enhance
 
             kept = kept_windows_from_timeline(timeline, asset_id)
-            with tracker.step("audio_prep", "2-bus speech enhancement — kept windows"):
-                enhance_info = stage_audio_enhance(
-                    asset_id,
-                    source,
-                    transcript,
-                    project_id,
-                    deps,
-                    enhancer=deps.speech_enhancer,
-                    kept_windows=kept or None,
-                    music_flagged_spans=music_spans,
+            # THE UNINSTALLED-ENHANCER LAW: a machine without deep-filter must
+            # still get its cut. The step is SKIPPED — loudly, never silently —
+            # the raw clips downgrade isolate_2bus -> loudnorm_48k so render
+            # proceeds with leveled raw audio, and installing deep-filter later
+            # (scripts/fetch_deep_filter.py) + Run upgrades the audio without
+            # redoing finished stages. The published-QA law is untouched: the
+            # receipt still names the engine actually used.
+            enhancer_ready = True
+            if deps.speech_enhancer is None:
+                try:
+                    resolve_enhancer()
+                except EnhancerUnavailableError:
+                    enhancer_ready = False
+            if not enhancer_ready:
+                with tracker.step("audio_prep", "2-bus speech enhancement — kept windows") as st:
+                    st.skip(
+                        "no neural enhancer installed (deep-filter) — loudnorm fallback; "
+                        "install per scripts/fetch_deep_filter.py and re-run to upgrade"
+                    )
+                n_downgraded = _downgrade_2bus_audio_mode(timeline)
+                deps.log(
+                    "  [audio-prep] SKIPPED — no neural speech enhancer (deep-filter) on this "
+                    f"machine; {n_downgraded} raw clip(s) render with loudnorm raw audio. "
+                    "Install it (python scripts/fetch_deep_filter.py) and press Run again — "
+                    "finished stages are never redone, only the audio is upgraded."
                 )
+            else:
+                try:
+                    with tracker.step("audio_prep", "2-bus speech enhancement — kept windows"):
+                        enhance_info = stage_audio_enhance(
+                            asset_id,
+                            source,
+                            transcript,
+                            project_id,
+                            deps,
+                            enhancer=deps.speech_enhancer,
+                            kept_windows=kept or None,
+                            music_flagged_spans=music_spans,
+                        )
+                except EnhancerUnavailableError as e:
+                    # binary vanished between probe and use — same honest skip
+                    deps.log(
+                        f"  [audio-prep] SKIPPED — enhancer unavailable mid-run ({e}); "
+                        "loudnorm fallback. Install deep-filter and re-run to upgrade."
+                    )
+                    _downgrade_2bus_audio_mode(timeline)
 
         tracker.stage(JobStage.render.value, 60.0)
         _check_stop(deps, project_id)
