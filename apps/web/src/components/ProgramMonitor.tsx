@@ -71,7 +71,12 @@ export const ProgramMonitor = forwardRef<
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
-  const { state: nle } = useNLEShortcuts({ videoRef, fps, enabled: !drawMode });
+  const { state: nle } = useNLEShortcuts({
+    videoRef,
+    fps,
+    enabled: !drawMode,
+    onUndo: undoNewestOp,
+  });
 
   useImperativeHandle(ref, () => ({
     seek: (t: number) => {
@@ -256,6 +261,26 @@ export const ProgramMonitor = forwardRef<
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [selectedOp, drawMode, regions, projectId, asset.width, asset.height, onChanged]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /** Ctrl+Z = undo the NEWEST op (revoke — history kept). The fold sorts by
+   * rev, so repeated undos naturally walk back one op at a time; returns
+   * false when no op-backed box exists, falling through to marker undo. */
+  function undoNewestOp(): boolean {
+    const latest = regions.reduce<NleEffect | null>((acc, r) => {
+      if (!r.op_id) return acc;
+      if (!acc || (r.op_rev ?? 0) > (acc.op_rev ?? 0)) return r;
+      return acc;
+    }, null);
+    if (!latest?.op_id) return false;
+    void api
+      .revokeOp(projectId, latest.op_id, "undo (Ctrl+Z)")
+      .then(async () => {
+        await reload();
+        onChanged();
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+    return true;
+  }
 
   async function removeRegion(r: NleEffect) {
     try {
@@ -621,7 +646,7 @@ export const ProgramMonitor = forwardRef<
         <span>I / O mark in-out</span>
         <span>←/→ frame step</span>
         <span>S split at playhead</span>
-        <span>Ctrl+Z undo</span>
+        <span title="revokes the newest op on the log (history kept); falls back to in/out marker undo">Ctrl+Z undo op</span>
         <span title="with a box selected: drag to move, corner to resize, Alt+arrows nudge (Shift = 10 px), Esc deselect">Alt+←↑↓→ nudge box</span>
       </div>
     </div>

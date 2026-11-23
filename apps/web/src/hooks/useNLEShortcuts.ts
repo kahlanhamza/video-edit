@@ -21,6 +21,10 @@ export interface UseNLEShortcutsOptions {
   onInOut?: (inS: number | null, outS: number | null) => void;
   /** False disables the key listener entirely (e.g. while drawing a blur box). */
   enabled?: boolean;
+  /** Ctrl+Z: return true when a SERVER-side undo consumed the event (op
+   * revoke); false falls through to the local marker undo. Latest-callback
+   * ref — safe to pass an inline closure. */
+  onUndo?: () => boolean;
 }
 
 const EDITABLE = new Set(["INPUT", "TEXTAREA", "SELECT"]);
@@ -36,13 +40,14 @@ export function useNLEShortcuts({
   onSplit,
   onInOut,
   enabled = true,
+  onUndo,
 }: UseNLEShortcutsOptions) {
   const [state, dispatch] = useReducer(nleReducer, initialNLEState);
   const [active, setActive] = useState(false);
   const rafRef = useRef<number | null>(null);
   // Latest-callback refs so the key handler never goes stale.
-  const cbs = useRef({ onSplit, onInOut });
-  cbs.current = { onSplit, onInOut };
+  const cbs = useRef({ onSplit, onInOut, onUndo });
+  cbs.current = { onSplit, onInOut, onUndo };
 
   const lastMarkers = useRef<{ inS: number | null; outS: number | null }>({
     inS: state.inS,
@@ -177,6 +182,9 @@ export function useNLEShortcuts({
         case "KeyZ":
           if (e.ctrlKey || e.metaKey) {
             e.preventDefault();
+            // a server-side op undo (revoke newest op) wins when available;
+            // the local marker stack is the fallback, never a double action
+            if (cbs.current.onUndo?.()) return;
             dispatch({ type: "undo" });
           }
           break;

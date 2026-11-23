@@ -109,6 +109,29 @@ describe("useNLEShortcuts", () => {
     expect(result.current.state.splits).toEqual([]);
   });
 
+  it("Ctrl+Z prefers the server op undo when onUndo returns true — never a double undo", () => {
+    const onUndo = vi.fn(() => true); // an op revoke fired on the server
+    const { result } = renderHook(() =>
+      useNLEShortcuts({ videoRef: { current: video }, onUndo }),
+    );
+    act(() => window.dispatchEvent(keyEvent("KeyS")));
+    expect(result.current.state.splits).toEqual([3.5]);
+    act(() => window.dispatchEvent(keyEvent("KeyZ", { ctrlKey: true })));
+    expect(onUndo).toHaveBeenCalledTimes(1);
+    expect(result.current.state.splits).toEqual([3.5]); // markers untouched
+  });
+
+  it("Ctrl+Z falls back to marker undo when onUndo returns false (no ops to revoke)", () => {
+    const onUndo = vi.fn(() => false);
+    const { result } = renderHook(() =>
+      useNLEShortcuts({ videoRef: { current: video }, onUndo }),
+    );
+    act(() => window.dispatchEvent(keyEvent("KeyS")));
+    act(() => window.dispatchEvent(keyEvent("KeyZ", { ctrlKey: true })));
+    expect(onUndo).toHaveBeenCalledTimes(1);
+    expect(result.current.state.splits).toEqual([]);
+  });
+
   it("ignores transport keys while typing in an input", () => {
     const input = document.createElement("input");
     document.body.appendChild(input);
