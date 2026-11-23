@@ -26,6 +26,7 @@ import {
   timelineWidth,
 } from "@/lib/nle";
 import type { NleCaption, NleClip, NleEffect, NleTimeline } from "@/lib/api";
+import { effectWindowFrames } from "@/lib/nle";
 import { Icon } from "./icons";
 
 const TRACK_HEAD_W = 148;
@@ -40,7 +41,11 @@ type DragMode =
   | { kind: "none" }
   | { kind: "seek" }
   | { kind: "trim-left"; clip: NleClip }
-  | { kind: "trim-right"; clip: NleClip };
+  | { kind: "trim-right"; clip: NleClip }
+  // FX-track edge drag: retime the op's frame window (adjust endpoint carries
+  // frame_start/frame_end; the box geometry passes through unchanged)
+  | { kind: "fx-start"; fx: NleEffect }
+  | { kind: "fx-end"; fx: NleEffect };
 
 export interface TimelineProps {
   nle: NleTimeline | null;
@@ -49,6 +54,8 @@ export interface TimelineProps {
   onTrimClip?: (itemIndex: number, newStartS: number, newDurS: number) => void;
   onSplitAtPlayhead?: (playheadS: number) => void;
   onDeleteEffect?: (effectId: string) => void;
+  /** Drag an op-backed effect block's edge → new frame window (raw frames). */
+  onAdjustEffectWindow?: (opId: string, frameStart: number, frameEnd: number) => void;
 }
 
 interface TrackDef {
@@ -67,6 +74,7 @@ export default function Timeline({
   onTrimClip,
   onSplitAtPlayhead,
   onDeleteEffect,
+  onAdjustEffectWindow,
 }: TimelineProps) {
   const [pxPerS, setPxPerS] = useState(24);
   const [selected, setSelected] = useState<string | null>(null);
@@ -157,6 +165,22 @@ export default function Timeline({
       if (c.master_index != null && c.source_start_s != null) {
         const newDur = Math.max(0.1, dragTimeRef.current - c.start_s);
         onTrimClip(c.master_index, c.source_start_s, Number(newDur.toFixed(3)));
+      }
+    }
+    if (
+      (drag.kind === "fx-start" || drag.kind === "fx-end") &&
+      onAdjustEffectWindow &&
+      drag.fx.op_id
+    ) {
+      const win = effectWindowFrames(
+        drag.kind === "fx-start" ? "start" : "end",
+        dragTimeRef.current,
+        fps,
+        duration,
+        { start: drag.fx.frame_start ?? null, end: drag.fx.frame_end ?? null },
+      );
+      if (win) {
+        onAdjustEffectWindow(drag.fx.op_id, win.frame_start, win.frame_end);
       }
     }
     setDrag({ kind: "none" });
@@ -377,6 +401,8 @@ export default function Timeline({
                           duration={duration}
                           onSeek={onSeek}
                           onDelete={onDeleteEffect}
+                          onDragStartEdge={(fx) => setDrag({ kind: "fx-start", fx })}
+                          onDragEndEdge={(fx) => setDrag({ kind: "fx-end", fx })}
                         />
                       )}
                       {lane &&
@@ -658,12 +684,16 @@ function EffectTrack({
   duration,
   onSeek,
   onDelete,
+  onDragStartEdge,
+  onDragEndEdge,
 }: {
   effects: NleEffect[];
   zoom: number;
   duration: number;
   onSeek: (t: number) => void;
   onDelete?: (id: string) => void;
+  onDragStartEdge?: (fx: NleEffect) => void;
+  onDragEndEdge?: (fx: NleEffect) => void;
 }) {
   if (effects.length === 0) return null;
   return (
@@ -673,6 +703,7 @@ function EffectTrack({
         const end = fx.t_end_s ?? duration;
         const w = Math.max(6, (end - start) * zoom);
         const agent = fx.origin === "agent";
+        const adjustable = !!fx.op_id && fx.mode !== "tracked" && !!onDragStartEdge;
         return (
           <div
             key={fx.id}
@@ -714,6 +745,26 @@ function EffectTrack({
                 </button>
               )}
             </div>
+            {adjustable && (
+              <>
+                <span
+                  className="trim-handle left-0"
+                  title="drag to retime the effect's start frame (release lands the adjust op)"
+                  onMouseDown={(e) => {
+                    e.stopPropagation();
+                    onDragStartEdge?.(fx);
+                  }}
+                />
+                <span
+                  className="trim-handle right-0"
+                  title="drag to retime the effect's end frame (release lands the adjust op)"
+                  onMouseDown={(e) => {
+                    e.stopPropagation();
+                    onDragEndEdge?.(fx);
+                  }}
+                />
+              </>
+            )}
           </div>
         );
       })}

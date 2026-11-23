@@ -498,7 +498,16 @@ export const api = {
   adjustOp: (
     id: string,
     opId: string,
-    patch: { x: number; y: number; w: number; h: number; sigma?: number; note?: string },
+    patch: {
+      x: number;
+      y: number;
+      w: number;
+      h: number;
+      sigma?: number;
+      frame_start?: number;
+      frame_end?: number;
+      note?: string;
+    },
   ) =>
     req<OpRecord>(`/projects/${id}/ops/${opId}/adjust`, {
       method: "POST",

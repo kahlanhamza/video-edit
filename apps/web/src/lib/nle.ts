@@ -264,3 +264,34 @@ export function adjustedBox(
   y = Math.round(clamp(y, 0, Math.max(0, assetH - h)));
   return { x, y, w: Math.round(w), h: Math.round(h) };
 }
+
+// --- effect window retime (FX track edge drag → adjust op frame window) ------
+
+/**
+ * The frame window an FX-track edge drag lands, derived from the drag time:
+ * seconds → raw frames via fps, clamped inside the tape, start < end. The
+ * OTHER edge stays pinned (`startFrame`/`endFrame` = the op's current window
+ * or the tape ends when the op had none). Returns null when the drag would
+ * invert or zero the window — the caller keeps the previous window then.
+ */
+export function effectWindowFrames(
+  side: "start" | "end",
+  dragS: number,
+  fps: number,
+  durationS: number,
+  current: { start: number | null; end: number | null },
+): { frame_start: number; frame_end: number } | null {
+  if (fps <= 0 || durationS <= 0) return null;
+  const lastFrame = Math.max(0, Math.floor(durationS * fps) - 1);
+  const t = Math.round(dragS * fps);
+  if (side === "start") {
+    const frame_start = clamp(t, 0, lastFrame);
+    const frame_end = current.end ?? lastFrame;
+    if (frame_end <= frame_start) return null;
+    return { frame_start, frame_end };
+  }
+  const frame_end = clamp(t, 0, lastFrame);
+  const frame_start = current.start ?? 0;
+  if (frame_end <= frame_start) return null;
+  return { frame_start, frame_end };
+}

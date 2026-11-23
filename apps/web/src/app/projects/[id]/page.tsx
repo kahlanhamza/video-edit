@@ -468,6 +468,30 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     }
   }
 
+  async function handleAdjustEffectWindow(opId: string, frameStart: number, frameEnd: number) {
+    if (!id || !nle) return;
+    const fx = nle.effects.find((e) => e.op_id === opId);
+    if (!fx) return;
+    setEditBusy(true);
+    try {
+      // geometry carries over; the drag only retimes the frame window
+      await api.adjustOp(id, opId, {
+        x: fx.x,
+        y: fx.y,
+        w: fx.w,
+        h: fx.h,
+        frame_start: frameStart,
+        frame_end: frameEnd,
+        note: "window retimed from the FX track",
+      });
+      await reloadNle();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setEditBusy(false);
+    }
+  }
+
   const seek = useCallback((t: number) => {
     setPlayheadS(t);
     monitorRef.current?.seek(t);
@@ -960,6 +984,7 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
           onTrimClip={handleTrim}
           onSplitAtPlayhead={handleSplitAtPlayhead}
           onDeleteEffect={handleDeleteEffect}
+          onAdjustEffectWindow={handleAdjustEffectWindow}
         />
       </section>
     </div>
