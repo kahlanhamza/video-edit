@@ -36,7 +36,7 @@ const opsStreamUrlMock = vi.fn(
 );
 
 vi.mock("@/lib/api", () => ({
-  api: { opsStreamUrl: (...a: unknown[]) => opsStreamUrlMock(...a) },
+  api: { opsStreamUrl: (pid: string) => opsStreamUrlMock(pid) },
 }));
 
 function lastSource(): FakeEventSource {
