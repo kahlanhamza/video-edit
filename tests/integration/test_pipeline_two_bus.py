@@ -276,9 +276,7 @@ def test_full_pipeline_two_bus_render_is_clean_and_proven(noisy_bodycam, project
         )
 
 
-def test_missing_enhancer_skips_loudly_never_silently(
-    noisy_bodycam, project, deps, monkeypatch
-):
+def test_missing_enhancer_skips_loudly_never_silently(noisy_bodycam, project, deps, monkeypatch):
     """No neural enhancer available + auto resolution => the audio_prep step
     is SKIPPED (loudly — the step row + console say why and how to upgrade),
     the raw clips downgrade to loudnorm, and the job still reaches the human
@@ -307,11 +305,7 @@ def test_missing_enhancer_skips_loudly_never_silently(
         job = s.execute(select(JobRow)).scalars().one()
         assert job.current_stage == "human_gate"
         assert job.error_message is None
-        step = (
-            s.execute(select(JobStepRow).where(JobStepRow.key == "audio_prep"))
-            .scalars()
-            .one()
-        )
+        step = s.execute(select(JobStepRow).where(JobStepRow.key == "audio_prep")).scalars().one()
         assert step.status == "skipped"
         assert "loudnorm fallback" in (step.detail or "")
 
