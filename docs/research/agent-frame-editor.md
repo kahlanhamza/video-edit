@@ -285,9 +285,14 @@ Design rules (all inherited from verified research + our own live sessions):
    union region so the shipped render path never loses privacy coverage; the
    ProgramMonitor draws the box FOLLOWING the object at the playhead and
    offers one-click "track from playhead" (seed op superseded, history kept).
-4. **Frame-scoped render ops**: per-op bake of [frame_start, frame_end] into
-   the segment graph (the `_tracked_redacted_clip` machinery generalized);
-   preview = overlay; nothing baked until Export.
+4. **Frame-scoped render ops** — *shipped:* `trajectory.merge_op_params`
+   folds every active tracked blur op into the render plan on the SAME Pass-2
+   path as detector sweeps (One-Euro smoothing, padded envelope, lead-in/out);
+   the pipeline bake (`_tracked_redacted_clip` per kept clip + the whole-source
+   fallback) consumes the merged plan, and the merged digest carries the op
+   fingerprint — an op edit/undo invalidates exactly the baked segments
+   (content-addressed cache law), preview stays overlay-only, Export is the
+   only render.
 5. **Chat agent v2**: orchestrator + selector/editor/critic roles over the
    registry, context pack = op digest + evidence; Studio chat panel (the
    console + SSE rails already exist).

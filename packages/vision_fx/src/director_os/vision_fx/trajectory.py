@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import math
 
-from director_os.vision_fx.compute.base import FaceTrack
+from director_os.vision_fx.compute.base import FaceTrack, TrackHit
 from director_os.vision_fx.one_euro import OneEuroFilter
 from pydantic import BaseModel, Field
 
@@ -183,6 +183,61 @@ def repair_trajectories(
         frame_h=frame_h,
         trajectories=trajectories,
     )
+
+
+def merge_op_params(
+    plan: PerFrameRedaction,
+    op_params_list: list[dict],
+    *,
+    fps: float | None = None,
+) -> tuple[PerFrameRedaction, bool]:
+    """Tracked blur ops -> additional render trajectories (roadmap step 4).
+
+    Every active `blur` op whose params carry `mode="tracked"` + a `tracked`
+    per-frame path (the selection service's output) becomes a RedactionTrajectory
+    RIDING the same Pass-2 repair as detector tracks: One-Euro smoothing, the
+    padded safety envelope, lead-in/out, bounded-gap bridging — ONE smoothing
+    code path for every box the render bakes (the house law). Hits outside the
+    plan's frame range are dropped; ops without a usable path are skipped.
+
+    Returns (plan, changed): `changed` False when no op contributed (the caller
+    keeps the original digest and the bake cache stays warm).
+    """
+    use_fps = float(fps if fps is not None else plan.fps)
+    tracks: list[FaceTrack] = []
+    for params in op_params_list:
+        if not isinstance(params, dict) or str(params.get("mode", "")) != "tracked":
+            continue
+        raw_hits = params.get("tracked") or []
+        hits: list[TrackHit] = []
+        for h in raw_hits:
+            try:
+                hit = TrackHit.model_validate(h)
+            except Exception:  # noqa: BLE001 — one malformed hit never kills the plan
+                continue
+            fi = int(round(hit.t_s * use_fps))
+            if fi < 0 or (plan.n_frames and fi >= plan.n_frames):
+                continue
+            hits.append(hit)
+        if len(hits) < 2:
+            continue
+        label = str(params.get("tracked_backend", "") or "op")
+        tracks.append(FaceTrack(track_id=f"sel_{label}", hits=hits))
+    if not tracks:
+        return plan, False
+    repaired = repair_trajectories(
+        tracks,
+        fps=use_fps,
+        frame_w=plan.frame_w,
+        frame_h=plan.frame_h,
+        n_frames=plan.n_frames,
+    )
+    merged = plan.model_copy(deep=True)
+    merged.trajectories = sorted(
+        [*merged.trajectories, *repaired.trajectories],
+        key=lambda t: (t.frame_start, t.track_id),
+    )
+    return merged, True
 
 
 def tracks_to_per_frame(

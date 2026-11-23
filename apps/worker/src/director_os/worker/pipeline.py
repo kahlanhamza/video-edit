@@ -64,6 +64,7 @@ from director_os.otio_engine.timeline import (
     save_otio,
     to_json_dict,
 )
+from director_os.vision_fx.trajectory import PerFrameRedaction
 from director_os.worker.progress import RunTracker
 from sqlalchemy import select
 
@@ -1028,16 +1029,16 @@ def _tracked_redacted_source(
     with deps.sessions() as s:
         row = s.get(PerceptionIndexRow, asset_id)
         payload = (row.redaction_tracks_json or {}) if row else {}
-    per_frame = payload.get("per_frame")
-    if not per_frame or deps.redact_backend != "tracked":
+    if deps.redact_backend != "tracked":
         return None
     from director_os.vision_fx.redact_track import (
         render_tracked_redaction,
     )
-    from director_os.vision_fx.trajectory import PerFrameRedaction
 
-    plan = PerFrameRedaction.model_validate(per_frame)
-    digest = payload.get("plan_digest") or "unpinned"
+    with_ops = _render_plan_with_ops(deps, project_id, payload)
+    if with_ops is None:
+        return None
+    plan, digest = with_ops
     dst = out_dir / f"redacted_source_{digest}.mp4"
     if dst.exists() and dst.stat().st_size > 0:
         deps.log(f"  [render] baked redacted source reuse ({dst.name})")
@@ -1068,6 +1069,62 @@ def _cfr_source(source: Path, out_dir: Path) -> Path:
         if not exact or n <= 0:
             normalize_cfr(source, dst)
     return dst
+
+
+def _render_plan_with_ops(
+    deps: PipelineDeps,
+    project_id: str,
+    payload: dict,
+) -> tuple[PerFrameRedaction, str] | None:
+    """The plan the render bakes: sweep plan + tracked op paths (step 4).
+
+    The sweep's per-frame plan is content-addressed by its digest; every
+    ACTIVE tracked blur op rides on top (Pass-2 repair, one smoothing path).
+    The merged digest mixes the sweep digest with the op set's identity, so
+    adding/revoking an op invalidates exactly the baked clips that cached the
+    old program — preview is overlay-only, Export is the only render, and a
+    re-render after an op edit re-bakes ONLY the dirty segments (cache law).
+    """
+    import hashlib
+
+    from director_os.core.db import TimelineOpRow
+    from director_os.vision_fx.trajectory import merge_op_params
+    from sqlalchemy import select
+
+    per_frame = payload.get("per_frame")
+    if not per_frame:
+        return None
+    plan = PerFrameRedaction.model_validate(per_frame)
+    digest = str(payload.get("plan_digest") or "unpinned")
+
+    with deps.sessions() as s:
+        rows = (
+            s.execute(
+                select(TimelineOpRow)
+                .where(
+                    TimelineOpRow.project_id == project_id,
+                    TimelineOpRow.kind == "blur",
+                    TimelineOpRow.revoked_at.is_(None),
+                )
+                .order_by(TimelineOpRow.rev)
+            )
+            .scalars()
+            .all()
+        )
+        op_rows = [(str(r.id), dict(r.params or {})) for r in rows]
+
+    merged, changed = merge_op_params(plan, [params for _id, params in op_rows])
+    if not changed:
+        return plan, digest
+    op_fingerprint = hashlib.sha256(
+        json.dumps(op_rows, sort_keys=True, default=str).encode()
+    ).hexdigest()[:8]
+    merged_digest = f"{digest}+ops{op_fingerprint}"[:24]
+    deps.log(
+        f"  [render] merged {len(merged.trajectories)} trajectory(ies) "
+        f"in the render plan (ops baked, digest {merged_digest})"
+    )
+    return merged, merged_digest
 
 
 def _clip_plan(plan, start_s: float, dur_s: float):
@@ -1205,16 +1262,16 @@ def _baked_clip_sources(
         item_duration_s,
         track_by_name,
     )
-    from director_os.vision_fx.trajectory import PerFrameRedaction
 
     with deps.sessions() as s:
         row = s.get(PerceptionIndexRow, asset_id)
         payload = (row.redaction_tracks_json or {}) if row else {}
-    per_frame = payload.get("per_frame")
-    if not per_frame or deps.redact_backend != "tracked":
+    if deps.redact_backend != "tracked":
         return {}, {}
-    plan = PerFrameRedaction.model_validate(per_frame)
-    digest = str(payload.get("plan_digest") or "unpinned")
+    with_ops = _render_plan_with_ops(deps, project_id, payload)
+    if with_ops is None:
+        return {}, {}
+    plan, digest = with_ops
 
     master = track_by_name(timeline, MASTER_TRACK)
     if master is None:
