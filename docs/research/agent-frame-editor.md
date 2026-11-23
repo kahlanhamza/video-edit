@@ -293,9 +293,15 @@ Design rules (all inherited from verified research + our own live sessions):
    fingerprint — an op edit/undo invalidates exactly the baked segments
    (content-addressed cache law), preview stays overlay-only, Export is the
    only render.
-5. **Chat agent v2**: orchestrator + selector/editor/critic roles over the
-   registry, context pack = op digest + evidence; Studio chat panel (the
-   console + SSE rails already exist).
+5. **Chat agent v2** — *shipped:* `agent_runtime/chat_v2.py` — one bounded
+   orchestrator turn per message (cap 3 tool rounds + 1 critic repair round,
+   Azure/Anthropic discipline): roles are roles over the SAME registry
+   (ADR-0011), context pack = op digest + tool catalog (perceive-first law),
+   fail-closed-with-feedback (unknown tool = a result the next round sees),
+   execute-then-done (a model that sends calls with done=true still gets them
+   dispatched), never-an-empty-reply (deterministic fallback), critic gate =
+   qa.self_audit. API `POST /projects/{id}/agent/chat`; Studio ChatPanel shows
+   every call with ok badges + critic verdict (no black box).
 6. **Export gate UI**: one button, dirty-segment compile, progress per
    segment (RunTracker steps already give per-step bars).
 

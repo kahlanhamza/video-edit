@@ -474,6 +474,27 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ note }),
     }),
+  // --- chat agent v2 (roadmap step 5): one bounded orchestrator turn ---
+  agentChat: (
+    id: string,
+    body: {
+      message: string;
+      niche?: string;
+      history?: Array<{ role: string; content: string }>;
+    },
+  ) =>
+    req<{
+      ok: boolean;
+      reply: string;
+      rounds: number;
+      calls: Array<{ tool: string; ok: boolean; detail: string }>;
+      critic: Record<string, unknown> | null;
+      version: number | null;
+      detail: string;
+    }>(`/projects/${id}/agent/chat`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
   importLegacyOps: (id: string) =>
     req<{ imported: number; skipped: number; total_regions: number }>(
       `/projects/${id}/ops/import-legacy`,

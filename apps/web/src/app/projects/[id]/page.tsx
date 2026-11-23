@@ -18,6 +18,7 @@ import {
   MonitorHandle,
   ProgramMonitor,
 } from "@/components/ProgramMonitor";
+import ChatPanel from "@/components/studio/ChatPanel";
 import ConsolePanel from "@/components/studio/ConsolePanel";
 import { Icon, IconName } from "@/components/studio/icons";
 import PipelinePanel from "@/components/studio/PipelinePanel";
@@ -912,6 +913,9 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
         <aside className="flex w-[340px] shrink-0 flex-col overflow-hidden border-l border-[var(--line-1)] bg-[var(--bg-1)] xl:w-[380px]">
           <div className="flex min-h-0 flex-[1.15] flex-col">
             <PipelinePanel live={live} />
+          </div>
+          <div className="flex min-h-0 flex-[1.2] flex-col">
+            <ChatPanel projectId={id} />
           </div>
           <div className="flex min-h-0 flex-1 flex-col">
             <ConsolePanel live={live} />

@@ -693,6 +693,101 @@ def timeline_nle(project_id: str) -> JSONResponse:
     return JSONResponse(snapshot)
 
 
+# --- chat agent v2 (roadmap step 5): one bounded orchestrator turn -------------
+
+
+class AgentChatIn(BaseModel):
+    message: str = Field(min_length=1, max_length=4000)
+    niche: str = Field(default="bodycam_documentary", max_length=60)
+    history: list[dict[str, str]] = Field(default_factory=list, max_length=20)
+
+
+class AgentChatCallOut(BaseModel):
+    tool: str
+    ok: bool
+    detail: str
+
+
+class AgentChatOut(BaseModel):
+    ok: bool
+    reply: str
+    rounds: int
+    calls: list[AgentChatCallOut]
+    critic: dict[str, Any] | None
+    version: int | None
+    detail: str
+
+
+@app.post("/projects/{project_id}/agent/chat", response_model=AgentChatOut)
+def agent_chat(project_id: str, body: AgentChatIn) -> AgentChatOut:
+    """One chat turn: perceive (op digest + evidence pack) -> act through the
+    typed registry -> critic gate with at most ONE repair round -> answer.
+
+    Roles are roles, not services (ADR-0011): selector/editor/critic switch
+    hats inside the turn over the SAME audited, checkpointed tools. A failed
+    step auto-rolls-back (checkpoint-first law); the reply is never empty.
+    """
+    from director_os.agent_runtime.chat_v2 import build_context_pack, run_chat_turn
+
+    factory = _session_factory
+    if factory is None:
+        raise HTTPException(status_code=500, detail="session factory not initialized")
+
+    s = session()
+    try:
+        project = s.get(ProjectRow, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        active = project.active_otio_version_id
+    finally:
+        s.close()
+
+    store = CheckpointStore(factory)
+    if active is None:
+        raise HTTPException(
+            status_code=422, detail="project has no timeline yet — run the pipeline first"
+        )
+    timeline = store.load_version(project_id, active)
+    toolbox = DirectorToolbox(timeline, project_id)
+    registry = build_director_registry(toolbox)
+    ops_store = OpsStore(factory, project_id)
+    register_ops_tools(registry, ops_store, project_id)
+    work_dir = get_settings().output_dir / "pipeline" / project_id
+    register_selection_tools(registry, ops_store, work_dir, agent_name="chat_agent")
+    try:
+        backend = build_backend_chain(registry, body.niche)
+    except LLMBackendError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    executor = PlannerExecutor(registry, store, project_id, agent="chat_agent", role="director")
+    pack = build_context_pack(ops_store, registry)
+    result = run_chat_turn(
+        backend,
+        registry,
+        executor,
+        ops_store,
+        user_message=body.message,
+        context_pack=pack,
+        history=body.history,
+        timeline=timeline,
+    )
+
+    # the durable post-turn state: the executor checkpointed every step
+    with factory() as s2:
+        p = s2.get(ProjectRow, project_id)
+        final_version = p.active_otio_version_id if p else None
+
+    return AgentChatOut(
+        ok=all(c["ok"] for c in result.calls) if result.calls else True,
+        reply=result.reply,
+        rounds=result.rounds,
+        calls=[AgentChatCallOut(**c) for c in result.calls],
+        critic=result.critic,
+        version=final_version,
+        detail=result.detail,
+    )
+
+
 # ------------------------------------------------------------------ agent dispatch
 class AgentDispatchRequest(BaseModel):
     """One agent tool call, executed checkpoint-first against the active timeline."""
