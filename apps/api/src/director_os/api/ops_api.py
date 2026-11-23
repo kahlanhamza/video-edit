@@ -22,6 +22,7 @@ from typing import Any
 
 from director_os.core.db import MediaAssetRow, ProjectRow
 from director_os.core.ops import (
+    EFFECT_KINDS,
     OpCreate,
     OpRecord,
     OpsFold,
@@ -178,6 +179,23 @@ class RevokeIn(BaseModel):
     note: str = Field(default="", max_length=1000)
 
 
+class AdjustIn(BaseModel):
+    """Manual geometry correction for one active blur/inpaint op (the owner
+    mandate: agent ops stay manually adjustable afterwards). Adjust is NOT an
+    in-place mutation — the append-only law holds: a NEW op carries the
+    corrected box (`params.adjusts_op_id` chains it), the old op is revoked,
+    every row and every hop stays on the audit trail."""
+
+    x: int = Field(ge=0)
+    y: int = Field(ge=0)
+    w: int = Field(gt=0)
+    h: int = Field(gt=0)
+    sigma: int | None = Field(default=None, ge=0, le=64)
+    frame_start: int | None = Field(default=None, ge=0)
+    frame_end: int | None = Field(default=None, ge=0)
+    note: str = Field(default="", max_length=1000)
+
+
 class ImportLegacyOut(BaseModel):
     imported: int
     skipped: int
@@ -281,6 +299,80 @@ def revoke_op(project_id: str, op_id: str, body: RevokeIn | None = None) -> OpOu
     if rec.kind in ("blur", "inpaint") and rec.asset_id:
         _drop_blur_region(rec.asset_id, rec.id)
     return _out(rec)
+
+
+@router.post("/ops/{op_id}/adjust", response_model=OpOut)
+def adjust_op(project_id: str, op_id: str, body: AdjustIn) -> OpOut:
+    """Manual adjust of one active blur/inpaint box — the human half of the
+    dual-modality law (agent proposes, human refines, both on one log).
+
+    Semantics (append-only, never an in-place row edit):
+    1. a NEW op is appended with the corrected geometry + `adjusts_op_id`;
+    2. its region dual-writes the render path FIRST;
+    3. only then the superseded op is revoked and its region dropped —
+       privacy coverage never has a gap, not even across a crash.
+    Tracked ops honestly refuse: their geometry is the per-frame path, a
+    silent conversion to a static box would look like coverage but leak.
+    """
+    _require_project(project_id)
+    store = _store(project_id)
+    rec = store.get(op_id)
+    if rec is None or rec.project_id != project_id:
+        raise HTTPException(status_code=404, detail=f"op not found: {op_id}")
+    if rec.revoked:
+        raise HTTPException(status_code=409, detail=f"op already revoked: {op_id}")
+    if rec.kind not in EFFECT_KINDS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"kind '{rec.kind}' has no box geometry to adjust "
+            f"(adjustable: {', '.join(EFFECT_KINDS)})",
+        )
+    if str((rec.params or {}).get("mode", "static")) == "tracked":
+        raise HTTPException(
+            status_code=409,
+            detail="tracked op: its geometry is the per-frame path — revoke it "
+            "and track again from the corrected box (never a silent static conversion)",
+        )
+    asset = _primary_asset(project_id)
+    fs = body.frame_start if body.frame_start is not None else rec.frame_start
+    fe = body.frame_end if body.frame_end is not None else rec.frame_end
+    if fs is not None or fe is not None:
+        try:
+            validate_op_window(
+                fs,
+                fe,
+                float(asset.duration_s) if asset else 0.0,
+                float(asset.fps) if asset else 0.0,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+    params = dict(rec.params or {})
+    params.update({"x": int(body.x), "y": int(body.y), "w": int(body.w), "h": int(body.h)})
+    if body.sigma is not None:
+        params["sigma"] = int(body.sigma)
+    params["adjusts_op_id"] = rec.id
+    note = body.note or f"adjusted from op {rec.id[:8]}"
+    # PRIVACY ORDER (see docstring): new region lands BEFORE the old drops.
+    new = store.create(
+        OpCreate(
+            kind=rec.kind,
+            asset_id=rec.asset_id,
+            frame_start=fs,
+            frame_end=fe,
+            track=rec.track,
+            params=params,
+            origin="human",
+            evidence={**(rec.evidence or {}), "adjusted_from": rec.id},
+            session_id=rec.session_id,
+            note=note,
+        )
+    )
+    if rec.asset_id:
+        _dual_write_blur_region(rec.asset_id, new)
+    store.revoke(rec.id, note=note)
+    if rec.asset_id:
+        _drop_blur_region(rec.asset_id, rec.id)
+    return _out(new)
 
 
 @router.post("/ops/import-legacy", response_model=ImportLegacyOut)

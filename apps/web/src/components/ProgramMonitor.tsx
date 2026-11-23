@@ -13,9 +13,11 @@ import {
   useRef,
   useState,
 } from "react";
-import { Asset, NleEffect, SelectionOut, TrackHit, api, assetProxyUrl, assetScrubUrl } from "@/lib/api";
+import { Asset, NleEffect, OpRecord, SelectionOut, TrackHit, api, assetProxyUrl, assetScrubUrl } from "@/lib/api";
 import {
+  AdjustDrag,
   TrackedBox,
+  adjustedBox,
   formatTimecodeFrames,
   scrubBackground,
   scrubFrameCount,
@@ -54,6 +56,13 @@ export const ProgramMonitor = forwardRef<
   const [error, setError] = useState<string | null>(null);
   const [showExisting, setShowExisting] = useState(true);
   const [drawMode, setDrawMode] = useState(false);
+  // manual adjust (dual-modality law: agent ops stay human-refinable):
+  // click a static op-backed box to select it, drag to move, drag the corner
+  // handle to resize, Alt+arrows to nudge — release lands an adjust op
+  // (append-only: a NEW op supersedes the old one, coverage never gaps)
+  const [selectedOp, setSelectedOp] = useState<string | null>(null);
+  const [adjustDrag, setAdjustDrag] = useState<AdjustDrag | null>(null);
+  const [preview, setPreview] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
   const [videoReady, setVideoReady] = useState(false);
@@ -129,12 +138,63 @@ export const ProgramMonitor = forwardRef<
   }
 
   function onMouseMove(ev: React.MouseEvent) {
+    if (adjustDrag) {
+      const p = toDisplayCoords(ev);
+      const rect = wrapRef.current!.getBoundingClientRect();
+      setPreview(
+        adjustedBox(
+          adjustDrag,
+          p,
+          { x: asset.width / rect.width, y: asset.height / rect.height },
+          asset.width,
+          asset.height,
+        ),
+      );
+      return;
+    }
     if (!draft) return;
     const p = toDisplayCoords(ev);
     setDraft({ ...draft, x1: p.x, y1: p.y });
   }
 
+  /** Begin a manual adjust drag on one static op-backed box. */
+  function startAdjust(r: NleEffect, mode: "move" | "resize", ev: React.MouseEvent) {
+    if (drawMode || !r.op_id) return; // draw mode owns the surface; tracked ops follow the object
+    ev.stopPropagation();
+    videoRef.current?.pause();
+    setSelectedOp(r.op_id);
+    setAdjustDrag({
+      opId: r.op_id,
+      mode,
+      origRaw: { x: r.x, y: r.y, w: r.w, h: r.h },
+      startDisplay: toDisplayCoords(ev),
+    });
+    setPreview({ x: r.x, y: r.y, w: r.w, h: r.h });
+  }
+
+  async function landAdjust() {
+    if (!adjustDrag || !preview) return;
+    const patch = {
+      ...preview,
+      note: `manually ${adjustDrag.mode === "move" ? "moved" : "resized"} in the studio`,
+    };
+    setAdjustDrag(null);
+    setPreview(null);
+    try {
+      const next: OpRecord = await api.adjustOp(projectId, adjustDrag.opId, patch);
+      setSelectedOp(next.id); // the box keeps its identity through the chain hop
+      await reload();
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   async function onMouseUp() {
+    if (adjustDrag) {
+      await landAdjust();
+      return;
+    }
     if (!draft) return;
     const dx = Math.abs(draft.x1 - draft.x0);
     const dy = Math.abs(draft.y1 - draft.y0);
@@ -164,6 +224,38 @@ export const ProgramMonitor = forwardRef<
       setError(e instanceof Error ? e.message : String(e));
     }
   }
+
+  // Alt+arrows nudge the selected box (1 raw px, Shift = 10) — frame-precise
+  // manual refinement without fighting the J/K/L/arrows transport shortcuts.
+  useEffect(() => {
+    if (!selectedOp || drawMode) return;
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") {
+        setSelectedOp(null);
+        return;
+      }
+      if (!ev.altKey || !ev.key.startsWith("Arrow")) return;
+      ev.preventDefault();
+      const r = regions.find((x) => x.op_id === selectedOp);
+      if (!r) return;
+      const step = ev.shiftKey ? 10 : 1;
+      const d = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] }[
+        ev.key as "ArrowLeft" | "ArrowRight" | "ArrowUp" | "ArrowDown"
+      ];
+      const x = Math.max(0, Math.min(asset.width - r.w, r.x + d[0]));
+      const y = Math.max(0, Math.min(asset.height - r.h, r.y + d[1]));
+      api
+        .adjustOp(projectId, selectedOp, { x, y, w: r.w, h: r.h, note: "nudged with arrow keys" })
+        .then(async (next) => {
+          setSelectedOp(next.id);
+          await reload();
+          onChanged();
+        })
+        .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selectedOp, drawMode, regions, projectId, asset.width, asset.height, onChanged]); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function removeRegion(r: NleEffect) {
     try {
@@ -257,8 +349,14 @@ export const ProgramMonitor = forwardRef<
           ref={wrapRef}
           className={`relative h-full max-h-full select-none ${drawMode ? "cursor-crosshair" : ""}`}
           onMouseDown={drawMode ? onMouseDown : undefined}
-          onMouseMove={drawMode ? onMouseMove : undefined}
-          onMouseUp={drawMode ? onMouseUp : undefined}
+          onMouseMove={onMouseMove}
+          onMouseUp={onMouseUp}
+          onMouseLeave={() => {
+            if (adjustDrag) {
+              setAdjustDrag(null);
+              setPreview(null);
+            }
+          }}
         >
           {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
           <video
@@ -279,7 +377,12 @@ export const ProgramMonitor = forwardRef<
             onPause={() => setPlaying(false)}
             onClick={() => {
               const v = videoRef.current;
-              if (v) v.paused ? v.play() : v.pause();
+              if (!v) return;
+              if (selectedOp) {
+                setSelectedOp(null); // clicking the surface deselects, Premiere-style
+                return;
+              }
+              v.paused ? v.play() : v.pause();
             }}
           />
           {/* poster overlay — the real first scrub frame until the video decodes */}
@@ -325,32 +428,58 @@ export const ProgramMonitor = forwardRef<
             regions.map((r) => {
               // tracked selections draw the box AT THE PLAYHEAD (it follows
               // the object as you scrub); static boxes draw their stored rect
+              // — or the LIVE adjust preview while one is being dragged
               const path = r.op_id ? trackedPaths[r.op_id] : undefined;
               const tb: TrackedBox | null =
                 r.mode === "tracked" && path && path.length > 0 ? trackedBoxAt(path, time) : null;
-              const bx = tb ? tb.x : r.x;
-              const by = tb ? tb.y : r.y;
-              const bw = tb ? tb.w : r.w;
-              const bh = tb ? tb.h : r.h;
+              const isDragged = adjustDrag?.opId === r.op_id && !!preview;
+              const bx = isDragged ? preview!.x : tb ? tb.x : r.x;
+              const by = isDragged ? preview!.y : tb ? tb.y : r.y;
+              const bw = isDragged ? preview!.w : tb ? tb.w : r.w;
+              const bh = isDragged ? preview!.h : tb ? tb.h : r.h;
               if (r.mode === "tracked" && !tb && path && path.length > 0) return null; // outside the tracked span
+              const adjustable = !!r.op_id && r.mode !== "tracked" && !drawMode;
+              const isSelected = selectedOp !== null && selectedOp === r.op_id;
               return (
                 <div
                   key={r.id}
-                  className="pointer-events-none absolute border bg-[rgba(241,109,109,0.14)]"
+                  className={`absolute border bg-[rgba(241,109,109,0.14)] ${adjustable ? "cursor-move" : "pointer-events-none"}`}
                   style={{
                     left: bx * scaleX,
                     top: by * scaleY,
                     width: bw * scaleX,
                     height: bh * scaleY,
-                    borderStyle: r.origin === "agent" || tb?.interpolated ? "dashed" : "solid",
-                    borderColor: r.mode === "tracked" ? "var(--warn, #e2a336)" : "var(--err)",
+                    borderStyle:
+                      isSelected || isDragged
+                        ? "solid"
+                        : r.origin === "agent" || tb?.interpolated
+                          ? "dashed"
+                          : "solid",
+                    borderColor:
+                      isSelected || isDragged
+                        ? "var(--acc)"
+                        : r.mode === "tracked"
+                          ? "var(--warn, #e2a336)"
+                          : "var(--err)",
+                    boxShadow: isSelected || isDragged ? "0 0 0 1px var(--acc)" : undefined,
+                  }}
+                  onMouseDown={(ev) => {
+                    if (adjustable) startAdjust(r, "move", ev);
                   }}
                   title={
                     r.mode === "tracked"
                     ? `${r.label || "tracked"} · follows object @ playhead ${bx}x${by}`
-                    : `${r.label || "blur"} ${r.w}x${r.h}@${r.x},${r.y} · ${r.origin ?? "legacy"}`
+                    : `${r.label || "blur"} ${r.w}x${r.h}@${r.x},${r.y} · ${r.origin ?? "legacy"}${adjustable ? " · drag to move, corner to resize" : ""}`
                   }
-                />
+                >
+                  {adjustable && isSelected && (
+                    <span
+                      className="absolute -bottom-1.5 -right-1.5 h-3 w-3 cursor-nwse-resize rounded-sm border border-[var(--acc)] bg-[var(--bg-2)]"
+                      title="drag to resize (release lands the corrected op)"
+                      onMouseDown={(ev) => startAdjust(r, "resize", ev)}
+                    />
+                  )}
+                </div>
               );
             })}
           {draft && (
@@ -439,7 +568,10 @@ export const ProgramMonitor = forwardRef<
           {regions.map((r) => (
             <div
               key={r.id}
-              className="group flex items-center justify-between rounded px-1 py-0.5 hover:bg-[var(--bg-2)]"
+              data-selected={r.op_id !== null && selectedOp === r.op_id}
+              className="group flex cursor-pointer items-center justify-between rounded px-1 py-0.5 hover:bg-[var(--bg-2)] data-[selected=true]:bg-[var(--acc-bg)]"
+              title={r.op_id && r.mode !== "tracked" ? "click to select — drag the box on the video or nudge with Alt+arrows" : undefined}
+              onClick={() => setSelectedOp((s) => (r.op_id && s !== r.op_id ? r.op_id : null))}
             >
               <span className="tcode text-[11px] text-[var(--tx-2)]">
                 {r.label || "blur"} · {r.w}×{r.h} @ {r.x},{r.y}
@@ -490,6 +622,7 @@ export const ProgramMonitor = forwardRef<
         <span>←/→ frame step</span>
         <span>S split at playhead</span>
         <span>Ctrl+Z undo</span>
+        <span title="with a box selected: drag to move, corner to resize, Alt+arrows nudge (Shift = 10 px), Esc deselect">Alt+←↑↓→ nudge box</span>
       </div>
     </div>
   );

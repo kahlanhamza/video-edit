@@ -209,3 +209,58 @@ export function trackedBoxAt(
   }
   return { x: best.x, y: best.y, w: best.w, h: best.h, interpolated: best.interpolated, score: best.score };
 }
+
+// --- manual box adjust (dual-modality law: agent proposes, human refines) ----
+
+/** Smallest box the adjust path will land (raw pixels) — nothing slimmer
+ * counts as privacy coverage worth an op. */
+export const MIN_ADJUST_PX = 8;
+
+export interface AdjustDrag {
+  opId: string;
+  mode: "move" | "resize";
+  /** the op's stored geometry in RAW frame pixels */
+  origRaw: { x: number; y: number; w: number; h: number };
+  /** where the pointer started, in DISPLAY pixels */
+  startDisplay: { x: number; y: number };
+}
+
+/**
+ * Geometry the adjusted op will carry, derived live during the drag:
+ * the pointer delta (display px) is scaled into raw frame pixels, applied to
+ * move or resize, then clamped so the box stays a valid rect INSIDE the tape
+ * frame — never negative, never past the edge, never below the minimum size.
+ * Pure: the component renders this preview and lands it as the adjust op.
+ */
+export function adjustedBox(
+  drag: AdjustDrag,
+  curDisplay: { x: number; y: number },
+  displayToRaw: { x: number; y: number },
+  assetW: number,
+  assetH: number,
+): { x: number; y: number; w: number; h: number } {
+  const dxRaw = Math.round((curDisplay.x - drag.startDisplay.x) * displayToRaw.x);
+  const dyRaw = Math.round((curDisplay.y - drag.startDisplay.y) * displayToRaw.y);
+  let x = drag.origRaw.x;
+  let y = drag.origRaw.y;
+  let w = drag.origRaw.w;
+  let h = drag.origRaw.h;
+  if (drag.mode === "move") {
+    x += dxRaw;
+    y += dyRaw;
+  } else {
+    // resize: the bottom-right corner follows the pointer; the top-left stays
+    w = Math.max(MIN_ADJUST_PX, w + dxRaw);
+    h = Math.max(MIN_ADJUST_PX, h + dyRaw);
+  }
+  // clamping law: never negative, never past the tape edge, never below the
+  // minimum coverage box — and on a degenerate (sub-minimum) tape the tape
+  // edge wins, because coverage past the frame would be a lie
+  const maxW = Math.max(1, assetW);
+  const maxH = Math.max(1, assetH);
+  w = clamp(w, Math.min(MIN_ADJUST_PX, maxW), maxW);
+  h = clamp(h, Math.min(MIN_ADJUST_PX, maxH), maxH);
+  x = Math.round(clamp(x, 0, Math.max(0, assetW - w)));
+  y = Math.round(clamp(y, 0, Math.max(0, assetH - h)));
+  return { x, y, w: Math.round(w), h: Math.round(h) };
+}

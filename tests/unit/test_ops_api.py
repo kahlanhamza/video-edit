@@ -206,7 +206,99 @@ def test_caption_edit_records_op(api_client, tmp_path, monkeypatch):
     del api_main  # imported for session side effects
 
 
-# ---------------------------------------------------------------- SSE stream
+# ---------------------------------------------------------------- adjust
+def test_adjust_supersedes_with_chain_and_keeps_coverage(api_client):
+    pid = _project(api_client, with_asset=True)
+    op = api_client.post(
+        f"/projects/{pid}/ops",
+        json={"kind": "blur", "params": {"x": 10, "y": 20, "w": 300, "h": 120, "sigma": 24}},
+    ).json()
+    r = api_client.post(
+        f"/projects/{pid}/ops/{op['id']}/adjust",
+        json={"x": 12, "y": 24, "w": 340, "h": 140, "note": "nudged onto the face"},
+    )
+    assert r.status_code == 200
+    new = r.json()
+    assert new["id"] != op["id"] and new["origin"] == "human"
+    assert new["params"]["x"] == 12 and new["params"]["w"] == 340
+    assert new["params"]["adjusts_op_id"] == op["id"], "chain hop on the audit trail"
+    assert new["params"]["sigma"] == 24, "untouched params carry over"
+    assert new["evidence"]["adjusted_from"] == op["id"]
+
+    # the old op is revoked (history kept) and exactly ONE box covers the tape
+    state = api_client.get(f"/projects/{pid}/ops").json()
+    assert state["active_ops"] == 1 and state["revoked_ops"] == 1
+    assert len(state["fold"]["effects"]) == 1
+    assert state["fold"]["effects"][0]["op_id"] == new["id"]
+
+    regions = api_client.get(f"/projects/{pid}/redactions").json()
+    assert len(regions) == 1 and regions[0]["id"] == new["id"]
+    assert regions[0]["x"] == 12, "render path consumes the corrected geometry"
+
+
+def test_adjust_keeps_frame_window_and_validates_new_one(api_client):
+    pid = _project(api_client, with_asset=True)
+    op = api_client.post(
+        f"/projects/{pid}/ops",
+        json={
+            "kind": "blur",
+            "frame_start": 30,
+            "frame_end": 300,
+            "params": {"x": 1, "y": 1, "w": 40, "h": 40},
+        },
+    ).json()
+    # window carries over when not given
+    keep = api_client.post(
+        f"/projects/{pid}/ops/{op['id']}/adjust", json={"x": 2, "y": 2, "w": 44, "h": 44}
+    ).json()
+    assert keep["frame_start"] == 30 and keep["frame_end"] == 300
+    # an explicitly bad window is rejected before anything is written
+    bad = api_client.post(
+        f"/projects/{pid}/ops/{keep['id']}/adjust",
+        json={"x": 3, "y": 3, "w": 48, "h": 48, "frame_start": 0, "frame_end": 99999},
+    )
+    assert bad.status_code == 422 and "beyond tape" in bad.json()["detail"]
+    state = api_client.get(f"/projects/{pid}/ops").json()
+    assert state["active_ops"] == 1, "failed adjust must not revoke the target"
+
+
+def test_adjust_refuses_tracked_revoked_and_non_box_kinds(api_client):
+    pid = _project(api_client, with_asset=True)
+    plain = api_client.post(
+        f"/projects/{pid}/ops",
+        json={"kind": "blur", "params": {"x": 1, "y": 1, "w": 40, "h": 40}},
+    ).json()
+    api_client.post(f"/projects/{pid}/ops/{plain['id']}/revoke")
+    assert (
+        api_client.post(
+            f"/projects/{pid}/ops/{plain['id']}/adjust", json={"x": 0, "y": 0, "w": 9, "h": 9}
+        ).status_code
+        == 409
+    ), "revoked ops are history, not adjustable"
+    tracked = api_client.post(
+        f"/projects/{pid}/ops",
+        json={
+            "kind": "blur",
+            "params": {"x": 1, "y": 1, "w": 40, "h": 40, "mode": "tracked"},
+        },
+    ).json()
+    r = api_client.post(
+        f"/projects/{pid}/ops/{tracked['id']}/adjust", json={"x": 0, "y": 0, "w": 9, "h": 9}
+    )
+    assert r.status_code == 409 and "tracked" in r.json()["detail"], "honest refusal"
+    zoom = api_client.post(f"/projects/{pid}/ops", json={"kind": "zoom"}).json()
+    r = api_client.post(
+        f"/projects/{pid}/ops/{zoom['id']}/adjust", json={"x": 0, "y": 0, "w": 9, "h": 9}
+    )
+    assert r.status_code == 422 and "no box geometry" in r.json()["detail"]
+    assert (
+        api_client.post(
+            f"/projects/{pid}/ops/ghost/adjust", json={"x": 0, "y": 0, "w": 9, "h": 9}
+        ).status_code
+        == 404
+    )
+
+
 def test_ops_stream_pushes_create_and_revoke(api_client):
     pid = _project(api_client)
     op = api_client.post(

@@ -482,6 +482,17 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ note }),
     }),
+  // manual adjust: a NEW op supersedes the old one (append-only law) —
+  // corrected geometry + adjusts_op_id chain, old op revoked, coverage never gaps
+  adjustOp: (
+    id: string,
+    opId: string,
+    patch: { x: number; y: number; w: number; h: number; sigma?: number; note?: string },
+  ) =>
+    req<OpRecord>(`/projects/${id}/ops/${opId}/adjust`, {
+      method: "POST",
+      body: JSON.stringify(patch),
+    }),
   // --- chat agent v2 (roadmap step 5): one bounded orchestrator turn ---
   agentChat: (
     id: string,

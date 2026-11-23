@@ -153,6 +153,13 @@ def test_validate_window_beyond_tape_raises():
         validate_op_window(3001, 3100, 100.0, 30.0)  # frame 3000 is the last
 
 
+def test_validate_window_end_beyond_tape_raises():
+    # the END bound lies just as loudly as the start — a window past the tape
+    # would bake coverage (or an effect) into frames that do not exist
+    with pytest.raises(ValueError, match="frame_end.*beyond tape"):
+        validate_op_window(0, 3001, 100.0, 30.0)
+
+
 def test_validate_window_edge_ok():
     validate_op_window(0, 3000, 100.0, 30.0)
 

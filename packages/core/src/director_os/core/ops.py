@@ -161,6 +161,8 @@ def validate_op_window(
         raise ValueError(
             f"frame_start {frame_start} beyond tape end (frame {last_frame} @ {fps}fps)"
         )
+    if frame_end > last_frame:
+        raise ValueError(f"frame_end {frame_end} beyond tape end (frame {last_frame} @ {fps}fps)")
 
 
 def _effect_from_op(rec: OpRecord) -> dict[str, Any]:
