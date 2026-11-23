@@ -24,7 +24,7 @@ from director_os.core.db import (
     TimelineOpRow,
     TimelineVersionRow,
 )
-from director_os.core.ops import fold_ops, records_from_rows
+from director_os.core.ops import apply_caption_overrides, fold_ops, records_from_rows
 from director_os.otio_engine.contract import meta_kind
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
@@ -88,15 +88,19 @@ def build_nle_snapshot(sessions: sessionmaker, project_id: str, output_dir: Path
             else None
         )
 
+    op_records = records_from_rows(op_rows)
+    fold = fold_ops(op_records, regions)
+    # caption ops are a display lens over the cue store (write-through keeps
+    # them in sync — the lens also covers ops recorded before the law landed)
+    captions = apply_caption_overrides(
+        _captions(output_dir / "pipeline" / project_id), fold.caption_overrides
+    )
     clips = _clips_from_otio(otio_json)
-    captions = _captions(output_dir / "pipeline" / project_id)
     duration = asset_facts["duration_s"] if asset_facts else 0.0
     for c in clips:
         duration = max(duration, c["end_s"])
     for cue in captions:
         duration = max(duration, cue["end_ms"] / 1000.0)
-    op_records = records_from_rows(op_rows)
-    fold = fold_ops(op_records, regions)
     return {
         "project_id": project_id,
         "version": version,

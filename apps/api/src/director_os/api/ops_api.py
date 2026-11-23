@@ -59,6 +59,12 @@ def _factory() -> Any:
     return gateway._session_factory
 
 
+def _subtitle_dir(project_id: str) -> Any:
+    from director_os.core.config import get_settings
+
+    return get_settings().output_dir / "pipeline" / project_id
+
+
 def _store(project_id: str) -> OpsStore:
     return OpsStore(_factory(), project_id)
 
@@ -253,6 +259,36 @@ def create_op(project_id: str, body: OpIn) -> OpOut:
             "evidence-before-action is a law, not a suggestion",
         )
     asset = _primary_asset(project_id)
+    if body.kind == "caption":
+        # WRITE-THROUGH LAW: the cue store is the baked truth — the store edit
+        # lands FIRST (a failure 422s before any op row exists), the op then
+        # records what the store now contains (same order as the PATCH path).
+        from director_os.subtitles.op_write import CaptionOpError, apply_caption_op
+
+        end_ms = body.params.get("end_ms")
+        if (
+            end_ms is not None
+            and asset is not None
+            and isinstance(end_ms, (int, float))
+            and float(end_ms) > asset.duration_s * 1000
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=f"cue end {int(float(end_ms))}ms beyond the tape "
+                f"({int(asset.duration_s * 1000)}ms @ {asset.duration_s:.2f}s)",
+            )
+        sub_dir = _subtitle_dir(project_id)
+        try:
+            beat = apply_caption_op(sub_dir, body.params)
+        except CaptionOpError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+        body.params = {
+            **body.params,
+            "text": beat.text,
+            "speaker": beat.speaker,
+            "start_ms": beat.start_ms,
+            "end_ms": beat.end_ms,
+        }
     if body.frame_start is not None or body.frame_end is not None:
         try:
             validate_op_window(

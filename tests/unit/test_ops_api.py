@@ -233,6 +233,47 @@ def test_caption_retime_records_window_op_and_validates_tape(api_client, tmp_pat
     del api_main  # imported for session side effects
 
 
+def test_caption_op_writes_through_and_grid_shows_it(api_client, tmp_path):
+    """POST /ops kind=caption must write the cue store FIRST (the baked truth)
+    and the grid must show the edit — an op whose text never bakes is a lie."""
+    import director_os.api.main as api_main
+    from director_os.core.config import get_settings
+    from director_os.subtitles.ass_builder import CaptionBeat
+    from director_os.subtitles.store import load_cues, save_cues
+
+    pid = _project(api_client, with_asset=True)
+    base = get_settings().output_dir / "pipeline" / pid
+    save_cues(
+        base,
+        [CaptionBeat(index=0, text="raw text", speaker="", start_ms=0, end_ms=900, words=[])],
+    )
+    r = api_client.post(
+        f"/projects/{pid}/ops",
+        json={
+            "kind": "caption",
+            "origin": "agent",
+            "evidence": {"transcript": "0.0-0.9s misheard"},
+            "params": {"cue_index": 0, "text": "proofread text"},
+        },
+    )
+    assert r.status_code == 201
+    op = r.json()
+    assert op["params"]["text"] == "proofread text"
+    assert load_cues(base)[0].text == "proofread text", "store write-through happened"
+    grid = api_client.get(f"/projects/{pid}/subtitles").json()
+    assert grid[0]["text"] == "proofread text", "the display lens serves the op"
+
+    # a caption op that carries no edit is refused BEFORE any row exists
+    nops = api_client.get(f"/projects/{pid}/ops").json()["active_ops"]
+    bad = api_client.post(
+        f"/projects/{pid}/ops",
+        json={"kind": "caption", "params": {"cue_index": 0}},
+    )
+    assert bad.status_code == 422 and "carries no edit" in bad.json()["detail"]
+    assert api_client.get(f"/projects/{pid}/ops").json()["active_ops"] == nops
+    del api_main  # imported for session side effects
+
+
 # ---------------------------------------------------------------- adjust
 def test_adjust_supersedes_with_chain_and_keeps_coverage(api_client):
     pid = _project(api_client, with_asset=True)

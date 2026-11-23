@@ -44,11 +44,15 @@ export const ProgramMonitor = forwardRef<
     projectId: string;
     asset: Asset;
     fps: number;
+    /** The op-log rev the page last saw — when it advances (agent op, another
+     * tab, an undo elsewhere) the monitor refetches the fold so blur boxes
+     * converge LIVE, not just the timeline. */
+    opsRev?: number | null;
     onTimeUpdate: (t: number) => void;
     onChanged: () => void;
   }
 >(function ProgramMonitor(
-  { projectId, asset, fps, onTimeUpdate, onChanged },
+  { projectId, asset, fps, opsRev, onTimeUpdate, onChanged },
   ref,
 ) {
   const [regions, setRegions] = useState<NleEffect[]>([]);
@@ -127,7 +131,9 @@ export const ProgramMonitor = forwardRef<
 
   useEffect(() => {
     reload();
-  }, [reload]);
+    // fires on mount, project change, and every op-log advance the page
+    // reports (SSE → reloadNle → ops_rev) — the monitor converges live
+  }, [reload, opsRev]);
 
   function toDisplayCoords(ev: React.MouseEvent): { x: number; y: number } {
     const rect = wrapRef.current!.getBoundingClientRect();

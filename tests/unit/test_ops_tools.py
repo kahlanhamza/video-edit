@@ -81,3 +81,99 @@ def test_ops_revoke_roundtrip(registry, store):
         registry.dispatch("ops.revoke", {"op_id": rec.id})
     with pytest.raises(ToolOperationError, match="not found"):
         registry.dispatch("ops.revoke", {"op_id": "does-not-exist"})
+
+
+# ------------------------------------------------- caption write-through law
+@pytest.fixture()
+def cue_store(tmp_path, monkeypatch):
+    """Point OUTPUT_DIR at a tmp tree with two seeded cues."""
+    from director_os.core.config import get_settings
+    from director_os.subtitles.ass_builder import CaptionBeat, WordTiming
+    from director_os.subtitles.store import save_cues
+
+    monkeypatch.setenv("OUTPUT_DIR", str(tmp_path / "out"))
+    get_settings.cache_clear()
+    base = tmp_path / "out" / "pipeline" / "p1"
+    save_cues(
+        base,
+        [
+            CaptionBeat(
+                text="unit one contact",
+                start_ms=0,
+                end_ms=1800,
+                speaker="OFFICER_1",
+                words=[WordTiming(word="unit", start_ms=0, end_ms=1800)],
+            ),
+            CaptionBeat(text="roger that", start_ms=2000, end_ms=3000, speaker="OFFICER_2"),
+        ],
+    )
+    yield base
+    get_settings.cache_clear()
+
+
+def test_ops_propose_caption_writes_through_to_the_cue_store(registry, store, cue_store):
+    from director_os.subtitles.store import load_cues
+
+    out = registry.dispatch(
+        "ops.propose",
+        {
+            "kind": "caption",
+            "params": {"cue_index": 1, "text": "roger, moving up"},
+            "evidence": {"transcript": "00:02:00-00:02:03 words unclear"},
+        },
+    )
+    assert out["ok"] is True and "cue store" in out["detail"]
+    cues = load_cues(cue_store)
+    assert cues[1].text == "roger, moving up", "the baked truth carries the agent edit"
+    rec = store.get(out["op_id"])
+    assert rec is not None and rec.params["text"] == "roger, moving up"
+    assert rec.params["start_ms"] == 2000, "op records the final window"
+
+
+def test_ops_propose_caption_retime_moves_words(registry, store, cue_store):
+    from director_os.subtitles.store import load_cues
+
+    out = registry.dispatch(
+        "ops.propose",
+        {
+            "kind": "caption",
+            "params": {"cue_index": 0, "start_ms": 500, "end_ms": 1500},
+            "evidence": {"frames": [15, 16]},
+        },
+    )
+    assert out["ok"] is True
+    cues = load_cues(cue_store)
+    assert cues[0].start_ms == 500 and cues[0].end_ms == 1500
+    assert cues[0].words[0].start_ms >= 500, "words ride into the new window"
+
+
+def test_ops_propose_caption_failures_create_no_op(registry, store, cue_store):
+    from director_os.subtitles.store import load_cues
+
+    before = store.list_ops(include_revoked=True)
+    with pytest.raises(ToolOperationError, match="cue_index"):
+        registry.dispatch(
+            "ops.propose",
+            {"kind": "caption", "params": {"text": "no cue"}, "evidence": {"frames": [0]}},
+        )
+    with pytest.raises(ToolOperationError, match="out of range"):
+        registry.dispatch(
+            "ops.propose",
+            {
+                "kind": "caption",
+                "params": {"cue_index": 99, "text": "ghost"},
+                "evidence": {"frames": [0]},
+            },
+        )
+    with pytest.raises(ToolOperationError, match="together"):
+        registry.dispatch(
+            "ops.propose",
+            {
+                "kind": "caption",
+                "params": {"cue_index": 0, "start_ms": 100},
+                "evidence": {"frames": [0]},
+            },
+        )
+    assert store.list_ops(include_revoked=True) == before, "fail-closed: no op rows"
+    cues = load_cues(cue_store)
+    assert cues[0].text == "unit one contact", "and no store writes"

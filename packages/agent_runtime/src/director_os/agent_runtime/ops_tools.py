@@ -82,13 +82,38 @@ def register_ops_tools(
                 "(frame.grab) or the transcript window that justifies this edit "
                 "(evidence-before-action law)"
             )
+        params = dict(kw.get("params") or {})
+        if kind == "caption":
+            # WRITE-THROUGH LAW: the cue store is the baked truth — a caption
+            # op that never reaches it would display text the render never
+            # bakes. The store edit lands FIRST (fail-closed: an invalid cue
+            # index/timing is a tool error, the op is never created), the op
+            # row records what the store now contains.
+            from pathlib import Path
+
+            from director_os.core.config import get_settings
+            from director_os.subtitles.op_write import CaptionOpError, apply_caption_op
+
+            sub_dir = Path(get_settings().output_dir) / "pipeline" / project_id
+            try:
+                beat = apply_caption_op(sub_dir, params)
+            except CaptionOpError as e:
+                raise ToolOperationError(str(e)) from e
+            params = {
+                **params,
+                "cue_index": params.get("cue_index"),
+                "text": beat.text,
+                "speaker": beat.speaker,
+                "start_ms": beat.start_ms,
+                "end_ms": beat.end_ms,
+            }
         rec = ops_store.create(
             OpCreate(
                 kind=kind,
                 frame_start=kw.get("frame_start"),
                 frame_end=kw.get("frame_end"),
                 track=str(kw.get("track") or "V1_master"),
-                params=dict(kw.get("params") or {}),
+                params=params,
                 origin="agent",
                 evidence=evidence,
                 session_id=agent_name,
@@ -96,12 +121,15 @@ def register_ops_tools(
             ),
             agent_name=agent_name,
         )
+        detail = f"op {rec.id[:8]} ({rec.kind}) appended at rev {rec.rev}"
+        if kind == "caption":
+            detail += f" — cue {params.get('cue_index')} written to the cue store"
         return {
             "ok": True,
             "op_id": rec.id,
             "rev": rec.rev,
             "kind": rec.kind,
-            "detail": f"op {rec.id[:8]} ({rec.kind}) appended at rev {rec.rev}",
+            "detail": detail,
         }
 
     def ops_revoke(**kw: Any) -> dict[str, Any]:
@@ -132,7 +160,8 @@ def register_ops_tools(
         "Append ONE edit op to the op log (blur/inpaint/caption/zoom/freeze/card/"
         "narration/audio/trim/split/note). Frame-addressed: name frame_start/"
         "frame_end when the op scopes frames; params carry kind specifics "
-        "(bbox x/y/w/h + sigma for blur, cue_index/text for caption). Evidence "
+        "(bbox x/y/w/h + sigma for blur; caption ops write through to the cue "
+        "store: cue_index + any of text / speaker / start_ms+end_ms). Evidence "
         "REQUIRED: cite the frame or transcript window that justifies it.",
         _OpsProposeInput,
         ops_propose,

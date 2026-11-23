@@ -77,6 +77,15 @@ def test_gate_clean_after_stamp_then_dirty_after_edit(api_client, project_id):
     assert out["pending_ops"] == 0
 
     # a new op event -> dirty again, tombstones excluded from pending
+    # (caption ops write through to the cue store — seed it first)
+    from director_os.core.config import get_settings
+    from director_os.subtitles.ass_builder import CaptionBeat
+    from director_os.subtitles.store import save_cues
+
+    save_cues(
+        get_settings().output_dir / "pipeline" / project_id,
+        [CaptionBeat(index=0, text="raw", speaker="", start_ms=0, end_ms=900, words=[])],
+    )
     api_client.post(
         f"/projects/{project_id}/ops",
         json={"kind": "caption", "params": {"cue_index": 0, "text": "fixed"}},

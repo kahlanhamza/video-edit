@@ -1359,7 +1359,12 @@ def _subtitle_dir(project_id: str) -> Path:
 
 @app.get("/projects/{project_id}/subtitles", response_model=list[CueOut])
 def get_subtitles(project_id: str) -> list[CueOut]:
-    """Structured cue list for the studio subtitle grid."""
+    """Structured cue list for the studio subtitle grid.
+
+    Caption ops ride over the store as a display lens (write-through keeps
+    them in sync; the lens also covers ops recorded before the law landed) —
+    agent caption edits are visible here the moment the op lands."""
+    from director_os.core.ops import OpsStore, apply_caption_overrides, fold_ops
     from director_os.subtitles.store import SubtitleStoreError, load_cues
 
     s = session()
@@ -1367,11 +1372,23 @@ def get_subtitles(project_id: str) -> list[CueOut]:
         raise HTTPException(status_code=404, detail="project not found")
     s.close()
     try:
-        cues = load_cues(_subtitle_dir(project_id))
+        cues = [c.model_dump() for c in load_cues(_subtitle_dir(project_id))]
     except SubtitleStoreError as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+    try:
+        if _session_factory is not None:
+            fold = fold_ops(OpsStore(_session_factory, project_id).list_ops(include_revoked=True))
+            cues = apply_caption_overrides(cues, fold.caption_overrides)
+    except Exception:  # noqa: BLE001 — display lens only, never fail the grid
+        pass
     return [
-        CueOut(index=i, text=c.text, start_ms=c.start_ms, end_ms=c.end_ms, speaker=c.speaker)
+        CueOut(
+            index=i,
+            text=c["text"],
+            start_ms=c["start_ms"],
+            end_ms=c["end_ms"],
+            speaker=c["speaker"],
+        )
         for i, c in enumerate(cues)
     ]
 

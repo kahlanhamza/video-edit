@@ -928,6 +928,7 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
               projectId={id}
               asset={playable}
               fps={fps}
+              opsRev={nle?.ops_rev ?? null}
               onTimeUpdate={setPlayheadS}
               onChanged={() => reloadNle()}
             />

@@ -714,6 +714,7 @@ dependencies = [
     { name = "director-os-core" },
     { name = "director-os-otio-engine" },
     { name = "director-os-skills" },
+    { name = "director-os-subtitles" },
     { name = "pydantic" },
 ]
 
@@ -722,6 +723,7 @@ requires-dist = [
     { name = "director-os-core", editable = "packages/core" },
     { name = "director-os-otio-engine", editable = "packages/otio_engine" },
     { name = "director-os-skills", editable = "packages/skills" },
+    { name = "director-os-subtitles", editable = "packages/subtitles" },
     { name = "pydantic", specifier = ">=2.7" },
 ]
 
