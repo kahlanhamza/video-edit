@@ -174,3 +174,38 @@ export function scrubBackground(i: number, n: number, url: string): {
     backgroundPosition: `${pos}% 0%`,
   };
 }
+
+/**
+ * The tracked box to draw at playhead time `tS` — the per-frame path of a
+ * tracked blur selection (step 3). `null` when the playhead sits outside the
+ * tracked span: the selection is NOT active there, so drawing anything would
+ * lie about what the program blurs. The box follows the object as you scrub.
+ */
+export interface TrackedBox {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  interpolated: boolean;
+  score: number;
+}
+
+export function trackedBoxAt(
+  hits: Array<{ t_s: number; x: number; y: number; w: number; h: number; score: number; interpolated: boolean }>,
+  tS: number,
+): TrackedBox | null {
+  if (hits.length === 0) return null;
+  const first = hits[0];
+  const last = hits[hits.length - 1];
+  if (tS < first.t_s - 1 / 1000 || tS > last.t_s + 1 / 1000) return null;
+  let best = first;
+  let bestD = Math.abs(first.t_s - tS);
+  for (const h of hits) {
+    const d = Math.abs(h.t_s - tS);
+    if (d < bestD) {
+      best = h;
+      bestD = d;
+    }
+  }
+  return { x: best.x, y: best.y, w: best.w, h: best.h, interpolated: best.interpolated, score: best.score };
+}

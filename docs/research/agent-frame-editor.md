@@ -97,11 +97,24 @@ segmentation across the whole video — "fast, precise selection of any object
 in any video", interactive, frame by frame. ([Meta SAM 2][sam2], [SAM 2
 paper][sam2-arxiv], [Ultralytics SAM 2 docs][sam2-ultra])
 
-**Planned (roadmap item 2):** a local SAM 2 service (ONNX, same packaging law
-as our YuNet/YOLO/YAMNET models — SHA-pinned fetch, CPU default, optional GPU)
-so that a box drawn on frame X becomes a tracked mask over the minimum span
-the op needs. This replaces "guess a static blur box over a 40-minute tape"
-with "segment THIS face on THIS frame, track it forward until it leaves".
+**Shipped as the selection service (roadmap step 3, 2026-11-23):** a box or
+click on frame X returns the object's per-frame path (`vision_fx/selection.py`).
+Backend ladder, strongest last and never silently downgraded:
+
+- `detector-assist` — IoU-best pipeline face/plate track at the anchor (exact,
+  zero re-decode — the sweep already ran);
+- `ncc-cpu` (always available) — normalized cross-correlation template tracker:
+  forward+backward from the anchor, template blending for drift, bounded-gap
+  interpolation, honest refusals (texture-free prompt, object lost, < 2 real
+  frames — a tracker that hallucinates across occlusions is a privacy leak);
+- `sam2` — wired, env-gated, LOUD when unavailable (never a silent swap).
+
+**EdgeTAM** (Meta, Jan 2025, Apache-2.0) is the on-device SAM 2 variant: 22x
+faster than SAM 2 (15.7 FPS iPhone 15 Pro Max, ~20 MB of CoreML encoders) —
+the chosen shape for the local SAM 2 service when weights ship locally
+([EdgeTAM][edgetam]). Premiere's Object Masking (2026 docs) and DaVinci's
+Magic Mask are the product bar this ladder is climbing toward: one click,
+isolate, track ([premiere-object-mask][premiere-om]).
 
 ### 1.7 Agent-assisted editing: LAVE (ACM IUI 2024)
 
@@ -119,7 +132,28 @@ language-descriptions-only — the agent reads the measured perception index
 (transcript words with speakers, VAD spans, audio events, shot density, vision
 insights) and **(shipped)** can pull the actual frame pixels via `frame.grab`.
 
-### 1.8 Efficient decode engineering: TorchCodec's performance notes
+### 1.8 Agent orchestration: what the 2025-2026 field converged on
+
+Four sources shaped the chat-orchestrator design (roadmap step 5):
+
+- **EditDuet** (arXiv:2509.10761) — two LLM agents over an NLE: an Editor that
+  mutates the timeline through tools and a Critic that evaluates the draft
+  against the user request and either gives natural-language feedback or calls
+  RENDER. Human preference 86.9% vs 13.1% for the best single-agent baseline.
+  Blueprint for our editor/critic roles + the Export gate as the critic's
+  terminal action ([editduet][editduet]).
+- **Azure Architecture Center** orchestration patterns: maker-checker loops
+  need iteration caps AND fallback behavior; group chat ≤ 3 agents to stay
+  controllable; every pattern needs explicit completion criteria ([azure-patterns][azure-patterns]).
+- **Anthropic's multi-agent research system**: orchestrator-worker with clear
+  task boundaries, parallel subagents, effort scaled to complexity, and —
+  matching our pipeline's step-resume law — agents must RESUME from where
+  errors occurred, not restart; end-state evaluation beats step-by-step
+  evaluation for state-mutating agents ([anthropic-multiagent][anthropic-multiagent]).
+- **LAVE** (§1.7) already gave us the dual-modality law; these three add the
+  loop discipline (caps, criteria, critic roles, resume-not-restart).
+
+### 1.9 Efficient decode engineering: TorchCodec's performance notes
 
 Meta's TorchCodec performance guide codifies the decode facts we rely on:
 exact vs approximate seeking cost, batch APIs, multithreading, optional CUDA.
@@ -243,9 +277,14 @@ Design rules (all inherited from verified research + our own live sessions):
    row (undo rides the feed as a revoke tombstone); the NLE snapshot renders
    effects from the fold (ops supersede legacy by id — never double-render);
    Studio draws boxes as ops and shows the agent origin badge live.
-3. **SAM 2 selection service**: local ONNX, box/click prompt on frame X →
-   tracked mask; `selection.track` agent tool; blur op consumes mask instead
-   of a static bbox. YuNet/YOLO path remains the CPU fallback.
+3. **Selection service** — *shipped:* `vision_fx/selection.py` (detector-assist
+   → ncc-cpu ladder + env-gated sam2 adapter, honest refusals); `POST
+   /assets/{id}/selection` + `GET /ops/{op_id}` + `GET /selection/backends`;
+   agent tool `selection.track` (evidence-before-action enforced) writes blur
+   ops with `params.tracked` (per-frame path step 4 bakes) and dual-writes the
+   union region so the shipped render path never loses privacy coverage; the
+   ProgramMonitor draws the box FOLLOWING the object at the playhead and
+   offers one-click "track from playhead" (seed op superseded, history kept).
 4. **Frame-scoped render ops**: per-op bake of [frame_start, frame_end] into
    the segment graph (the `_tracked_redacted_clip` machinery generalized);
    preview = overlay; nothing baked until Export.
@@ -268,6 +307,11 @@ Design rules (all inherited from verified research + our own live sessions):
 - [LAVE project page (U of Toronto DGP)][lave-page]; [LAVE paper (arXiv:2402.10294, ACM IUI 2024)][lave-arxiv] — LLM agent + dual-modality editing, the closest published blueprint.
 - [Remotion][remotion] — deterministic frame-by-frame programmatic rendering.
 - [TorchCodec performance tips (Meta-PyTorch)][torchcodec] — exact vs approximate seek, batch decode, threading, CUDA.
+- [EdgeTAM (Meta AI, GitHub)][edgetam] — on-device SAM 2 variant: 22x faster, Apache-2.0, the local SAM 2 shape.
+- [Adobe Premiere — Object Masking][premiere-om] — 2026 product bar for one-click subject isolation + tracking.
+- [EditDuet: A Multi-Agent System for Video NLE (arXiv:2509.10761)][editduet] — Editor+Critic loop over an NLE, RENDER as the terminal action.
+- [Azure Architecture Center — AI agent design patterns][azure-patterns] — maker-checker caps, completion criteria, pattern tradeoffs.
+- [Anthropic — How we built our multi-agent research system][anthropic-multiagent] — orchestrator-worker, resume-not-restart, end-state evaluation.
 - Prior in-repo research: `docs/research/agent-research-dossier.md`, `docs/research/skills-mining.md`.
 
 [mlt]: https://www.mltframework.org/docs/framework
@@ -282,4 +326,9 @@ Design rules (all inherited from verified research + our own live sessions):
 [lave-arxiv]: https://arxiv.org/abs/2402.10294
 [remotion]: https://www.remotion.dev
 [remotion-article]: https://nkaushik.in/writing/programmatic-video-with-remotion-react-and-ai
+[edgetam]: https://github.com/facebookresearch/EdgeTAM
+[premiere-om]: https://helpx.adobe.com/premiere/desktop/add-video-effects/work-with-masks/object-masking.html
+[editduet]: https://arxiv.org/abs/2509.10761
+[azure-patterns]: https://learn.microsoft.com/en-us/azure/architecture/ai-ml/guide/ai-agent-design-patterns
+[anthropic-multiagent]: https://www.anthropic.com/engineering/built-multi-agent-research-system
 [torchcodec]: https://meta-pytorch.org/torchcodec/stable/generated_examples/decoding/performance_tips.html

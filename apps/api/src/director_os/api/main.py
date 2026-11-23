@@ -16,6 +16,7 @@ from director_os.agent_runtime.checkpoint import CheckpointStore
 from director_os.agent_runtime.editing_tools import DirectorToolbox, build_director_registry
 from director_os.agent_runtime.llm import LLMBackendError, build_backend_chain
 from director_os.agent_runtime.ops_tools import register_ops_tools
+from director_os.agent_runtime.selection_tools import register_selection_tools
 from director_os.api.channels import ChannelPublisher, MultiChannelPublisher
 from director_os.api.events import (
     DEFAULT_LIVE_MAX_S,
@@ -78,6 +79,11 @@ app = FastAPI(
 
 # Op log v1: the everything-is-an-op atom surface (CRUD + fold + SSE stream)
 app.include_router(ops_router)
+
+# Selection service: promptable per-object tracking (agent-frame-editor step 3)
+from director_os.api.selection_api import router as selection_router  # noqa: E402
+
+app.include_router(selection_router)
 
 # Director Studio (M3) talks to this gateway from the browser in dev
 app.add_middleware(
@@ -737,6 +743,13 @@ def agent_dispatch(project_id: str, body: AgentDispatchRequest) -> AgentDispatch
     toolbox = DirectorToolbox(timeline, project_id)
     registry = build_director_registry(toolbox)
     register_ops_tools(registry, OpsStore(factory, project_id), project_id)
+    work_dir = get_settings().output_dir / "pipeline" / project_id
+    register_selection_tools(
+        registry,
+        OpsStore(factory, project_id),
+        work_dir,
+        agent_name="director_agent",
+    )
     executor = PlannerExecutor(registry, store, project_id, agent="director_agent", role="director")
     run = executor.execute_plan(
         [ToolStep(tool=body.tool, args=body.args, checkpoint_note=body.checkpoint_note)],
@@ -826,6 +839,13 @@ def agent_plan(project_id: str, body: AgentPlanRequest | None = None) -> AgentPl
     toolbox = DirectorToolbox(timeline, project_id)
     registry = build_director_registry(toolbox)
     register_ops_tools(registry, OpsStore(factory, project_id), project_id)
+    work_dir = get_settings().output_dir / "pipeline" / project_id
+    register_selection_tools(
+        registry,
+        OpsStore(factory, project_id),
+        work_dir,
+        agent_name="director_agent",
+    )
     try:
         backend = build_backend_chain(registry, body.niche)
     except LLMBackendError as e:

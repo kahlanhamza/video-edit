@@ -28,6 +28,7 @@ from director_os.agent_runtime.registry import (
     ToolRegistry,
     ToolSpec,
 )
+from director_os.agent_runtime.selection_tools import register_selection_tools
 from director_os.agent_runtime.workshop_tools import register_workshop_tools
 
 __all__ = [
@@ -48,5 +49,6 @@ __all__ = [
     "ToolStep",
     "build_director_registry",
     "register_ops_tools",
+    "register_selection_tools",
     "register_workshop_tools",
 ]

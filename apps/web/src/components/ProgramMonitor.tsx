@@ -13,8 +13,15 @@ import {
   useRef,
   useState,
 } from "react";
-import { Asset, NleEffect, api, assetProxyUrl, assetScrubUrl } from "@/lib/api";
-import { formatTimecodeFrames, scrubBackground, scrubFrameCount, scrubFrameIndex } from "@/lib/nle";
+import { Asset, NleEffect, SelectionOut, TrackHit, api, assetProxyUrl, assetScrubUrl } from "@/lib/api";
+import {
+  TrackedBox,
+  formatTimecodeFrames,
+  scrubBackground,
+  scrubFrameCount,
+  scrubFrameIndex,
+  trackedBoxAt,
+} from "@/lib/nle";
 import { useNLEShortcuts } from "@/hooks/useNLEShortcuts";
 import { Icon } from "./studio/icons";
 
@@ -50,6 +57,8 @@ export const ProgramMonitor = forwardRef<
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
   const [videoReady, setVideoReady] = useState(false);
+  const [tracking, setTracking] = useState<string | null>(null);
+  const [trackedPaths, setTrackedPaths] = useState<Record<string, TrackHit[]>>({});
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
@@ -73,9 +82,33 @@ export const ProgramMonitor = forwardRef<
       const state = await api.listOps(projectId);
       setRegions(state.fold.effects);
       setError(null);
+      // tracked selections (step 3): fetch each op's per-frame path once —
+      // the monitor then draws the box FOLLOWING the object as you scrub
+      const need = state.fold.effects.filter(
+        (r) => r.mode === "tracked" && r.op_id && !trackedPaths[r.op_id],
+      );
+      if (need.length > 0) {
+        const loaded = await Promise.all(
+          need.map(async (r) => {
+            try {
+              const op = await api.getOp(r.op_id!);
+              const hits = (op.params?.tracked as TrackHit[] | undefined) ?? [];
+              return [r.op_id!, hits] as const;
+            } catch {
+              return [r.op_id!, [] as TrackHit[]] as const;
+            }
+          }),
+        );
+        setTrackedPaths((prev) => {
+          const next = { ...prev };
+          for (const [id, hits] of loaded) next[id] = hits;
+          return next;
+        });
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId]);
 
   useEffect(() => {
@@ -143,6 +176,40 @@ export const ProgramMonitor = forwardRef<
       onChanged();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  /** Track this box from the playhead: promptable selection (step 3). The
+   * drawn box seeds the prompt; the tracked op REPLACES the static one
+   * (revoked — history kept) so the program never double-blurs. */
+  async function trackRegion(r: NleEffect) {
+    if (!r.op_id) return; // legacy regions have no op to upgrade
+    setTracking(r.op_id);
+    setError(null);
+    const anchor = Math.min(Math.max(0, Math.round(time * fps)), Math.max(0, Math.round(asset.duration_s * fps) - 1));
+    const span = Math.min(12, Math.max(1, asset.duration_s - anchor / fps));
+    try {
+      const sel: SelectionOut = await api.createSelection(asset.id, {
+        kind: "box",
+        x: r.x,
+        y: r.y,
+        w: r.w,
+        h: r.h,
+        anchor_frame: anchor,
+        frame_start: anchor,
+        frame_end: Math.min(Math.round(asset.duration_s * fps) - 1, anchor + Math.round(span * fps)),
+      });
+      await api.revokeOp(projectId, r.op_id, `superseded by tracked op ${sel.op_id?.slice(0, 8)}`);
+      if (sel.op_id) {
+        setTrackedPaths((prev) => ({ ...prev, [sel.op_id!]: sel.hits }));
+      }
+      await reload();
+      onChanged();
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setTracking(null);
     }
   }
 
@@ -255,21 +322,37 @@ export const ProgramMonitor = forwardRef<
           ))}
           {showExisting &&
             scaleX > 0 &&
-            regions.map((r) => (
-              <div
-                key={r.id}
-                className="pointer-events-none absolute border bg-[rgba(241,109,109,0.14)]"
-                style={{
-                  left: r.x * scaleX,
-                  top: r.y * scaleY,
-                  width: r.w * scaleX,
-                  height: r.h * scaleY,
-                  borderStyle: r.origin === "agent" ? "dashed" : "solid",
-                  borderColor: "var(--err)",
-                }}
-                title={`${r.label || "blur"} ${r.w}x${r.h}@${r.x},${r.y} · ${r.origin ?? "legacy"}`}
-              />
-            ))}
+            regions.map((r) => {
+              // tracked selections draw the box AT THE PLAYHEAD (it follows
+              // the object as you scrub); static boxes draw their stored rect
+              const path = r.op_id ? trackedPaths[r.op_id] : undefined;
+              const tb: TrackedBox | null =
+                r.mode === "tracked" && path && path.length > 0 ? trackedBoxAt(path, time) : null;
+              const bx = tb ? tb.x : r.x;
+              const by = tb ? tb.y : r.y;
+              const bw = tb ? tb.w : r.w;
+              const bh = tb ? tb.h : r.h;
+              if (r.mode === "tracked" && !tb && path && path.length > 0) return null; // outside the tracked span
+              return (
+                <div
+                  key={r.id}
+                  className="pointer-events-none absolute border bg-[rgba(241,109,109,0.14)]"
+                  style={{
+                    left: bx * scaleX,
+                    top: by * scaleY,
+                    width: bw * scaleX,
+                    height: bh * scaleY,
+                    borderStyle: r.origin === "agent" || tb?.interpolated ? "dashed" : "solid",
+                    borderColor: r.mode === "tracked" ? "var(--warn, #e2a336)" : "var(--err)",
+                  }}
+                  title={
+                    r.mode === "tracked"
+                    ? `${r.label || "tracked"} · follows object @ playhead ${bx}x${by}`
+                    : `${r.label || "blur"} ${r.w}x${r.h}@${r.x},${r.y} · ${r.origin ?? "legacy"}`
+                  }
+                />
+              );
+            })}
           {draft && (
             <div
               className="pointer-events-none absolute border border-dashed border-[var(--acc)] bg-[var(--acc-bg)]"
@@ -365,14 +448,34 @@ export const ProgramMonitor = forwardRef<
                     agent
                   </span>
                 )}
+                {r.mode === "tracked" && r.op_id && trackedPaths[r.op_id]?.length > 0 && (
+                  <span
+                    className="ml-1.5 rounded bg-[var(--bg-3, #26292f)] px-1 text-[9px] uppercase tracking-wider text-[var(--warn, #e2a336)]"
+                    title={`per-frame path · ${trackedPaths[r.op_id].length} frames`}
+                  >
+                    tracked · {trackedPaths[r.op_id].length}f
+                  </span>
+                )}
               </span>
-              <button
-                className="icon-btn !h-5 !w-5 opacity-0 group-hover:opacity-100"
-                title="remove blur box (op-backed boxes are revoked — history kept)"
-                onClick={() => removeRegion(r)}
-              >
-                <Icon name="trash" size={12} />
-              </button>
+              <span className="flex items-center gap-0.5">
+                {r.op_id && r.mode !== "tracked" && (
+                  <button
+                    className="icon-btn !h-5 !w-5 opacity-0 group-hover:opacity-100"
+                    disabled={tracking === r.op_id}
+                    title="Track this object from the playhead — the blur follows it across frames (selection service)"
+                    onClick={() => trackRegion(r)}
+                  >
+                    <Icon name="wand" size={12} />
+                  </button>
+                )}
+                <button
+                  className="icon-btn !h-5 !w-5 opacity-0 group-hover:opacity-100"
+                  title="remove blur box (op-backed boxes are revoked — history kept)"
+                  onClick={() => removeRegion(r)}
+                >
+                  <Icon name="trash" size={12} />
+                </button>
+              </span>
             </div>
           ))}
           {error && <p className="text-[11px] text-[var(--err)]">{error}</p>}

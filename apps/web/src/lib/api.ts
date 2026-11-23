@@ -154,6 +154,31 @@ export interface OpsState {
   };
 }
 
+// --- selection service (agent-frame-editor step 3): tracked blur paths ---
+export interface TrackHit {
+  t_s: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  score: number;
+  interpolated: boolean;
+}
+
+export interface SelectionOut {
+  backend: string;
+  anchor_frame: number;
+  frame_start: number;
+  frame_end: number;
+  n_hits: number;
+  n_interpolated: number;
+  mean_score: number;
+  hits: TrackHit[];
+  union_box: { x: number; y: number; w: number; h: number };
+  op_id: string | null;
+  detail: string;
+}
+
 export interface TimelineVersion {
   version_num: number;
   created_by: string;
@@ -456,6 +481,31 @@ export const api = {
     ),
   opsStreamUrl: (id: string, since = 0) =>
     `${API_BASE}/projects/${id}/ops/stream?since=${since}`,
+  // --- selection service: promptable per-object tracking (step 3) ---
+  createSelection: (
+    assetId: string,
+    body: {
+      kind: "box" | "point";
+      x: number;
+      y: number;
+      w?: number;
+      h?: number;
+      anchor_frame: number;
+      frame_start: number;
+      frame_end: number;
+      backend?: string;
+      create_blur_op?: boolean;
+      sigma?: number;
+      label?: string;
+    },
+  ) =>
+    req<SelectionOut>(`/assets/${assetId}/selection`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  getOp: (opId: string) => req<OpRecord>(`/ops/${opId}`),
+  selectionBackends: () =>
+    req<Record<string, boolean>>(`/selection/backends`),
   // --- WS4: multi-source case ingest + CaseDossier
   listSources: (id: string) => req<CaseSourceOut[]>(`/projects/${id}/sources`),
   addSource: (id: string, body: AddSourceIn) =>
