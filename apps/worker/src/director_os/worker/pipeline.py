@@ -1121,16 +1121,8 @@ def _render_plan_with_ops(
             .all()
         )
         op_rows = [(str(r.id), dict(r.params or {})) for r in rows]
-        # the export gate cursor: the highest op rev in the project (ANY kind)
-        # — every later op event (propose/revoke/caption) makes it stale
-        from sqlalchemy import func
-
-        max_rev = int(
-            s.execute(
-                select(func.max(TimelineOpRow.rev)).where(TimelineOpRow.project_id == project_id)
-            ).scalar_one()
-            or 0
-        )
+        # (the gate cursor lives in _stamp_export_gate now — it computes the
+        # same max op rev itself, so the stamp also happens in default mode)
 
     merged, changed = merge_op_params(plan, [params for _id, params in op_rows])
 
@@ -1140,26 +1132,7 @@ def _render_plan_with_ops(
     # Version-level edits (trim_clip / trim_audio / split / move / remove)
     # never touch the op fold: without the version stamp a post-export trim
     # would leave the gate "clean" while the disk carries the OLD cut.
-    if asset_id:
-        from director_os.core.db import ProjectRow
-
-        with deps.sessions() as s:
-            project = s.get(ProjectRow, project_id)
-            baked_version = (
-                int(project.active_otio_version_id)
-                if project is not None and project.active_otio_version_id is not None
-                else None
-            )
-            prow = s.get(PerceptionIndexRow, asset_id)
-            if prow is None:
-                prow = PerceptionIndexRow(asset_id=asset_id)
-                s.add(prow)
-            prow.redaction_tracks_json = {
-                **(prow.redaction_tracks_json or {}),
-                "baked_ops_rev": max_rev,
-                "baked_timeline_version": baked_version,
-            }
-            s.commit()
+    _stamp_export_gate(deps, project_id, asset_id)
 
     if not changed:
         return plan, digest
@@ -1172,6 +1145,46 @@ def _render_plan_with_ops(
         f"in the render plan (ops baked, digest {merged_digest})"
     )
     return merged, merged_digest
+
+
+def _stamp_export_gate(deps: PipelineDeps, project_id: str, asset_id: str | None) -> None:
+    """Stamp the export-gate cursor for ANY successful master render.
+
+    Reads (max op rev, active timeline version) at call time — i.e. the exact
+    program the render just baked to disk — into the PerceptionIndexRow the
+    API gate reads. Without this, a project with NO tracked redaction (the
+    default) never stamps and the Export button claims "dirty" forever (CR-002).
+    Tracked renders additionally call this from _render_plan_with_ops so the
+    stamp lands with the bake; calling again after stage_render is idempotent.
+    """
+    if not asset_id:
+        return
+    from director_os.core.db import ProjectRow, TimelineOpRow
+    from sqlalchemy import func, select
+
+    with deps.sessions() as s:
+        max_rev = int(
+            s.execute(
+                select(func.max(TimelineOpRow.rev)).where(TimelineOpRow.project_id == project_id)
+            ).scalar_one()
+            or 0
+        )
+        project = s.get(ProjectRow, project_id)
+        baked_version = (
+            int(project.active_otio_version_id)
+            if project is not None and project.active_otio_version_id is not None
+            else None
+        )
+        prow = s.get(PerceptionIndexRow, asset_id)
+        if prow is None:
+            prow = PerceptionIndexRow(asset_id=asset_id)
+            s.add(prow)
+        prow.redaction_tracks_json = {
+            **(prow.redaction_tracks_json or {}),
+            "baked_ops_rev": max_rev,
+            "baked_timeline_version": baked_version,
+        }
+        s.commit()
 
 
 def _clip_plan(plan, start_s: float, dur_s: float):
@@ -2495,6 +2508,10 @@ def run_pipeline(
                 narration_audio=narration_audio if narration_clips else None,
             )
             st.pct(96, f"{report.rendered} rendered / {report.cached} cached")
+        # the disk now carries THIS program (ops@max_rev + active version) —
+        # stamp the gate in EVERY redact mode, not only the tracked path,
+        # or the Export button lies "dirty" forever on default projects
+        _stamp_export_gate(deps, project_id, asset_id)
 
         tracker.stage(JobStage.subtitles.value, 85.0)
         _check_stop(deps, project_id)
@@ -2564,11 +2581,15 @@ def run_pipeline(
                     ((prow.redaction_tracks_json or {}).get("timestamp_ocr") or {}) if prow else {}
                 )
                 card_sub = f"CASE FILE — {ocr.get('iso')}" if ocr.get("iso") else None
+                # The pack MUST carry the post-fx deliverable (captions burned,
+                # tracked blur baked, audio enhanced) — the file the human ships.
+                # Passing report.final_path here shipped the PRE-fx master and
+                # every upload from the pack silently lost captions/blur (CR-001).
                 pack = build_ship_pack(
                     project_id,
                     deps,
                     timeline,
-                    report.final_path,
+                    final_for_qa,
                     transcript=transcript,
                     insights=(shots.get("visual_timeline") or {}).get("insights", []),
                     card_subtitle=card_sub,

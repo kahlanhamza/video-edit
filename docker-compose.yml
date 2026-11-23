@@ -18,7 +18,12 @@ services:
       POSTGRES_PASSWORD: directoros
       POSTGRES_DB: directoros
     ports:
-      - "5432:5432"
+      # CR-011: infrastructure services answer 127.0.0.1 only. They carry
+      # default dev credentials and the (possibly plaintext-era) vault —
+      # nothing on the LAN needs to reach Postgres/Redis/MinIO directly.
+      # api/web stay 0.0.0.0 deliberately: the owner tests the Studio from a
+      # phone on the LAN.
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -30,7 +35,7 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -46,8 +51,8 @@ services:
       MINIO_ROOT_USER: directoros
       MINIO_ROOT_PASSWORD: directoros-secret
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     volumes:
       - miniodata:/data
     healthcheck:
@@ -157,7 +162,8 @@ services:
       SAM2_WEIGHTS_URL: ${SAM2_WEIGHTS_URL:-}
       SAM2_WEIGHTS_SHA256: ${SAM2_WEIGHTS_SHA256:-}
     ports:
-      - "8300:8300"
+      # the tracker decodes arbitrary local paths — never expose it past the host
+      - "127.0.0.1:8300:8300"
     volumes:
       - sam2weights:/weights
       # the service reads the same output tree the api/worker write

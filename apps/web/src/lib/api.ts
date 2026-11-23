@@ -153,6 +153,26 @@ export interface ExportGate {
   exported_once: boolean;
 }
 
+export interface DeliverableFile {
+  name: string;
+  path: string;
+  size_bytes: number;
+}
+
+export interface Deliverables {
+  project_id: string;
+  project_status: string;
+  gate_dirty: boolean;
+  master_path: string | null;
+  master_size_bytes: number | null;
+  master_is_post_fx: boolean;
+  srt_path: string | null;
+  pack_dir: string | null;
+  pack_files: DeliverableFile[];
+  suggested_title: string;
+  youtube_configured: boolean;
+}
+
 export interface OpsState {
   project_id: string;
   rev: number;
@@ -442,10 +462,13 @@ export const api = {
       video_id: string;
       privacy_status: string;
       caption_attached: boolean;
+      dry_run: boolean;
     }>(`/projects/${id}/publish-draft`, {
       method: "POST",
       body: JSON.stringify(payload),
     }),
+  getDeliverables: (id: string) =>
+    req<Deliverables>(`/projects/${id}/deliverables`),
   // --- M3 close-out: proxy player + subtitle grid + blur canvas
   listAssets: (id: string) => req<Asset[]>(`/projects/${id}/assets`),
   listSubtitles: (id: string) => req<Cue[]>(`/projects/${id}/subtitles`),

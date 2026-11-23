@@ -11,12 +11,16 @@ Critic agent (and the cost dashboard in M5) a complete audit trail.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import opentimelineio.adapters as ot_adapters
 from director_os.core.db import AgentToolLogRow, TimelineVersionRow
 from director_os.otio_engine.timeline import to_json_dict
 from sqlalchemy import desc, select
+from sqlalchemy.exc import IntegrityError
+
+CHECKPOINT_WRITE_ATTEMPTS = 5
 
 
 class CheckpointError(RuntimeError):
@@ -37,26 +41,48 @@ class CheckpointStore:
         note: str,
         created_by: str = "director_agent",
     ) -> int:
-        """Persist the timeline state; returns the new version_num."""
-        with self._sessions() as s:
-            last = s.execute(
-                select(TimelineVersionRow.version_num)
-                .where(TimelineVersionRow.project_id == project_id)
-                .order_by(desc(TimelineVersionRow.version_num))
-                .limit(1)
-            ).scalar_one_or_none()
-            version = (last or 0) + 1
-            s.add(
-                TimelineVersionRow(
-                    project_id=project_id,
-                    version_num=version,
-                    otio_json=to_json_dict(timeline),
-                    created_by=created_by,
-                    checkpoint_note=note[:500],
+        """Persist the timeline state; returns the new version_num.
+
+        The version number is assigned by SELECT-max then INSERT — two
+        concurrent dispatches (double-click, inline fallback racing a
+        recovered broker) could both read the same max and race the write
+        (CR-007). The (project_id, version_num) unique constraint is the
+        backstop; on conflict we re-read the max and retry — a checkpoint is
+        content-addressed by the timeline it stores, so the retry writes the
+        SAME state under the winning number.
+        """
+        payload = to_json_dict(timeline)
+        for attempt in range(CHECKPOINT_WRITE_ATTEMPTS):
+            with self._sessions() as s:
+                last = s.execute(
+                    select(TimelineVersionRow.version_num)
+                    .where(TimelineVersionRow.project_id == project_id)
+                    .order_by(desc(TimelineVersionRow.version_num))
+                    .limit(1)
+                ).scalar_one_or_none()
+                version = (last or 0) + 1
+                s.add(
+                    TimelineVersionRow(
+                        project_id=project_id,
+                        version_num=version,
+                        otio_json=payload,
+                        created_by=created_by,
+                        checkpoint_note=note[:500],
+                    )
                 )
-            )
-            s.commit()
-            return version
+                try:
+                    s.commit()
+                    return version
+                except IntegrityError:
+                    # a concurrent writer took this version number first —
+                    # roll this session back and contend again
+                    s.rollback()
+                    if attempt == CHECKPOINT_WRITE_ATTEMPTS - 1:
+                        raise
+                    time.sleep(0.02 * (attempt + 1))
+        raise CheckpointError(
+            f"checkpoint did not converge after {CHECKPOINT_WRITE_ATTEMPTS} attempts"
+        )
 
     def list_versions(self, project_id: str) -> list[dict[str, Any]]:
         with self._sessions() as s:

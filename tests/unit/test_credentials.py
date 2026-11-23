@@ -168,3 +168,23 @@ def test_version_meta_defaults_zero(db):
     with make_session_factory(db)() as s:
         assert read_version(s) == 0
         assert s.get(SettingsMetaRow, VERSION_KEY) is None
+
+
+def test_real_encryption_activates_with_dependency(db, monkeypatch):
+    """CR-008 regression: `cryptography` is now a real dependency — with
+    SETTINGS_SECRET_KEY set the vault MUST encrypt at rest (no silent
+    plaintext degradation), roundtrip through the DB, and decrypt on read."""
+    from director_os.core.credentials import encryption_active
+
+    monkeypatch.setenv("SETTINGS_SECRET_KEY", "real-key-for-ci-0123456789abcdef")
+    assert encryption_active() is True
+
+    with make_session_factory(db)() as s:
+        upsert_credentials(s, {"GLADIA_API_KEY": "sk_gladia_live_value"})
+        s.commit()
+        raw = s.query(CredentialRow).filter_by(key="GLADIA_API_KEY").one()
+        assert raw.encrypted is True
+        assert raw.value != "sk_gladia_live_value"
+        assert raw.value.startswith("gAAAA")  # real Fernet token prefix
+        creds = load_credentials(s)
+    assert creds["GLADIA_API_KEY"] == "sk_gladia_live_value"

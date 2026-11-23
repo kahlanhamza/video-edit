@@ -82,7 +82,7 @@ video-edit/
 │                            caption v4, post-FX v3, TTS normalization, etc.)
 ├── tests/unit/              89 hermetic test modules (contracts, laws, tools, backends)
 ├── tests/integration/       4 heavier tests (two-bus, fixture render, redact, deepfilter)
-├── docs/                    ADRs, research dossiers, M3 acceptance evidence, this file
+├── docs/                    ADRs, CRITIQUE.md (adversarial review + open items), research, M3 acceptance, this file
 └── demo/                    demo_1080p.py — the M1 full-res demonstration
 ```
 

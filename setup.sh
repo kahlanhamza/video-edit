@@ -86,6 +86,26 @@ ask_key() { # ask_key KEY HINT  -> writes into .env unless skipped/kept
 echo "--- API keys (both optional; Enter skips) ---"
 ask_key GLADIA_API_KEY "Gladia = transcription/captions. Free key: https://app.gladia.io"
 ask_key LLM_API_KEY    "LLM = the AI editor's brain. Meta Model API key: https://fai.meta.com/developer (or a Google AI Studio key: https://aistudio.google.com/apikey)"
+
+# SETTINGS_SECRET_KEY: encrypts the settings vault at rest (CR-008). Generate
+# one automatically unless the user already set it — an empty key means API
+# keys and the YouTube refresh token sit PLAINTEXT in the database.
+cur_secret=$(grep -E "^SETTINGS_SECRET_KEY=" .env | tail -n1 | cut -d= -f2-)
+if [ -z "$cur_secret" ]; then
+  gen=""
+  if command -v python3 >/dev/null 2>&1; then
+    gen=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))" 2>/dev/null)
+  fi
+  [ -z "$gen" ] && command -v openssl >/dev/null 2>&1 && gen=$(openssl rand -base64 32 | tr -d '\n=/+' | head -c 43)
+  if [ -n "$gen" ]; then
+    set_key .env SETTINGS_SECRET_KEY "$gen"
+    echo "      SETTINGS_SECRET_KEY generated — saved provider keys are encrypted at rest"
+  else
+    echo "      WARNING: could not generate SETTINGS_SECRET_KEY — the vault stays plaintext"
+  fi
+else
+  echo "      SETTINGS_SECRET_KEY already set — kept"
+fi
 echo "[2/4] Keys configured"
 
 # --- 3) build + boot --------------------------------------------------------

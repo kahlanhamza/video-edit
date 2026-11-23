@@ -31,6 +31,7 @@ from director_os.api.ops_api import router as ops_router
 from director_os.api.youtube import (
     Chapter,
     DraftMetadata,
+    GoogleYouTubePublisher,
     InMemoryYouTubePublisher,
     YouTubePublisher,
 )
@@ -696,6 +697,81 @@ def timeline_nle(project_id: str) -> JSONResponse:
 # --- export gate (roadmap step 6): preview is overlay-only; Export is the only render ---
 
 
+def _compute_gate_state(s: Any, project_id: str) -> dict[str, Any]:
+    """Export-gate state from server truth (op fold + stamped bake cursor).
+
+    Shared by GET /export/gate, GET /deliverables and POST /publish-draft —
+    all three must answer the SAME question: does the disk carry the program
+    the reviewer sees?
+    """
+    from director_os.core.db import PerceptionIndexRow, TimelineOpRow
+    from sqlalchemy import func, select
+
+    project = s.get(ProjectRow, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    ops_rev = int(
+        s.execute(
+            select(func.max(TimelineOpRow.rev)).where(TimelineOpRow.project_id == project_id)
+        ).scalar_one()
+        or 0
+    )
+    asset = (
+        s.execute(
+            select(MediaAssetRow)
+            .where(MediaAssetRow.project_id == project_id)
+            .order_by(MediaAssetRow.id)
+            .limit(1)
+        )
+        .scalars()
+        .first()
+    )
+    baked_ops_rev = None
+    baked_timeline_version = None
+    if asset is not None:
+        prow = s.get(PerceptionIndexRow, asset.id)
+        baked_raw = (prow.redaction_tracks_json or {}).get("baked_ops_rev") if prow else None
+        baked_ops_rev = int(baked_raw) if baked_raw is not None else None
+        ver_raw = (
+            (prow.redaction_tracks_json or {}).get("baked_timeline_version") if prow else None
+        )
+        baked_timeline_version = int(ver_raw) if ver_raw is not None else None
+    pending = 0
+    if baked_ops_rev is not None and ops_rev > baked_ops_rev:
+        pending = int(
+            s.execute(
+                select(func.count(TimelineOpRow.id)).where(
+                    TimelineOpRow.project_id == project_id,
+                    TimelineOpRow.rev > baked_ops_rev,
+                    TimelineOpRow.kind != "revoke",
+                )
+            ).scalar_one()
+            or 0
+        )
+    active_version = project.active_otio_version_id
+    # dirty on TWO axes: op-fold advance (blur/redaction edits) AND
+    # timeline-version advance (trim/split/move — the checkpointed cut).
+    # A post-export A1 trim MUST flip the gate or the button lies.
+    dirty = (
+        baked_ops_rev is None
+        or ops_rev > baked_ops_rev
+        or (
+            active_version is not None
+            and baked_timeline_version is not None
+            and active_version > baked_timeline_version
+        )
+    )
+    return {
+        "ops_rev": ops_rev,
+        "baked_ops_rev": baked_ops_rev,
+        "active_version": active_version,
+        "baked_timeline_version": baked_timeline_version,
+        "dirty": dirty,
+        "pending_ops": pending,
+        "exported_once": baked_ops_rev is not None or baked_timeline_version is not None,
+    }
+
+
 @app.get("/projects/{project_id}/export/gate")
 def export_gate(project_id: str) -> JSONResponse:
     """The export gate state: is the program dirtier than the last bake?
@@ -704,78 +780,9 @@ def export_gate(project_id: str) -> JSONResponse:
     consumed — never client-trusted); `dirty` = the op log has advanced past
     it. One button semantics: the Studio renders this state next to Export.
     """
-    from director_os.core.db import PerceptionIndexRow
-
     s = session()
     try:
-        project = s.get(ProjectRow, project_id)
-        if project is None:
-            raise HTTPException(status_code=404, detail="project not found")
-        from director_os.core.db import TimelineOpRow
-        from sqlalchemy import func, select
-
-        ops_rev = int(
-            s.execute(
-                select(func.max(TimelineOpRow.rev)).where(TimelineOpRow.project_id == project_id)
-            ).scalar_one()
-            or 0
-        )
-        asset = (
-            s.execute(
-                select(MediaAssetRow)
-                .where(MediaAssetRow.project_id == project_id)
-                .order_by(MediaAssetRow.id)
-                .limit(1)
-            )
-            .scalars()
-            .first()
-        )
-        baked_ops_rev = None
-        baked_timeline_version = None
-        if asset is not None:
-            prow = s.get(PerceptionIndexRow, asset.id)
-            baked_raw = (prow.redaction_tracks_json or {}).get("baked_ops_rev") if prow else None
-            baked_ops_rev = int(baked_raw) if baked_raw is not None else None
-            ver_raw = (
-                (prow.redaction_tracks_json or {}).get("baked_timeline_version") if prow else None
-            )
-            baked_timeline_version = int(ver_raw) if ver_raw is not None else None
-        pending = 0
-        if baked_ops_rev is not None and ops_rev > baked_ops_rev:
-            pending = int(
-                s.execute(
-                    select(func.count(TimelineOpRow.id)).where(
-                        TimelineOpRow.project_id == project_id,
-                        TimelineOpRow.rev > baked_ops_rev,
-                        TimelineOpRow.kind != "revoke",
-                    )
-                ).scalar_one()
-                or 0
-            )
-        active_version = project.active_otio_version_id
-        # dirty on TWO axes: op-fold advance (blur/redaction edits) AND
-        # timeline-version advance (trim/split/move — the checkpointed cut).
-        # A post-export A1 trim MUST flip the gate or the button lies.
-        dirty = (
-            baked_ops_rev is None
-            or ops_rev > baked_ops_rev
-            or (
-                active_version is not None
-                and baked_timeline_version is not None
-                and active_version > baked_timeline_version
-            )
-        )
-        return JSONResponse(
-            {
-                "ops_rev": ops_rev,
-                "baked_ops_rev": baked_ops_rev,
-                "active_version": active_version,
-                "baked_timeline_version": baked_timeline_version,
-                "dirty": dirty,
-                "pending_ops": pending,
-                "exported_once": baked_ops_rev is not None or baked_timeline_version is not None,
-            }
-        )
+        return JSONResponse(_compute_gate_state(s, project_id))
     finally:
         s.close()
 
@@ -1171,6 +1178,62 @@ class PublishDraftResponse(BaseModel):
     video_id: str
     privacy_status: str
     caption_attached: bool
+    # False = a REAL YouTube Data API upload happened. True = the in-memory
+    # publisher recorded a simulation (no YouTube call was made). The Studio
+    # must render this distinctly — a fake success is worse than an error
+    # (CR-003: the publish button used to lie with a synthetic video id).
+    dry_run: bool = False
+
+
+def _resolve_publisher() -> tuple[YouTubePublisher, bool]:
+    """Real YouTube publisher when the vault carries OAuth credentials, else
+    the in-memory recorder (dry run). Never fake a real upload."""
+    s = session()
+    try:
+        from director_os.core.credentials import load_credentials
+
+        creds = load_credentials(s)
+    finally:
+        s.close()
+    client_id = (creds.get("YOUTUBE_CLIENT_ID") or "").strip()
+    client_secret = (creds.get("YOUTUBE_CLIENT_SECRET") or "").strip()
+    refresh_token = (creds.get("YOUTUBE_REFRESH_TOKEN") or "").strip()
+    if client_id and client_secret and refresh_token:
+        try:
+            from google.oauth2.credentials import Credentials as GoogleCredentials
+        except ImportError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "YouTube OAuth credentials are configured but google-api-python-client "
+                    "is not installed in this deployment — `uv add google-api-python-client` "
+                    "or clear the YOUTUBE_* keys to publish dry runs only"
+                ),
+            ) from e
+        oauth = GoogleCredentials(
+            token=None,
+            refresh_token=refresh_token,
+            client_id=client_id,
+            client_secret=client_secret,
+            token_uri="https://oauth2.googleapis.com/token",
+        )
+        return GoogleYouTubePublisher(oauth), False
+    return _publisher, True
+
+
+def _publish_gate_check(s: Any, project_id: str) -> None:
+    """Refuse to publish a cut the disk does not carry (gate dirty)."""
+    gate = _compute_gate_state(s, project_id)
+    if gate["dirty"]:
+        pending = gate["pending_ops"]
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "export gate is dirty — the timeline on screen is NOT the file "
+                f"you are about to publish ({pending} op(s) since the last bake). "
+                "Hit Export first, then publish."
+            ),
+        )
 
 
 @app.post("/projects/{project_id}/publish-draft", response_model=PublishDraftResponse)
@@ -1197,8 +1260,13 @@ def publish_draft(project_id: str, body: PublishDraftRequest) -> PublishDraftRes
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
 
+    # the gate check runs AFTER cheap input validation — a chapter typo must
+    # not be masked by a 409 that asks for an Export run first
+    _publish_gate_check(s, project_id)
+
+    publisher, dry_run = _resolve_publisher()
     try:
-        result = _publisher.upload_draft(
+        result = publisher.upload_draft(
             Path(body.video_path), metadata, Path(body.srt_path) if body.srt_path else None
         )
     except FileNotFoundError as e:
@@ -1206,14 +1274,108 @@ def publish_draft(project_id: str, body: PublishDraftRequest) -> PublishDraftRes
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"publisher failed: {e}") from e
 
-    row.youtube_draft_id = result.video_id
-    row.status = ProjectStatus.published_draft.value
-    s.commit()
+    # a dry run must NOT flip the project to published_draft — nothing was
+    # uploaded; marking it published would hide the real last mile forever
+    if not dry_run:
+        row.youtube_draft_id = result.video_id
+        row.status = ProjectStatus.published_draft.value
+        s.commit()
     return PublishDraftResponse(
         project_id=project_id,
         video_id=result.video_id,
         privacy_status=result.privacy_status,
         caption_attached=result.caption_attached,
+        dry_run=dry_run,
+    )
+
+
+class DeliverableFile(BaseModel):
+    name: str
+    path: str
+    size_bytes: int
+
+
+class DeliverablesResponse(BaseModel):
+    """The real last mile: the exact files on disk this project can ship."""
+
+    project_id: str
+    project_status: str
+    gate_dirty: bool
+    master_path: str | None = None
+    master_size_bytes: int | None = None
+    master_is_post_fx: bool = False
+    srt_path: str | None = None
+    pack_dir: str | None = None
+    pack_files: list[DeliverableFile] = Field(default_factory=list)
+    suggested_title: str = ""
+    youtube_configured: bool = False
+
+
+@app.get("/projects/{project_id}/deliverables", response_model=DeliverablesResponse)
+def project_deliverables(project_id: str) -> DeliverablesResponse:
+    """What the human actually ships: the baked master (post-fx preferred),
+    the captions, and every file in the ship pack. The Studio publish view
+    prefills from this — nobody should hand-type a filesystem path (CR-003)."""
+    s = session()
+    try:
+        row = s.get(ProjectRow, project_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        gate = _compute_gate_state(s, project_id)
+        from director_os.core.credentials import load_credentials
+
+        creds = load_credentials(s)
+        youtube_configured = all(
+            (creds.get(k) or "").strip()
+            for k in ("YOUTUBE_CLIENT_ID", "YOUTUBE_CLIENT_SECRET", "YOUTUBE_REFRESH_TOKEN")
+        )
+    finally:
+        s.close()
+
+    work = get_settings().output_dir / "pipeline" / project_id
+
+    def _newest(pattern: str) -> Path | None:
+        matches = [p for p in work.rglob(pattern) if p.is_file() and p.stat().st_size > 0]
+        return max(matches, key=lambda p: p.stat().st_mtime) if matches else None
+
+    pack_dir = work / "ship_pack"
+    pack_master = pack_dir / "final_1080p.mp4"
+    master: Path | None = pack_master if pack_master.is_file() else None
+    master_is_post_fx = False
+    if master is None:
+        postfx = _newest("master_postfx.mp4")
+        if postfx is not None:
+            master, master_is_post_fx = postfx, True
+    if master is None:
+        master = _newest("final.mp4")
+    srt: Path | None = pack_dir / "captions.srt"
+    if not (srt is not None and srt.is_file()):
+        srt = _newest("subtitles.srt")
+
+    pack_files: list[DeliverableFile] = []
+    if pack_dir.is_dir():
+        for p in sorted(pack_dir.rglob("*")):
+            if p.is_file() and p.stat().st_size > 0:
+                pack_files.append(
+                    DeliverableFile(
+                        name=p.relative_to(pack_dir).as_posix(),
+                        path=str(p),
+                        size_bytes=p.stat().st_size,
+                    )
+                )
+
+    return DeliverablesResponse(
+        project_id=project_id,
+        project_status=row.status,
+        gate_dirty=bool(gate["dirty"]),
+        master_path=str(master) if master is not None else None,
+        master_size_bytes=master.stat().st_size if master is not None else None,
+        master_is_post_fx=master_is_post_fx or (master is not None and master.parent == pack_dir),
+        srt_path=str(srt) if srt is not None and srt.is_file() else None,
+        pack_dir=str(pack_dir) if pack_dir.is_dir() else None,
+        pack_files=pack_files,
+        suggested_title=row.title or "",
+        youtube_configured=youtube_configured,
     )
 
 

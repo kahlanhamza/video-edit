@@ -10,7 +10,7 @@
 // Every track has a real header (name chip, eye/lock/mute) like Premiere.
 // The playhead spans ruler + tracks with a flag handle in the ruler.
 
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { assetScrubUrl } from "@/lib/api";
 import {
   buildLanes,
@@ -210,12 +210,37 @@ export default function Timeline({
     setDrag({ kind: "none" });
   }
 
-  const ticks = useMemo(() => {
+  // CR-013: ticks used to read scrollLeft once at render time (no scroll
+  // listener) — scrolling right past the first viewport left the ruler blank.
+  // Scroll events (rAF-throttled) now drive the visible tick window.
+  const [scrollState, setScrollState] = useState({ left: 0, viewW: 900 });
+  useEffect(() => {
     const el = scrollRef.current;
-    const viewW = (el?.clientWidth ?? 900) - TRACK_HEAD_W;
-    const start = (el?.scrollLeft ?? 0) / zoom;
-    return rulerTicks(start, start + viewW / zoom, zoom);
-  }, [zoom, duration, nle]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (!el) return;
+    let raf = 0;
+    const onScroll = () => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() =>
+        setScrollState({ left: el.scrollLeft, viewW: el.clientWidth }),
+      );
+    };
+    onScroll();
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      cancelAnimationFrame(raf);
+    };
+  }, [nle]);
+
+  const ticks = useMemo(
+    () =>
+      rulerTicks(
+        scrollState.left / zoom,
+        (scrollState.left + scrollState.viewW - TRACK_HEAD_W) / zoom,
+        zoom,
+      ),
+    [scrollState, zoom],
+  );
 
   const canEdit = (c: NleClip) =>
     c.track === "V1_master" && c.master_index != null && c.source_start_s != null && !!onTrimClip;
@@ -297,31 +322,26 @@ export default function Timeline({
       </div>
 
       {/* ---- tracks (scrollable) ---- */}
-      <div
-        ref={scrollRef}
-        className="tl-scroll min-h-0 flex-1 overflow-x-auto overflow-y-hidden bg-[var(--bg-0)]"
-        onMouseMove={onPointerMove}
-        onMouseUp={endDrag}
-        onMouseLeave={endDrag}
-      >
+      <div className="relative min-h-0 flex-1">
+        <div
+          ref={scrollRef}
+          className="tl-scroll h-full min-h-0 overflow-x-auto overflow-y-hidden bg-[var(--bg-0)]"
+          onMouseMove={onPointerMove}
+          onMouseUp={endDrag}
+          onMouseLeave={endDrag}
+        >
         {!nle ? (
           <TimelineEmpty />
         ) : (
           <div className="relative select-none" style={{ width: width + TRACK_HEAD_W, height: totalH }}>
-            {/* ruler */}
+            {/* ruler — spans the full content width; the fixed corner lives in
+                the header overlay below (sticky was a no-op: the ruler spanned
+                its own containing block, CR-013) */}
             <div
-              className="sticky left-0 z-30 cursor-crosshair border-b border-[var(--line-1)] bg-[var(--bg-1)]"
+              className="cursor-crosshair border-b border-[var(--line-1)] bg-[var(--bg-1)]"
               style={{ height: RULER_H, width: width + TRACK_HEAD_W }}
               onMouseDown={onRulerDown}
             >
-              <div
-                className="absolute left-0 top-0 z-10 h-full border-r border-[var(--line-1)] bg-[var(--bg-2)]"
-                style={{ width: TRACK_HEAD_W }}
-              >
-                <span className="micro-label absolute left-2.5 top-1/2 -translate-y-1/2">
-                  {formatTimecodeShort(duration)} total
-                </span>
-              </div>
               {ticks.map((tk) => (
                 <div
                   key={tk.t}
@@ -357,52 +377,8 @@ export default function Timeline({
                   className="relative border-b border-[var(--line-1)]"
                   style={{ height: isHidden ? 0 : track.height, overflow: "hidden" }}
                 >
-                  {/* header */}
-                  <div
-                    className="absolute left-0 top-0 z-10 flex h-full items-center gap-1.5 border-r border-[var(--line-1)] bg-[var(--bg-2)] px-2"
-                    style={{ width: TRACK_HEAD_W, height: track.height }}
-                  >
-                    <span
-                      className="flex h-[17px] min-w-[22px] items-center justify-center rounded px-1 text-[10px] font-bold"
-                      style={{
-                        color: `var(--clip-${track.kind === "card" ? "card" : track.kind === "video" ? "video" : track.kind === "audio" ? "audio" : track.kind === "cc" ? "cc" : "fx"})`,
-                        background: "rgba(255,255,255,0.06)",
-                      }}
-                    >
-                      {track.name}
-                    </span>
-                    <span className="text-[10px] font-medium tracking-wide text-[var(--tx-2)]">{trackLabel(track.kind)}</span>
-                    <div className="flex-1" />
-                    {track.canMute && (
-                      <button
-                        className="icon-btn !h-5 !w-5"
-                        title="mute / solo monitoring"
-                        onClick={() =>
-                          setHidden((h) => ({ ...h, [track.id]: !h[track.id] }))
-                        }
-                      >
-                        <Icon name="mute" size={12} />
-                      </button>
-                    )}
-                    {track.canHide && (
-                      <button
-                        className="icon-btn !h-5 !w-5"
-                        title={isHidden ? "show track" : "hide track"}
-                        onClick={() =>
-                          setHidden((h) => ({ ...h, [track.id]: !h[track.id] }))
-                        }
-                      >
-                        <Icon name={isHidden ? "eyeOff" : "eye"} size={12} />
-                      </button>
-                    )}
-                    <button
-                      className="icon-btn !h-5 !w-5"
-                      title={isLocked ? "unlock track" : "lock track (blocks edits)"}
-                      onClick={() => setLocked((l) => ({ ...l, [track.id]: !l[track.id] }))}
-                    >
-                      <Icon name={isLocked ? "lock" : "unlock"} size={12} />
-                    </button>
-                  </div>
+                  {/* header cells live in the pinned overlay — the scrolled
+                      copy used to slide away and leave unlabeled tracks */}
 
                   {/* lane content */}
                   {!isHidden && (
@@ -486,6 +462,83 @@ export default function Timeline({
                 zIndex: 41,
               }}
             />
+          </div>
+        )}
+        </div>
+
+        {/* fixed left column (CR-013): track labels + controls pinned to the
+            viewport edge — scrolled lane content passes UNDER it, like a real
+            NLE. pointer-events sit on the cells only, so lane clicks in the
+            first 148px still work when nothing is scrolled over them. During
+            an active drag the overlay goes fully inert — a pointer crossing
+            the header column must NOT fire the scroll container's mouseleave
+            and cancel a running trim. */}
+        {nle && (
+          <div
+            className="pointer-events-none absolute inset-y-0 left-0 z-50"
+            style={{ width: TRACK_HEAD_W }}
+          >
+            <div
+              className={`absolute left-0 top-0 border-b border-r border-[var(--line-1)] bg-[var(--bg-2)] ${
+                drag.kind === "none" ? "pointer-events-auto" : "pointer-events-none"
+              }`}
+              style={{ height: RULER_H, width: TRACK_HEAD_W }}
+            >
+              <span className="micro-label absolute left-2.5 top-1/2 -translate-y-1/2">
+                {formatTimecodeShort(duration)} total
+              </span>
+            </div>
+            <div className="absolute left-0" style={{ top: RULER_H }}>
+              {tracks.map((track) => {
+                const isHidden = !!hidden[track.id];
+                const isLocked = !!locked[track.id];
+                return (
+                  <div
+                    key={track.id}
+                    className={`flex items-center gap-1.5 border-b border-r border-[var(--line-1)] bg-[var(--bg-2)] px-2 ${
+                      drag.kind === "none" ? "pointer-events-auto" : "pointer-events-none"
+                    }`}
+                    style={{
+                      width: TRACK_HEAD_W,
+                      height: isHidden ? 0 : track.height,
+                      overflow: "hidden",
+                    }}
+                  >
+                    <span
+                      className="flex h-[17px] min-w-[22px] items-center justify-center rounded px-1 text-[10px] font-bold"
+                      style={{
+                        color: `var(--clip-${track.kind === "card" ? "card" : track.kind === "video" ? "video" : track.kind === "audio" ? "audio" : track.kind === "cc" ? "cc" : "fx"})`,
+                        background: "rgba(255,255,255,0.06)",
+                      }}
+                    >
+                      {track.name}
+                    </span>
+                    <span className="text-[10px] font-medium tracking-wide text-[var(--tx-2)]">
+                      {trackLabel(track.kind)}
+                    </span>
+                    <div className="flex-1" />
+                    {track.canHide && (
+                      <button
+                        className="icon-btn !h-5 !w-5"
+                        title={isHidden ? "show track" : "hide track"}
+                        onClick={() =>
+                          setHidden((h) => ({ ...h, [track.id]: !h[track.id] }))
+                        }
+                      >
+                        <Icon name={isHidden ? "eyeOff" : "eye"} size={12} />
+                      </button>
+                    )}
+                    <button
+                      className="icon-btn !h-5 !w-5"
+                      title={isLocked ? "unlock track" : "lock track (blocks edits)"}
+                      onClick={() => setLocked((l) => ({ ...l, [track.id]: !l[track.id] }))}
+                    >
+                      <Icon name={isLocked ? "lock" : "unlock"} size={12} />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         )}
       </div>

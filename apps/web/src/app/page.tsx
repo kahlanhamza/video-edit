@@ -68,6 +68,23 @@ export default function ProjectsPage() {
     refresh();
   }, [refresh]);
 
+  // CR-010: the front door never refreshed — a case could sit "done" for
+  // hours while the grid showed a stale chip. Poll while the tab is visible;
+  // pipelines park at the gate on their own, the operator should see it.
+  useEffect(() => {
+    const t = setInterval(() => {
+      if (document.visibilityState === "visible") void refresh();
+    }, 10000);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void refresh();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      clearInterval(t);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [refresh]);
+
   function updateVideo(id: number, url: string) {
     setVideoRows((rows) => rows.map((r) => (r.id === id ? { ...r, url } : r)));
   }
@@ -130,6 +147,14 @@ export default function ProjectsPage() {
           runNote = run.reused
             ? "resumed the previous pipeline run"
             : `pipeline started (${run.detail})`;
+          // Honest multi-camera semantics (CR-006): the pipeline cuts the
+          // PRIMARY camera only. Extra URLs stay as case sources — ingesting
+          // them now would launch a SECOND full pipeline on the same project
+          // and clobber the reviewed timeline version. Ingest them from
+          // Media → Ingest when you deliberately want them processed.
+          if (videoUrls.length > 1) {
+            runNote += ` — camera 1 is the primary cut; ${videoUrls.length - 1} extra URL(s) kept as case sources (Media → Ingest to process them)`;
+          }
         } catch (e) {
           runNote = `pipeline not started: ${e instanceof Error ? e.message : e}`;
         }

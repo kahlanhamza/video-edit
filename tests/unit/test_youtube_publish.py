@@ -172,7 +172,176 @@ def project_id(client):
     return resp.json()["id"]
 
 
+def _seed_baked_gate(project_id: str, version: int = 1) -> None:
+    """Simulate a completed bake: primary asset + perception row carrying the
+    exact gate cursor `_stamp_export_gate` writes (ops rev + version)."""
+    from director_os.api.main import session
+    from director_os.core.db import MediaAssetRow, PerceptionIndexRow
+
+    s = session()
+    try:
+        asset = MediaAssetRow(
+            project_id=project_id, duration_s=10.0, fps=30.0, width=640, height=360
+        )
+        s.add(asset)
+        s.flush()
+        s.add(
+            PerceptionIndexRow(
+                asset_id=asset.id,
+                redaction_tracks_json={"baked_ops_rev": 0, "baked_timeline_version": version},
+            )
+        )
+        s.commit()
+    finally:
+        s.close()
+
+
+def _seed_youtube_vault() -> None:
+    from director_os.api.main import session
+    from director_os.core.credentials import upsert_credentials
+
+    s = session()
+    try:
+        upsert_credentials(
+            s,
+            {
+                "YOUTUBE_CLIENT_ID": "cid.apps.googleusercontent.com",
+                "YOUTUBE_CLIENT_SECRET": "super-secret",
+                "YOUTUBE_REFRESH_TOKEN": "1//refresh-token",
+            },
+        )
+        s.commit()
+    finally:
+        s.close()
+
+
+def _install_google_stubs(monkeypatch) -> None:
+    """googleapiclient/google-auth are optional deps absent in CI — inject
+    import-level stubs so _resolve_publisher can construct OAuth credentials."""
+    import sys
+    import types
+
+    creds_mod = types.ModuleType("google.oauth2.credentials")
+
+    class Credentials:
+        def __init__(self, **kw):
+            self.kw = kw
+
+    creds_mod.Credentials = Credentials
+    oauth_pkg = types.ModuleType("google.oauth2")
+    oauth_pkg.credentials = creds_mod
+    google_pkg = types.ModuleType("google")
+    google_pkg.oauth2 = oauth_pkg
+    monkeypatch.setitem(sys.modules, "google", google_pkg)
+    monkeypatch.setitem(sys.modules, "google.oauth2", oauth_pkg)
+    monkeypatch.setitem(sys.modules, "google.oauth2.credentials", creds_mod)
+
+
+class _StubRealPublisher:
+    """Stands in for GoogleYouTubePublisher: records and returns a real-looking result."""
+
+    last_instance: _StubRealPublisher | None = None
+
+    def __init__(self, credentials):
+        self.credentials = credentials
+        self.uploads: list[dict] = []
+        _StubRealPublisher.last_instance = self
+
+    def upload_draft(self, video_path, metadata, srt_path=None):
+        from director_os.api.youtube import PublishResult
+
+        self.uploads.append(
+            {
+                "video_path": str(video_path),
+                "title": metadata.title,
+                "srt_path": str(srt_path) if srt_path else None,
+                "credentials": self.credentials,
+            }
+        )
+        return PublishResult(
+            video_id="yt_real_123",
+            privacy_status="private",
+            caption_attached=srt_path is not None,
+        )
+
+
+def test_publish_draft_real_upload_when_vault_configured(client, project_id, tmp_path, monkeypatch):
+    """Vault carries OAuth creds -> the REAL publisher runs, dry_run=False, and
+    the project flips to published_draft (the true last mile)."""
+    from director_os.api import main as api_main
+
+    _install_google_stubs(monkeypatch)
+    monkeypatch.setattr(api_main, "GoogleYouTubePublisher", _StubRealPublisher)
+    _seed_youtube_vault()
+    _seed_baked_gate(project_id)
+
+    video = tmp_path / "final.mp4"
+    video.write_bytes(b"fake-master")
+    srt = tmp_path / "captions.srt"
+    srt.write_text("1\n00:00:00,000 --> 00:00:02,000\nhello\n")
+    resp = client.post(
+        f"/projects/{project_id}/publish-draft",
+        json={
+            "video_path": str(video),
+            "title": "Case 26-0417 — full documentation",
+            "srt_path": str(srt),
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["dry_run"] is False
+    assert data["video_id"] == "yt_real_123"
+
+    pub = _StubRealPublisher.last_instance
+    assert pub is not None and len(pub.uploads) == 1
+    assert pub.uploads[0]["video_path"] == str(video)
+    assert pub.uploads[0]["srt_path"] == str(srt)
+
+    proj = client.get(f"/projects/{project_id}").json()
+    assert proj["status"] == "published_draft"
+
+
+def test_publish_draft_dry_run_without_vault_creds(client, project_id, tmp_path):
+    """No YouTube keys in the vault -> InMemory publisher records a SIMULATION.
+    The response says so (dry_run) and the project must NOT be marked published."""
+    _seed_baked_gate(project_id)
+    video = tmp_path / "final.mp4"
+    video.write_bytes(b"fake-master")
+    resp = client.post(
+        f"/projects/{project_id}/publish-draft",
+        json={"video_path": str(video), "title": "Dry run case"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["dry_run"] is True
+    assert data["video_id"].startswith("draft_")
+
+    proj = client.get(f"/projects/{project_id}").json()
+    assert proj["status"] != "published_draft"
+
+    from director_os.core.db import ProjectRow
+    from sqlalchemy import select
+
+    s = __import__("director_os.api.main", fromlist=["session"]).session()
+    row = s.execute(select(ProjectRow).where(ProjectRow.id == project_id)).scalar_one()
+    assert row.youtube_draft_id is None
+
+
+def test_publish_draft_refuses_dirty_gate(client, project_id, tmp_path):
+    """CR-002 law: a cut the disk does not carry must never reach YouTube —
+    no stamps (nothing ever baked) => gate dirty => 409 with an actionable detail."""
+    video = tmp_path / "final.mp4"
+    video.write_bytes(b"fake")
+    resp = client.post(
+        f"/projects/{project_id}/publish-draft",
+        json={"video_path": str(video), "title": "t"},
+    )
+    assert resp.status_code == 409
+    assert "dirty" in resp.json()["detail"]
+
+
 def test_publish_draft_happy_path(client, project_id, tmp_path):
+    _seed_baked_gate(project_id)
     video = tmp_path / "final.mp4"
     video.write_bytes(b"fake-master")
     resp = client.post(
@@ -189,17 +358,16 @@ def test_publish_draft_happy_path(client, project_id, tmp_path):
     data = resp.json()
     assert data["privacy_status"] == "private"
     assert data["video_id"].startswith("draft_")
+    assert data["dry_run"] is True  # no vault creds in this fixture = simulation
 
-    proj = client.get(f"/projects/{project_id}").json()
-    assert proj["status"] == "published_draft"
-
-    # youtube_draft_id persisted on the row
+    # a dry run persists NOTHING — no fake draft id, no published status
     from director_os.core.db import ProjectRow
     from sqlalchemy import select
 
     s = __import__("director_os.api.main", fromlist=["session"]).session()
     row = s.execute(select(ProjectRow).where(ProjectRow.id == project_id)).scalar_one()
-    assert row.youtube_draft_id == data["video_id"]
+    assert row.youtube_draft_id is None
+    assert row.status != "published_draft"
 
 
 def test_publish_draft_404(client):
@@ -241,6 +409,7 @@ def test_publish_draft_rejects_mismatched_chapters(client, project_id):
 
 
 def test_publish_draft_rejects_missing_video(client, project_id, tmp_path):
+    _seed_baked_gate(project_id)  # gate clean, so the 422 is the FILE, not the gate
     resp = client.post(
         f"/projects/{project_id}/publish-draft",
         json={"video_path": str(tmp_path / "ghost.mp4"), "title": "t"},
@@ -257,3 +426,71 @@ def test_publish_draft_title_limit(client, project_id, tmp_path):
         json={"video_path": str(video), "title": "t" * 101},
     )
     assert resp.status_code == 422
+
+
+# ------------------------- deliverables (the real last mile) -------------------------
+@pytest.fixture()
+def deliverable_env(client, tmp_path: Path, monkeypatch):
+    """Point OUTPUT_DIR at a per-test dir AFTER the client fixture pinned the
+    DB, so get_settings() rebuilds with both."""
+    from director_os.core.config import get_settings
+
+    out = tmp_path / "output"
+    monkeypatch.setenv("OUTPUT_DIR", str(out))
+    get_settings.cache_clear()
+    yield out
+    get_settings.cache_clear()
+
+
+def test_deliverables_prefill_from_ship_pack(client, project_id, deliverable_env):
+    work = deliverable_env / "pipeline" / project_id
+    pack = work / "ship_pack"
+    pack.mkdir(parents=True)
+    (pack / "final_1080p.mp4").write_bytes(b"pack-master")
+    (pack / "captions.srt").write_text("1\n00:00:00,000 --> 00:00:02,000\nhi\n")
+    (pack / "metadata.json").write_text("{}")
+
+    resp = client.get(f"/projects/{project_id}/deliverables")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["master_path"] == str(pack / "final_1080p.mp4")
+    assert data["master_size_bytes"] == len(b"pack-master")
+    assert data["srt_path"] == str(pack / "captions.srt")
+    assert data["pack_dir"] == str(pack)
+    names = [f["name"] for f in data["pack_files"]]
+    assert names == ["captions.srt", "final_1080p.mp4", "metadata.json"]
+    assert data["suggested_title"] == "Publish Gate Case"
+    assert data["youtube_configured"] is False
+    # nothing baked yet -> the gate is dirty and publish will 409 (honest UI)
+    assert data["gate_dirty"] is True
+
+
+def test_deliverables_falls_back_to_postfx_then_final(client, project_id, deliverable_env):
+    work = deliverable_env / "pipeline" / project_id
+    work.mkdir(parents=True)
+    final = work / "final.mp4"
+    final.write_bytes(b"pre-fx master")
+
+    resp = client.get(f"/projects/{project_id}/deliverables")
+    data = resp.json()
+    assert data["master_path"] == str(final)
+    assert data["master_is_post_fx"] is False
+
+    postfx = work / "postfx" / "master_postfx.mp4"
+    postfx.parent.mkdir()
+    postfx.write_bytes(b"post-fx master")
+    resp = client.get(f"/projects/{project_id}/deliverables")
+    data = resp.json()
+    assert data["master_path"] == str(postfx)
+    assert data["master_is_post_fx"] is True
+
+
+def test_deliverables_404(client):
+    assert client.get("/projects/does-not-exist/deliverables").status_code == 404
+
+
+def test_deliverables_youtube_configured_flag(client, project_id, deliverable_env):
+    _seed_youtube_vault()
+    resp = client.get(f"/projects/{project_id}/deliverables")
+    assert resp.status_code == 200
+    assert resp.json()["youtube_configured"] is True

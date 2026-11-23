@@ -18,6 +18,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     create_engine,
     event,
 )
@@ -80,6 +81,12 @@ class PerceptionIndexRow(Base):
 
 class TimelineVersionRow(Base):
     __tablename__ = "timeline_versions"
+    # CR-007: two concurrent dispatches SELECT-max then INSERT — without this
+    # constraint both could claim the same version_num and corrupt the
+    # rollback chain. The store retries on the IntegrityError this enforces.
+    __table_args__ = (
+        UniqueConstraint("project_id", "version_num", name="uq_versions_project_num"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)

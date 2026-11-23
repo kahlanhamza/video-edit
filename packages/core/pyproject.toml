@@ -10,6 +10,10 @@ dependencies = [
     "alembic>=1.13",
     "httpx>=0.27",
     "pysubs2>=1.7",
+    # at-rest encryption for the settings vault (CR-008): without it
+    # credentials.py silently degrades to plaintext even when
+    # SETTINGS_SECRET_KEY is set — keys sat readable in the DB
+    "cryptography>=42.0",
 ]
 
 [build-system]

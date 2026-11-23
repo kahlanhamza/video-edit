@@ -30,6 +30,7 @@ import {
   Asset,
   CaseDossier,
   CaseSourceOut,
+  Deliverables,
   DispatchResult,
   Job,
   NleTimeline,
@@ -153,41 +154,12 @@ function DossierView({ dossier }: { dossier: CaseDossier }) {
   );
 }
 
-const TOOLS = [
-  {
-    id: "timeline.trim_clip",
-    args: { item_index: 0, new_start_s: 1.0, new_dur_s: 3.0 },
-    hint: "trim master clip 0",
-  },
-  {
-    id: "timeline.split_clip",
-    args: { item_index: 0, at_local_s: 1.5 },
-    hint: "split master clip 0",
-  },
-  {
-    id: "redaction.add_blur",
-    args: { item_index: 0, bbox: [40, 40, 300, 120], sigma: 24 },
-    hint: "privacy blur on clip 0",
-  },
-  {
-    id: "cards.add",
-    args: {
-      template: "location_intro",
-      title: "CASE FILE",
-      start_s: 0.0,
-      dur_s: 3.0,
-    },
-    hint: "location card at 0s",
-  },
-];
-
 type LeftView = "media" | "sources" | "captions" | "tools" | "publish";
-
 const VIEWS: { id: LeftView; label: string; icon: IconName }[] = [
   { id: "media", label: "Media", icon: "media" },
   { id: "sources", label: "Sources", icon: "folder" },
   { id: "captions", label: "Captions", icon: "captions" },
-  { id: "tools", label: "Director tools", icon: "wand" },
+  { id: "tools", label: "Agent activity", icon: "wand" },
   { id: "publish", label: "Publish", icon: "upload" },
 ];
 
@@ -212,6 +184,8 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     base_description: "Rendered by DirectorOS — private review draft.",
   });
   const [publishResult, setPublishResult] = useState<string | null>(null);
+  const [publishBusy, setPublishBusy] = useState(false);
+  const [deliverables, setDeliverables] = useState<Deliverables | null>(null);
   const [ingestUrl, setIngestUrl] = useState("");
   const [ingestBusy, setIngestBusy] = useState(false);
   const [ingestStatus, setIngestStatus] = useState<string | null>(null);
@@ -312,6 +286,26 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     prevDoneRef.current = live.done;
   }, [live.done, refresh, reloadNle]);
 
+  // CR-009: when the SSE stream is dead but the newest job is unfinished,
+  // poll the server so progress + job truth keep moving (and `running` stays
+  // honest — buttons stay locked while the worker renders). Healthy SSE
+  // streams make this a no-op.
+  const pollJob = jobs.length ? jobs[jobs.length - 1] : null;
+  const pollNeeded =
+    pollJob != null &&
+    !pollJob.error &&
+    pollJob.progress_pct < 100 &&
+    pollJob.stage !== "human_gate" &&
+    pollJob.stage !== "awaiting_review" &&
+    (!live.connected || live.done);
+  useEffect(() => {
+    if (!pollNeeded) return;
+    const t = setInterval(() => {
+      void refresh();
+    }, 5000);
+    return () => clearInterval(t);
+  }, [pollNeeded, refresh]);
+
   async function runOrResume() {
     setRunBusy(true);
     setRunNote(null);
@@ -331,6 +325,15 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     } finally {
       setRunBusy(false);
     }
+  }
+
+  // Export is NOT a re-run: when the gate is clean the disk already carries
+  // the reviewed program — the button must say so and do nothing (CR-004:
+  // Export used to be a disguised pipeline restart, clickable after "Exported ✓").
+  const exportClean = !!gate && gate.exported_once && !gate.dirty;
+  async function doExport() {
+    if (exportClean) return;
+    await runOrResume();
   }
 
   async function doIngest() {
@@ -412,15 +415,45 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
   }
 
   async function doPublish() {
+    setPublishBusy(true);
+    setPublishResult(null);
     try {
-      const r = await api.publishDraft(id!, publish);
+      const r = await api.publishDraft(id!, {
+        ...publish,
+        srt_path: deliverables?.srt_path ?? null,
+      });
       setPublishResult(
-        `draft ${r.video_id} (${r.privacy_status}, captions: ${r.caption_attached})`,
+        r.dry_run
+          ? `SIMULATED — no YouTube call was made (draft id ${r.video_id}). Add YOUTUBE_CLIENT_ID / SECRET / REFRESH_TOKEN in Settings, or upload ship_pack/final_1080p.mp4 manually.`
+          : `REAL YouTube private draft created: ${r.video_id} (${r.privacy_status}, captions: ${r.caption_attached}) — review it at youtube.com and press Publish there.`,
       );
     } catch (e) {
       setPublishResult(`failed: ${e instanceof Error ? e.message : e}`);
+    } finally {
+      setPublishBusy(false);
     }
   }
+
+  // the publish view must show what the disk ACTUALLY carries — nobody
+  // hand-types a filesystem path (CR-003)
+  const loadDeliverables = useCallback(async () => {
+    if (!id) return;
+    try {
+      const d = await api.getDeliverables(id);
+      setDeliverables(d);
+      setPublish((p) => ({
+        ...p,
+        video_path: p.video_path || d.master_path || "",
+        title: p.title || d.suggested_title || "",
+      }));
+    } catch {
+      setDeliverables(null); // 404 / no outputs yet
+    }
+  }, [id]);
+
+  useEffect(() => {
+    if (view === "publish") void loadDeliverables();
+  }, [view, loadDeliverables]);
 
   // --- timeline manual edits ---
   async function handleTrim(itemIndex: number, newStartS: number, newDurS: number) {
@@ -515,7 +548,18 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
   const jobError = live.job?.error ?? latestJob?.error ?? null;
   const playable = assets.find((a) => a.has_proxy);
   const fps = nle?.asset?.fps ?? 30;
-  const running = !live.done && !jobError && live.connected;
+  // running = SERVER truth first (the newest job is unfinished and not parked
+  // at the gate), SSE liveness second. CR-009: a dropped SSE stream used to
+  // flip this false and re-enable Run/Export mid-run while the worker was
+  // still rendering — the buttons lied and a click double-dispatched.
+  const latestJobUnfinished =
+    latestJob != null &&
+    !latestJob.error &&
+    latestJob.progress_pct < 100 &&
+    latestJob.stage !== "human_gate" &&
+    latestJob.stage !== "awaiting_review";
+  const running = latestJobUnfinished || (!live.done && !jobError && live.connected);
+  const streamStale = latestJobUnfinished && !live.connected && !live.done;
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-[var(--bg-0)]">
@@ -570,16 +614,25 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
           <span className="tcode text-[11px] text-[var(--tx-2)]">
             {pct.toFixed(0)}%
           </span>
+          {streamStale && (
+            <span
+              className="chip"
+              title="the live event stream dropped — progress comes from server polling until it reconnects; Run/Export stay locked while the worker is busy"
+            >
+              reconnecting…
+            </span>
+          )}
         </div>
 
         <div className="flex-1" />
 
         {/* export gate (step 6): the ONLY render — dirty state lives on the
-            server (baked_ops_rev stamped by the bake), never client-trusted */}
+            server (baked_ops_rev stamped by the bake), never client-trusted.
+            When the gate is clean the button is DISABLED, not a disguised re-run. */}
         <button
           className={gate?.dirty ? "btn" : "btn-ghost"}
-          onClick={runOrResume}
-          disabled={runBusy || running}
+          onClick={doExport}
+          disabled={runBusy || running || exportClean}
           title={
             gate?.exported_once
               ? gate?.dirty
@@ -880,22 +933,13 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
             {view === "tools" && (
               <div className="space-y-3">
                 <p className="text-[11px] leading-relaxed text-[var(--tx-3)]">
-                  Checkpoint-first director tools — the same engine the LLM
-                  director uses. Every dispatch is versioned and rolls back on
-                  failure.
+                  Every timeline mutation — yours (trim/split handles) or the
+                  agent's (chat) — is a checkpointed op. Failed dispatches roll
+                  back automatically; this log is the record. Edits are made on
+                  the timeline itself or by telling the chat agent what to cut —
+                  never by firing blind preset tools (CR-005: the old demo
+                  buttons silently re-cut clip 0 with hardcoded args).
                 </p>
-                <div className="grid grid-cols-2 gap-1.5">
-                  {TOOLS.map((t) => (
-                    <button
-                      key={t.id}
-                      className="btn-ghost !h-8 justify-start !text-[11px]"
-                      onClick={() => dispatchTool(t.id, t.args)}
-                      title={t.id}
-                    >
-                      {t.hint}
-                    </button>
-                  ))}
-                </div>
                 {editBusy && (
                   <p className="text-[11px] text-[var(--warn)]">dispatching edit…</p>
                 )}
@@ -921,9 +965,50 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
                 <p className="text-[11px] leading-relaxed text-[var(--tx-3)]">
                   Human Review Gate — approve the cut as a YouTube Private Draft.
                 </p>
+                {deliverables === null ? (
+                  <p className="text-[11px] text-[var(--tx-3)]">
+                    Nothing rendered yet — run the pipeline first; the master and
+                    ship pack appear here automatically.
+                  </p>
+                ) : (
+                  <div className="rounded border border-[var(--line-1)] bg-[var(--bg-2)] p-2 text-[11px] text-[var(--tx-2)]">
+                    <div className="tcode text-[var(--tx-3)]">SHIPPABLE MASTER</div>
+                    <div className="mt-1 break-all text-[var(--tx-1)]">
+                      {deliverables.master_path ?? "— no master on disk yet"}
+                    </div>
+                    {deliverables.master_size_bytes != null && (
+                      <div className="mt-1 text-[var(--tx-3)]">
+                        {(deliverables.master_size_bytes / 1e6).toFixed(1)} MB
+                        {deliverables.master_is_post_fx ? " · post-fx (captions + blur baked)" : " · pre-post-fx master"}
+                      </div>
+                    )}
+                    {deliverables.pack_files.length > 0 && (
+                      <div className="mt-2">
+                        <div className="tcode text-[var(--tx-3)]">SHIP PACK — {deliverables.pack_files.length} file(s)</div>
+                        <div className="mt-1 break-all text-[var(--tx-3)]">
+                          {deliverables.pack_files.map((f) => f.name).join(" · ")}
+                        </div>
+                      </div>
+                    )}
+                    {!deliverables.youtube_configured && (
+                      <div className="mt-2 text-[var(--tx-3)]">
+                        YouTube OAuth not configured — publishing records a SIMULATION only.
+                        Add YOUTUBE_CLIENT_ID / SECRET / REFRESH_TOKEN in Settings for a real
+                        upload, or upload <span className="tcode">ship_pack/final_1080p.mp4</span> to
+                        YouTube Studio manually (chapters + captions are in the pack).
+                      </div>
+                    )}
+                  </div>
+                )}
+                {deliverables?.gate_dirty && (
+                  <p className="text-[11px] leading-relaxed text-[var(--warn,#e2b341)]">
+                    Export gate is dirty — the timeline on screen is NOT the file below.
+                    Hit Export first, then publish.
+                  </p>
+                )}
                 <input
                   className="input"
-                  placeholder="master path (output/pipeline/<id>/final.mp4)"
+                  placeholder="master path (prefilled from the ship pack)"
                   value={publish.video_path}
                   onChange={(e) => setPublish({ ...publish, video_path: e.target.value })}
                 />
@@ -945,12 +1030,15 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
                 <button
                   className="btn"
                   onClick={doPublish}
-                  disabled={!publish.video_path || !publish.title}
+                  disabled={!publish.video_path || !publish.title || publishBusy}
                 >
-                  <Icon name="upload" size={12} /> Publish private draft
+                  <Icon name="upload" size={12} />
+                  {publishBusy ? "Publishing…" : "Publish private draft"}
                 </button>
                 {publishResult && (
-                  <p className="text-[11px] text-[var(--tx-2)]">{publishResult}</p>
+                  <p className="whitespace-pre-wrap text-[11px] leading-relaxed text-[var(--tx-2)]">
+                    {publishResult}
+                  </p>
                 )}
               </div>
             )}
