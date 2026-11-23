@@ -128,9 +128,7 @@ def _stub_qa(final_path: Path) -> AuditReport:
 def test_gate_stamped_without_tracked_redaction(fixture_video: Path, project, deps, monkeypatch):
     """CR-002: default REDACT_MODE (no tracked backend, no per_frame payload)
     still stamps the gate cursor — the Export button goes clean after a bake."""
-    monkeypatch.setattr(
-        pipeline_mod, "stage_qa", lambda final_path, *a, **kw: _stub_qa(final_path)
-    )
+    monkeypatch.setattr(pipeline_mod, "stage_qa", lambda final_path, *a, **kw: _stub_qa(final_path))
     calls: list[str] = []
     deps.transcribe = fake_transcriber_factory(calls)
     result = run_pipeline(fixture_video, project, deps)
@@ -201,8 +199,6 @@ def test_ship_pack_built_from_post_fx_master(fixture_video: Path, project, deps,
 
     # the pack master is the POST-fx artifact (marker included) — the exact
     # bug CR-001 pinned: it used to be a copy of the pre-fx master
-    pack_master = (
-        deps.settings.output_dir / "pipeline" / project / "ship_pack" / "final_1080p.mp4"
-    )
+    pack_master = deps.settings.output_dir / "pipeline" / project / "ship_pack" / "final_1080p.mp4"
     assert pack_master.exists(), "ship pack missing — it is the folder the human uploads"
     assert pack_master.read_bytes().endswith(b"DIRECTOROS-POSTFX-MARKER")

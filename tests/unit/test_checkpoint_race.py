@@ -69,9 +69,13 @@ def test_concurrent_checkpoints_get_unique_versions(store):
     assert sorted(versions) == list(range(1, 41))
 
     with sessions_factory() as s:
-        rows = s.execute(
-            select(TimelineVersionRow.version_num).where(
-                TimelineVersionRow.project_id == "proj-race"
+        rows = (
+            s.execute(
+                select(TimelineVersionRow.version_num).where(
+                    TimelineVersionRow.project_id == "proj-race"
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     assert sorted(rows) == list(range(1, 41))

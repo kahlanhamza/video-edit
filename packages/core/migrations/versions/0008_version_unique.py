@@ -30,19 +30,18 @@ def upgrade() -> None:
     # dedupe: keep the row with the greatest id (the most recent write) —
     # checkpoints are content snapshots, the newest one is what the timeline
     # actually continued from
-    bind.execute(sa.text(
-        """
+    bind.execute(
+        sa.text(
+            """
         DELETE FROM timeline_versions
         WHERE id NOT IN (
             SELECT MAX(id) FROM timeline_versions GROUP BY project_id, version_num
         )
         """
-    ))
+        )
+    )
 
-    indexes = {
-        ix["name"]
-        for ix in sa.inspect(bind).get_indexes("timeline_versions")
-    }
+    indexes = {ix["name"] for ix in sa.inspect(bind).get_indexes("timeline_versions")}
     if "uq_versions_project_num" not in indexes:
         op.create_index(
             "uq_versions_project_num",
@@ -57,9 +56,6 @@ def downgrade() -> None:
     names = set(sa.inspect(bind).get_table_names())
     if "timeline_versions" not in names:
         return
-    indexes = {
-        ix["name"]
-        for ix in sa.inspect(bind).get_indexes("timeline_versions")
-    }
+    indexes = {ix["name"] for ix in sa.inspect(bind).get_indexes("timeline_versions")}
     if "uq_versions_project_num" in indexes:
         op.drop_index("uq_versions_project_num", table_name="timeline_versions")

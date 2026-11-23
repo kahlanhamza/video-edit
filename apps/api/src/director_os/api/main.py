@@ -732,9 +732,7 @@ def _compute_gate_state(s: Any, project_id: str) -> dict[str, Any]:
         prow = s.get(PerceptionIndexRow, asset.id)
         baked_raw = (prow.redaction_tracks_json or {}).get("baked_ops_rev") if prow else None
         baked_ops_rev = int(baked_raw) if baked_raw is not None else None
-        ver_raw = (
-            (prow.redaction_tracks_json or {}).get("baked_timeline_version") if prow else None
-        )
+        ver_raw = (prow.redaction_tracks_json or {}).get("baked_timeline_version") if prow else None
         baked_timeline_version = int(ver_raw) if ver_raw is not None else None
     pending = 0
     if baked_ops_rev is not None and ops_rev > baked_ops_rev:
