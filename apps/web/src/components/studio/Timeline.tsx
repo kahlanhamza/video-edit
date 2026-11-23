@@ -24,6 +24,7 @@ import {
   scrubFrameIndex,
   snapTime,
   timelineWidth,
+  voTrimWindow,
 } from "@/lib/nle";
 import type { NleCaption, NleClip, NleEffect, NleTimeline } from "@/lib/api";
 import { effectWindowFrames } from "@/lib/nle";
@@ -52,6 +53,8 @@ export interface TimelineProps {
   playheadS: number;
   onSeek: (t: number) => void;
   onTrimClip?: (itemIndex: number, newStartS: number, newDurS: number) => void;
+  /** Drag an A1 audio block edge -> new VO window inside the TTS stem. */
+  onTrimAudio?: (itemIndex: number, voInS: number, voOutS: number | null) => void;
   onSplitAtPlayhead?: (playheadS: number) => void;
   onDeleteEffect?: (effectId: string) => void;
   /** Drag an op-backed effect block's edge → new frame window (raw frames). */
@@ -72,6 +75,7 @@ export default function Timeline({
   playheadS,
   onSeek,
   onTrimClip,
+  onTrimAudio,
   onSplitAtPlayhead,
   onDeleteEffect,
   onAdjustEffectWindow,
@@ -143,6 +147,26 @@ export default function Timeline({
   }
 
   function endDrag() {
+    // A1 audio trim: the edge drag cuts INSIDE the TTS stem (vo window),
+    // the twin math of the master trim below — narration blocks never move
+    // source windows, they re-cut the voiceover itself.
+    if (
+      (drag.kind === "trim-left" || drag.kind === "trim-right") &&
+      drag.clip.kind === "narration" &&
+      onTrimAudio
+    ) {
+      const c = drag.clip;
+      if (c.master_index != null) {
+        const win = voTrimWindow(
+          drag.kind === "trim-left" ? "start" : "end",
+          dragTimeRef.current,
+          c,
+        );
+        if (win) onTrimAudio(c.master_index, win.vo_in_s, win.vo_out_s);
+      }
+      setDrag({ kind: "none" });
+      return;
+    }
     if (drag.kind === "trim-left" && onTrimClip) {
       const c = drag.clip;
       if (c.master_index != null && c.source_start_s != null) {
@@ -195,6 +219,8 @@ export default function Timeline({
 
   const canEdit = (c: NleClip) =>
     c.track === "V1_master" && c.master_index != null && c.source_start_s != null && !!onTrimClip;
+  const canTrimAudio = (c: NleClip) =>
+    c.kind === "narration" && c.master_index != null && !!onTrimAudio;
 
   const scrubN = nle?.asset ? scrubFrameCount(nle.asset.duration_s) : 0;
   const scrubUrl = nle?.asset ? assetScrubUrl(nle.asset.id) : "";
@@ -427,7 +453,8 @@ export default function Timeline({
                             onTrimEnd={(clip) => {
                               setDrag({ kind: "trim-right", clip });
                             }}
-                            canEdit={canEdit(c)}
+                            canEdit={canEdit(c) || canTrimAudio(c)}
+                            isAudio={c.kind === "narration"}
                           />
                         ))}
                       {lane && lane.clips.length === 0 && (
@@ -519,6 +546,7 @@ function ClipBlock({
   onTrimStart,
   onTrimEnd,
   canEdit,
+  isAudio,
 }: {
   clip: NleClip;
   kind: TrackDef["kind"];
@@ -533,11 +561,23 @@ function ClipBlock({
   onTrimStart: (clip: NleClip) => void;
   onTrimEnd: (clip: NleClip) => void;
   canEdit: boolean;
+  isAudio?: boolean;
 }) {
   const key = `${clip.track}:${clip.name}:${clip.start_s}`;
   const w = Math.max(3, clip.dur_s * zoom);
   const label =
     kind === "audio" ? `VO · ${clip.name}` : kind === "card" ? `CARD · ${clip.name}` : clip.name;
+  // A1 audio trim truth: the audio extent inside the block (tail pad renders
+  // darker so the operator sees exactly how much VO is there)
+  const audioLen =
+    isAudio && (clip.vo_out_s != null || clip.tts_duration_s != null || (clip.vo_in_s ?? 0) > 0)
+      ? Math.min(
+          (clip.vo_out_s ?? clip.tts_duration_s ?? clip.dur_s + (clip.vo_in_s ?? 0)) -
+            (clip.vo_in_s ?? 0),
+          clip.dur_s,
+        )
+      : null;
+  const trimmed = isAudio && ((clip.vo_in_s ?? 0) > 0 || clip.vo_out_s != null);
 
   // filmstrip cells: one scrubsheet frame per 2 s of SOURCE time
   const cells: React.ReactNode[] = [];
@@ -575,7 +615,13 @@ function ClipBlock({
         width: w,
         background: `var(--clip-${kind === "video" ? "video" : kind === "card" ? "card" : "audio"})`,
       }}
-      title={`${clip.name} · ${clip.dur_s.toFixed(2)}s${clip.act ? ` · ${clip.act}` : ""}${clip.script ? ` · ${clip.script.slice(0, 70)}` : ""}`}
+      title={`${clip.name} · ${clip.dur_s.toFixed(2)}s${
+        isAudio && trimmed
+          ? ` · VO ${(clip.vo_in_s ?? 0).toFixed(2)}–${
+              clip.vo_out_s != null ? clip.vo_out_s.toFixed(2) : "end"
+            }s`
+          : ""
+      }${clip.act ? ` · ${clip.act}` : ""}${clip.script ? ` · ${clip.script.slice(0, 70)}` : ""}`}
       onClick={(e) => {
         e.stopPropagation();
         onSelect(key);
@@ -583,6 +629,19 @@ function ClipBlock({
       }}
     >
       {cells}
+      {/* A1: tail pad zone — the block is longer than the trimmed VO here */}
+      {isAudio && audioLen != null && audioLen < clip.dur_s - 0.01 && (
+        <div
+          className="absolute inset-y-0 right-0 bg-black/45"
+          style={{ left: audioLen * zoom }}
+          title="tail pad — air after the voiceover ends"
+        />
+      )}
+      {isAudio && trimmed && (
+        <span className="absolute right-1 top-1 z-10 rounded bg-black/55 px-1 text-[8px] font-bold tracking-wide text-white/85">
+          VO TRIM
+        </span>
+      )}
       {/* label bar over the filmstrip */}
       <div
         className="absolute inset-x-0 bottom-0 flex items-center px-1.5"

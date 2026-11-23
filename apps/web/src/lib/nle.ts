@@ -274,6 +274,42 @@ export function adjustedBox(
  * or the tape ends when the op had none). Returns null when the drag would
  * invert or zero the window — the caller keeps the previous window then.
  */
+/**
+ * The VO window an A1 audio-block edge drag lands: the trim cuts INSIDE the
+ * TTS stem (dead air off the head, tails off the end) — the twin of the V1
+ * master trim, which moves the source window instead. Bounds: the stem end
+ * is the measured TTS duration (`tts_duration_s`, falling back to the block
+ * length when the manifest hasn't landed yet), the window never goes under
+ * VO_MIN (0.5s — one word is ~0.3s). Returns null on a no-op so the caller
+ * keeps the previous window and never dispatches a pointless op.
+ */
+export function voTrimWindow(
+  edge: "start" | "end",
+  dragS: number,
+  clip: {
+    start_s: number;
+    dur_s: number;
+    vo_in_s?: number;
+    vo_out_s?: number | null;
+    tts_duration_s?: number | null;
+  },
+): { vo_in_s: number; vo_out_s: number | null } | null {
+  const VO_MIN = 0.5;
+  const voIn = clip.vo_in_s ?? 0;
+  const outBound = clip.vo_out_s ?? clip.tts_duration_s ?? voIn + clip.dur_s;
+  const round3 = (v: number) => Math.round(v * 1000) / 1000;
+  if (edge === "start") {
+    const delta = Math.max(0, dragS - clip.start_s);
+    const newIn = round3(clamp(voIn + delta, 0, Math.max(0, outBound - VO_MIN)));
+    if (Math.abs(newIn - voIn) < 0.001) return null;
+    return { vo_in_s: newIn, vo_out_s: clip.vo_out_s ?? null };
+  }
+  const newLen = clamp(dragS - clip.start_s, VO_MIN, Math.max(VO_MIN, outBound - voIn));
+  const newOut = round3(voIn + newLen);
+  if (Math.abs(newOut - outBound) < 0.001) return null; // full window again (or already there)
+  return { vo_in_s: voIn, vo_out_s: newOut };
+}
+
 export function effectWindowFrames(
   side: "start" | "end",
   dragS: number,

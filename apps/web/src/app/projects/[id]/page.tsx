@@ -433,6 +433,17 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     setEditBusy(false);
   }
 
+  // A1 audio trim: the edge drag lands a VO window inside the TTS stem
+  async function handleTrimAudio(itemIndex: number, voInS: number, voOutS: number | null) {
+    setEditBusy(true);
+    await dispatchTool("timeline.trim_audio", {
+      item_index: itemIndex,
+      vo_in_s: voInS,
+      vo_out_s: voOutS,
+    });
+    setEditBusy(false);
+  }
+
   async function handleSplitAtPlayhead(t: number) {
     if (!nle) return;
     const clip = nle.clips.find(
@@ -982,6 +993,7 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
           playheadS={playheadS}
           onSeek={seek}
           onTrimClip={handleTrim}
+          onTrimAudio={handleTrimAudio}
           onSplitAtPlayhead={handleSplitAtPlayhead}
           onDeleteEffect={handleDeleteEffect}
           onAdjustEffectWindow={handleAdjustEffectWindow}

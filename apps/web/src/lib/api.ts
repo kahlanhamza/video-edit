@@ -65,6 +65,11 @@ export interface NleClip {
   audio_mode: string | null;
   /** in-point in SOURCE footage seconds (trim math) */
   source_start_s: number | null;
+  /** A1 audio trim: the VO window inside the TTS stem + the measured stem
+   *  (optional — snapshots predate the trim, undefined = untrimmed full stem) */
+  vo_in_s?: number;
+  vo_out_s?: number | null;
+  tts_duration_s?: number | null;
 }
 
 export interface NleCaption {
