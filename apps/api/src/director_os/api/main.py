@@ -708,7 +708,8 @@ def export_gate(project_id: str) -> JSONResponse:
 
     s = session()
     try:
-        if s.get(ProjectRow, project_id) is None:
+        project = s.get(ProjectRow, project_id)
+        if project is None:
             raise HTTPException(status_code=404, detail="project not found")
         from director_os.core.db import TimelineOpRow
         from sqlalchemy import func, select
@@ -730,10 +731,15 @@ def export_gate(project_id: str) -> JSONResponse:
             .first()
         )
         baked_ops_rev = None
+        baked_timeline_version = None
         if asset is not None:
             prow = s.get(PerceptionIndexRow, asset.id)
             baked_raw = (prow.redaction_tracks_json or {}).get("baked_ops_rev") if prow else None
             baked_ops_rev = int(baked_raw) if baked_raw is not None else None
+            ver_raw = (
+                (prow.redaction_tracks_json or {}).get("baked_timeline_version") if prow else None
+            )
+            baked_timeline_version = int(ver_raw) if ver_raw is not None else None
         pending = 0
         if baked_ops_rev is not None and ops_rev > baked_ops_rev:
             pending = int(
@@ -746,14 +752,28 @@ def export_gate(project_id: str) -> JSONResponse:
                 ).scalar_one()
                 or 0
             )
-        dirty = baked_ops_rev is None or ops_rev > baked_ops_rev
+        active_version = project.active_otio_version_id
+        # dirty on TWO axes: op-fold advance (blur/redaction edits) AND
+        # timeline-version advance (trim/split/move — the checkpointed cut).
+        # A post-export A1 trim MUST flip the gate or the button lies.
+        dirty = (
+            baked_ops_rev is None
+            or ops_rev > baked_ops_rev
+            or (
+                active_version is not None
+                and baked_timeline_version is not None
+                and active_version > baked_timeline_version
+            )
+        )
         return JSONResponse(
             {
                 "ops_rev": ops_rev,
                 "baked_ops_rev": baked_ops_rev,
+                "active_version": active_version,
+                "baked_timeline_version": baked_timeline_version,
                 "dirty": dirty,
                 "pending_ops": pending,
-                "exported_once": baked_ops_rev is not None,
+                "exported_once": baked_ops_rev is not None or baked_timeline_version is not None,
             }
         )
     finally:

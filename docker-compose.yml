@@ -169,6 +169,16 @@ services:
       timeout: 5s
       retries: 5
 
+  # One-shot file server for the full-stack smoke test (scripts/fullstack_smoke.sh):
+  # serves the shared output volume so the API can download the generated test
+  # video over the compose network. Start: docker compose --profile smoke up -d smoke-media
+  smoke-media:
+    image: python:3.12-slim
+    profiles: ["smoke"]
+    command: ["python", "-m", "http.server", "8099", "--directory", "/data", "--bind", "0.0.0.0"]
+    volumes:
+      - outputdata:/data:ro
+
   # Director Studio web UI — same stack, same one command. The browser on
   # your machine talks to the API at http://localhost:8000 (compose maps it).
   web:

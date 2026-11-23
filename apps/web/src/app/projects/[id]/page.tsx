@@ -583,8 +583,10 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
           title={
             gate?.exported_once
               ? gate?.dirty
-                ? `${gate.pending_ops} op event(s) since the last export — re-export re-bakes only the dirty segments`
-                : `Exported at op rev ${gate.baked_ops_rev} — the program on screen is what is on disk`
+                ? gate.pending_ops > 0
+                  ? `${gate.pending_ops} op event(s) since the last export — re-export re-bakes only the dirty segments`
+                  : "Timeline edited since the last export (trim/split/move) — re-export bakes the new cut"
+                : `Exported (ops rev ${gate.baked_ops_rev ?? "—"}, version ${gate.baked_timeline_version ?? "—"}) — the program on screen is what is on disk`
               : "First export: bakes the program (tracked ops + blur regions) into the deliverable"
           }
         >

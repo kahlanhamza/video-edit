@@ -1,4 +1,4 @@
-.PHONY: setup lint type test up down logs api worker render-fixture demo-1080p clean
+.PHONY: setup lint type test up down logs api worker render-fixture demo-1080p smoke smoke-trim clean
 
 setup:
 	uv sync
@@ -15,6 +15,12 @@ test:
 
 up:
 	docker compose up -d --build
+
+smoke:
+	./scripts/fullstack_smoke.sh
+
+smoke-trim:
+	./scripts/fullstack_smoke.sh --trim-only $(PID)
 
 down:
 	docker compose down

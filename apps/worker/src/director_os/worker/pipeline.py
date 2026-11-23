@@ -1134,10 +1134,22 @@ def _render_plan_with_ops(
 
     merged, changed = merge_op_params(plan, [params for _id, params in op_rows])
 
-    # export-gate stamp: THIS render consumed the op state up to max_rev —
-    # the Studio's Export button reads it (dirty = fold rev > stamped rev)
-    if asset_id and max_rev:
+    # export-gate stamp: THIS render consumed the op state up to max_rev AND
+    # the active timeline version — the Studio's Export button reads both
+    # (dirty = fold rev > stamped rev OR active version > stamped version).
+    # Version-level edits (trim_clip / trim_audio / split / move / remove)
+    # never touch the op fold: without the version stamp a post-export trim
+    # would leave the gate "clean" while the disk carries the OLD cut.
+    if asset_id:
+        from director_os.core.db import ProjectRow
+
         with deps.sessions() as s:
+            project = s.get(ProjectRow, project_id)
+            baked_version = (
+                int(project.active_otio_version_id)
+                if project is not None and project.active_otio_version_id is not None
+                else None
+            )
             prow = s.get(PerceptionIndexRow, asset_id)
             if prow is None:
                 prow = PerceptionIndexRow(asset_id=asset_id)
@@ -1145,6 +1157,7 @@ def _render_plan_with_ops(
             prow.redaction_tracks_json = {
                 **(prow.redaction_tracks_json or {}),
                 "baked_ops_rev": max_rev,
+                "baked_timeline_version": baked_version,
             }
             s.commit()
 

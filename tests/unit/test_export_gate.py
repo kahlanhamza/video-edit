@@ -108,3 +108,75 @@ def test_gate_revoked_op_counts_as_pending_event(api_client, project_id):
 
 def test_gate_404_unknown_project(api_client):
     assert api_client.get("/projects/nope/export/gate").status_code == 404
+
+
+def test_gate_dirty_after_version_level_trim(api_client, project_id):
+    """A post-export A1 trim (trim_audio) never touches the op fold — the
+    gate must go dirty on the TIMELINE VERSION axis, or the Export button
+    would claim "the program on screen is what is on disk" while the disk
+    carries the old cut."""
+    import director_os.api.main as api_main
+    from director_os.core.db import MediaAssetRow, PerceptionIndexRow
+
+    # exported once: ops rev 1, timeline version 7 baked
+    with api_main.session() as s:
+        s.add(
+            MediaAssetRow(
+                id="av1", project_id=project_id, duration_s=4.0, fps=30.0, width=320, height=240
+            )
+        )
+        s.commit()
+    with api_main.session() as s:
+        s.add(
+            PerceptionIndexRow(
+                asset_id="av1",
+                redaction_tracks_json={"baked_ops_rev": 1, "baked_timeline_version": 7},
+            )
+        )
+        s.commit()
+    with api_main.session() as s:
+        p = s.get(api_main.ProjectRow, project_id)
+        assert p is not None
+        p.active_otio_version_id = 7
+        s.commit()
+
+    out = api_client.get(f"/projects/{project_id}/export/gate").json()
+    assert out["dirty"] is False
+    assert out["exported_once"] is True
+    assert out["active_version"] == 7 and out["baked_timeline_version"] == 7
+
+    # the A1 trim advances the timeline version (no op row at all)
+    with api_main.session() as s:
+        p = s.get(api_main.ProjectRow, project_id)
+        assert p is not None
+        p.active_otio_version_id = 8
+        s.commit()
+
+    out = api_client.get(f"/projects/{project_id}/export/gate").json()
+    assert out["dirty"] is True, "version-level edit MUST dirty the gate"
+    assert out["pending_ops"] == 0, "no op rows — pending is an op-fold concept"
+
+
+def test_gate_version_clause_inert_for_legacy_bakes(api_client, project_id):
+    """Older renders stamped only baked_ops_rev: the version clause must not
+    spuriously dirty them (regression guard)."""
+    import director_os.api.main as api_main
+    from director_os.core.db import MediaAssetRow, PerceptionIndexRow
+
+    with api_main.session() as s:
+        s.add(
+            MediaAssetRow(
+                id="av2", project_id=project_id, duration_s=4.0, fps=30.0, width=320, height=240
+            )
+        )
+        s.commit()
+        s.add(PerceptionIndexRow(asset_id="av2", redaction_tracks_json={"baked_ops_rev": 3}))
+        with api_main.session() as s2:
+            p = s2.get(api_main.ProjectRow, project_id)
+            assert p is not None
+            p.active_otio_version_id = 2
+            s2.commit()
+        s.commit()
+    out = api_client.get(f"/projects/{project_id}/export/gate").json()
+    assert out["dirty"] is False, "legacy bake (no version stamp) stays clean"
+    assert out["baked_timeline_version"] is None

@@ -118,6 +118,20 @@ When no Celery broker is reachable, the gateway runs the pipeline itself in
 an inline worker thread (the exact `advance_job` entrypoint the fleet runs),
 so `make api` alone is a working Studio.
 
+### Full-stack smoke (real device, docker compose)
+
+```bash
+make smoke          # full: generates a test video in the api container, runs the
+                    # pipeline end to end, then drives the A1 trim interaction
+make smoke-trim PID=<existing project id>   # trim interaction on YOUR project
+```
+
+The smoke proves: stack health -> (full) ingest + pipeline to the human gate
+-> `timeline.trim_audio` dispatch -> NLE carries the VO window -> invalid trim
+rejected without advancing the version -> export gate dirty. Optional
+services: `docker compose --profile gpu up -d sam2` (SAM2 local weights),
+`--profile smoke` starts the test-media file server.
+
 ## The hard-won guardrails (PLAN §9) are executable
 
 Every R&D bug is a CI test — see `tests/unit/test_g1..g8`:

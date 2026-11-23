@@ -146,6 +146,8 @@ export interface OpRecord {
 export interface ExportGate {
   ops_rev: number;
   baked_ops_rev: number | null;
+  active_version?: number | null;
+  baked_timeline_version?: number | null;
   dirty: boolean;
   pending_ops: number;
   exported_once: boolean;
@@ -574,6 +576,8 @@ export const api = {
     req<{
       ops_rev: number;
       baked_ops_rev: number | null;
+      active_version?: number | null;
+      baked_timeline_version?: number | null;
       dirty: boolean;
       pending_ops: number;
       exported_once: boolean;
