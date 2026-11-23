@@ -39,20 +39,31 @@ def run_ffmpeg(cmd: list[str]) -> dict:
 
 
 @celery_app.task(name="directoros.advance_job")
-def advance_job_task(job_id: str, project_id: str, source: str, database_url: str) -> dict:
+def advance_job_task(
+    job_id: str,
+    project_id: str,
+    source: str,
+    database_url: str,
+    custom_headers: dict[str, str] | None = None,
+) -> dict:
     """Resume/advance one durable pipeline job (stages persist their products).
 
-    Safe to retry after a worker crash: completed stages are skipped via the
-    domain tables (media_assets / perception_index / timeline_versions /
-    segment_cache). See `worker.pipeline` for the stage contract.
+    `custom_headers` is optional and positional-safe: tasks queued by an
+    older gateway carry four args and still unpack. See
+    `worker.pipeline` for the stage contract.
     """
     from director_os.worker.pipeline import advance_job
 
-    return advance_job(job_id, project_id, source, database_url)
+    return advance_job(job_id, project_id, source, database_url, custom_headers=custom_headers)
 
 
 @celery_app.task(name="directoros.replan_job")
-def replan_job_task(project_id: str, source: str, database_url: str) -> dict:
+def replan_job_task(
+    project_id: str,
+    source: str,
+    database_url: str,
+    custom_headers: dict[str, str] | None = None,
+) -> dict:
     """Re-run Stage 6+ after a CaseDossier refresh (new source attached).
 
     Ingest + ASR short-circuit on the persisted domain rows — the video is
@@ -61,7 +72,9 @@ def replan_job_task(project_id: str, source: str, database_url: str) -> dict:
     """
     from director_os.worker.pipeline import advance_job
 
-    return advance_job(None, project_id, source, database_url, force_replan=True)
+    return advance_job(
+        None, project_id, source, database_url, force_replan=True, custom_headers=custom_headers
+    )
 
 
 # ---------------------------------------------------------------------------

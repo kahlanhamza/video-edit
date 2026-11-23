@@ -2,10 +2,12 @@
 
 // Cases — the Studio front door (app shell, no page scroll).
 // Left: the new-case composer (1..N videos, sources, uploads, auto-discover).
-// Right: the case grid. One action — create AND run; the agent takes over.
+// Right: the case grid with LIVE pipeline progress. One action — create AND
+// run; the operator lands straight in the editor and watches the download.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { api, Project, SourceIn } from "@/lib/api";
 import { Icon } from "@/components/studio/icons";
 
@@ -27,6 +29,11 @@ interface PendingUpload {
   file: File;
 }
 
+interface Toast {
+  kind: "ok" | "err" | "info";
+  message: string;
+}
+
 function fmtSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -41,6 +48,24 @@ const STATUS_CHIP: Record<string, string> = {
   rendered: "chip chip-ok",
 };
 
+/** pipeline stage → what the operator actually did (no jargon on the door) */
+const STAGE_LABEL: Record<string, string> = {
+  ingest: "Downloading & preparing media",
+  perception: "Transcribing audio",
+  proofread: "Proofreading captions",
+  vision: "Vision indexing",
+  planning: "Cutting the story",
+  director: "Directing the re-cut",
+  redaction: "Redacting privacy regions",
+  narration: "Writing narration",
+  audio_prep: "Enhancing audio",
+  render: "Rendering",
+  qa: "Quality check",
+  publish: "Publishing",
+  human_gate: "Waiting for your review",
+  awaiting_review: "Waiting for your review",
+};
+
 export default function ProjectsPage() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [title, setTitle] = useState("");
@@ -50,8 +75,22 @@ export default function ProjectsPage() {
   const [pendingUploads, setPendingUploads] = useState<PendingUpload[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [toast, setToast] = useState<Toast | null>(null);
   const nextId = useRef(2);
   const fileInput = useRef<HTMLInputElement | null>(null);
+  const router = useRouter();
+
+  const showToast = useCallback((kind: Toast["kind"], message: string) => {
+    setToast({ kind, message });
+  }, []);
+
+  // success/info toasts auto-dismiss; errors stay until the operator closes
+  // them (a self-erasing error is a lie — CR-011)
+  useEffect(() => {
+    if (!toast || toast.kind === "err") return;
+    const t = setTimeout(() => setToast(null), 6000);
+    return () => clearTimeout(t);
+  }, [toast]);
 
   const refresh = useCallback(async () => {
     try {
@@ -68,13 +107,15 @@ export default function ProjectsPage() {
     refresh();
   }, [refresh]);
 
-  // CR-010: the front door never refreshed — a case could sit "done" for
-  // hours while the grid showed a stale chip. Poll while the tab is visible;
-  // pipelines park at the gate on their own, the operator should see it.
+  // CR-010, adaptive: while ANY case runs, poll fast (4s) so download/
+  // transcription progress is visible; a quiet grid polls slowly (30s).
+  // The old fixed 10s poll either starved running cases or churned idle ones.
+  const anyRunning = projects.some((p) => p.job_running);
   useEffect(() => {
+    const interval = anyRunning ? 4000 : 30000;
     const t = setInterval(() => {
       if (document.visibilityState === "visible") void refresh();
-    }, 10000);
+    }, interval);
     const onVisible = () => {
       if (document.visibilityState === "visible") void refresh();
     };
@@ -83,7 +124,7 @@ export default function ProjectsPage() {
       clearInterval(t);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [refresh]);
+  }, [refresh, anyRunning]);
 
   function updateVideo(id: number, url: string) {
     setVideoRows((rows) => rows.map((r) => (r.id === id ? { ...r, url } : r)));
@@ -137,30 +178,33 @@ export default function ProjectsPage() {
         auto_discover: autoDiscover,
         ...(sources.length > 0 ? { sources } : {}),
       });
-      // one action: create AND run — the agent takes it from here (download,
-      // scrape sources, script, cut, render). Failures are resumable via the
-      // project page's Run/Resume button.
-      let runNote = "";
+      // One action: create AND run. With a video URL the worker starts
+      // DOWNLOADING immediately (the job registers instantly, the download
+      // streams progress) — so the honest move is to land the operator in
+      // the editor where the pipeline panel shows the bytes moving. There
+      // is nothing to watch on this page; staying here is the "Creating…
+      // forever" bug in a nicer costume.
+      let runFailed: string | null = null;
       if (videoUrls.length > 0) {
         try {
           const run = await api.runPipeline(created.id, videoUrls[0]);
-          runNote = run.reused
-            ? "resumed the previous pipeline run"
-            : `pipeline started (${run.detail})`;
+          if (run.reused) {
+            showToast("info", `Resumed the previous pipeline run for “${created.title}”`);
+          }
           // Honest multi-camera semantics (CR-006): the pipeline cuts the
-          // PRIMARY camera only. Extra URLs stay as case sources — ingesting
-          // them now would launch a SECOND full pipeline on the same project
-          // and clobber the reviewed timeline version. Ingest them from
-          // Media → Ingest when you deliberately want them processed.
+          // PRIMARY camera only. Extra URLs stay as case sources.
           if (videoUrls.length > 1) {
-            runNote += ` — camera 1 is the primary cut; ${videoUrls.length - 1} extra URL(s) kept as case sources (Media → Ingest to process them)`;
+            showToast(
+              "info",
+              `Camera 1 is the primary cut — ${videoUrls.length - 1} extra URL(s) kept as case sources (Media → Ingest to process them)`,
+            );
           }
         } catch (e) {
-          runNote = `pipeline not started: ${e instanceof Error ? e.message : e}`;
+          runFailed = e instanceof Error ? e.message : String(e);
         }
       }
-      // uploads run sequentially after the case exists; failures are
-      // collected per-source so the rest of the case is not lost.
+      // uploads run after the case exists; failures are collected per-source
+      // so the rest of the case is not lost.
       const failed: string[] = [];
       for (const p of pendingUploads) {
         try {
@@ -169,21 +213,25 @@ export default function ProjectsPage() {
           failed.push(`${p.file.name}: ${e instanceof Error ? e.message : e}`);
         }
       }
+      // reset the composer before navigating (a stale form on back is a trap)
       setTitle("");
       setVideoRows([{ id: nextId.current++, url: "" }]);
       setAutoDiscover(true);
       setSourceRows([]);
       setPendingUploads([]);
-      await refresh();
-      if (failed.length > 0) {
-        setError(
-          `case created, but ${failed.length} upload(s) failed — ${failed.join(" · ")} ${runNote}`,
-        );
-      } else if (runNote) {
-        setError(`case created — ${runNote}`);
+      if (runFailed || failed.length > 0) {
+        // the case exists and the operator can retry there — but the failure
+        // must be SEEN, so it rides into the editor as a sticky toast
+        if (runFailed) {
+          showToast("err", `Case created, pipeline not started — ${runFailed}`);
+          await refresh();
+          return;
+        }
+        showToast("err", `Case created, ${failed.length} upload(s) failed — ${failed.join(" · ")}`);
       }
+      router.push(`/projects/${created.id}`);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      showToast("err", e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
@@ -207,7 +255,7 @@ export default function ProjectsPage() {
       </header>
 
       {error && (
-        <div className="flex shrink-0 items-center gap-2 border-b border-[var(--line-1)] bg-[var(--bg-1)] px-4 py-1.5 text-[11px] text-[var(--tx-2)]">
+        <div className="flex shrink-0 items-center gap-2 border-b border-[var(--line-1)] bg-[var(--bg-1)] px-4 py-1.5 text-[12px] text-[var(--tx-2)]">
           <button
             className="icon-btn !h-4 !w-4"
             onClick={() => setError(null)}
@@ -447,34 +495,92 @@ export default function ProjectsPage() {
             </div>
           )}
           <div className="mt-4 grid gap-2.5 sm:grid-cols-2 xl:grid-cols-3">
-            {projects.map((p) => (
-              <a
-                key={p.id}
-                href={`/projects/${p.id}`}
-                className="panel group flex flex-col gap-3 p-4 transition-colors hover:border-[var(--acc-line)]"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="truncate text-[13px] font-medium text-[var(--tx-1)]">
-                    {p.title}
+            {projects.map((p) => {
+              const running = p.job_running;
+              const pct = p.job_pct ?? 0;
+              return (
+                <a
+                  key={p.id}
+                  href={`/projects/${p.id}`}
+                  className="panel card-lift group flex flex-col gap-3 p-4 transition-colors hover:border-[var(--acc-line)]"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate text-[13px] font-medium text-[var(--tx-1)]">
+                      {p.title}
+                    </span>
+                    {running ? (
+                      <span className="chip chip-acc">
+                        <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-current" />
+                        running
+                      </span>
+                    ) : (
+                      <span className={STATUS_CHIP[p.status.toLowerCase()] ?? "chip"}>
+                        {p.status}
+                      </span>
+                    )}
+                  </div>
+                  {/* live pipeline truth on the card itself — a case that is
+                      downloading shows WHERE it is, so nobody clicks around
+                      hunting for feedback (the owner's 2026-11-23 report) */}
+                  {running && (
+                    <div>
+                      <div className="flex items-baseline justify-between gap-2">
+                        <span className="truncate text-[11px] text-[var(--tx-2)]">
+                          {STAGE_LABEL[p.job_stage ?? ""] ?? p.job_stage ?? "working"}
+                        </span>
+                        <span className="tcode text-[11px] text-[var(--acc)]">
+                          {(p.job_pct ?? 0).toFixed(0)}%
+                        </span>
+                      </div>
+                      <div className="bar-track mt-1.5">
+                        <div
+                          className="bar-fill bar-indeterminate"
+                          style={{ width: `${Math.min(100, pct)}%` }}
+                        />
+                      </div>
+                    </div>
+                  )}
+                  <div className="flex items-center justify-between text-[10.5px] text-[var(--tx-3)]">
+                    <span className="uppercase tracking-wider">
+                      {p.niche_skill.replaceAll("_", " ")}
+                    </span>
+                    <span className="tcode">{p.id.slice(0, 8)}</span>
+                  </div>
+                  <span className="flex items-center gap-1 text-[11px] font-medium text-[var(--acc)] opacity-0 transition-opacity group-hover:opacity-100">
+                    Open studio <Icon name="stepFwd" size={11} />
                   </span>
-                  <span className={STATUS_CHIP[p.status.toLowerCase()] ?? "chip"}>
-                    {p.status}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between text-[10px] text-[var(--tx-3)]">
-                  <span className="uppercase tracking-wider">
-                    {p.niche_skill.replaceAll("_", " ")}
-                  </span>
-                  <span className="tcode">{p.id.slice(0, 8)}</span>
-                </div>
-                <span className="flex items-center gap-1 text-[11px] font-medium text-[var(--acc)] opacity-0 transition-opacity group-hover:opacity-100">
-                  Open studio <Icon name="stepFwd" size={11} />
-                </span>
-              </a>
-            ))}
+                </a>
+              );
+            })}
           </div>
         </main>
       </div>
+
+      {/* toast — floating, bottom-right, Material-snackbar energy */}
+      {toast && (
+        <div
+          role="status"
+          className={`toast ${toast.kind === "err" ? "toast-err" : toast.kind === "ok" ? "toast-ok" : ""}`}
+        >
+          <span
+            className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+              toast.kind === "err"
+                ? "bg-[var(--err)]"
+                : toast.kind === "ok"
+                  ? "bg-[var(--ok)]"
+                  : "bg-[var(--acc)]"
+            }`}
+          />
+          <span className="min-w-0 flex-1 leading-relaxed">{toast.message}</span>
+          <button
+            className="icon-btn !h-5 !w-5 shrink-0"
+            onClick={() => setToast(null)}
+            title="dismiss"
+          >
+            <Icon name="x" size={11} />
+          </button>
+        </div>
+      )}
     </div>
   );
 }

@@ -7,6 +7,7 @@ M2 adds SSE job progress, agent tool dispatch endpoints and the Human Review Gat
 from __future__ import annotations
 
 import contextlib
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -61,7 +62,6 @@ from director_os.core.db import (
     make_session_factory,
     new_id,
 )
-from director_os.core.http import download
 from director_os.core.models import ProjectStatus
 from director_os.core.ops import OpsStore
 from fastapi import FastAPI, File, HTTPException, Query, Response, UploadFile
@@ -140,6 +140,42 @@ class ProjectOut(BaseModel):
     title: str
     niche_skill: str
     status: str
+    # live pipeline truth for the case grid — a card that silently looks "idle"
+    # while the worker downloads a 469 MB bodycam is why Run got clicked ten
+    # times. stage/pct mirror the newest job; running = the honest busy flag.
+    job_stage: str | None = None
+    job_pct: float | None = None
+    job_running: bool = False
+
+
+def _newest_job_map(s: Session, project_ids: list[str]) -> dict[str, JobRow]:
+    """Newest job per project (single query, first-seen wins on desc order)."""
+    if not project_ids:
+        return {}
+    rows = s.execute(
+        select(JobRow)
+        .where(JobRow.project_id.in_(project_ids))
+        .order_by(JobRow.created_at.desc(), JobRow.id.desc())
+        .limit(1000)
+    ).scalars()
+    newest: dict[str, JobRow] = {}
+    for j in rows:
+        if j.project_id not in newest:
+            newest[j.project_id] = j
+    return newest
+
+
+def _project_out(r: ProjectRow, job: JobRow | None) -> ProjectOut:
+    running = _job_is_running(job)
+    return ProjectOut(
+        id=r.id,
+        title=r.title,
+        niche_skill=r.niche_skill,
+        status=r.status,
+        job_stage=job.current_stage if job is not None else None,
+        job_pct=round(float(job.progress_pct or 0.0), 1) if job is not None else None,
+        job_running=running,
+    )
 
 
 @app.get("/health")
@@ -207,29 +243,79 @@ def _add_source_rows(project_id: str, body: ProjectCreate) -> int:
 
 
 # ------------------------------------------------------- job dispatch (one path for every trigger)
-_in_flight: set[str] = set()
+_in_flight: dict[str, float] = {}
 _in_flight_lock = __import__("threading").Lock()
+_IN_FLIGHT_TTL_S = 15 * 60.0
+
+
+def _claim_job(job_id: str | None) -> bool:
+    """Best-effort double-dispatch guard — fleet path INCLUDED.
+
+    The old guard only covered the inline gateway thread, so with a broker up
+    two Run clicks queued the same job twice and two workers raced one
+    pipeline (duplicate ASR spend, racing proxy builds). The inline path
+    releases its claim when the thread exits; the Celery path releases by TTL
+    (the gateway cannot observe a remote worker's exit). A claim older than
+    the TTL counts as dead (crashed worker / gateway restart) and may be
+    re-claimed; Stop() releases explicitly so the Stop -> Run resume law
+    never waits on a stale claim.
+    """
+    if job_id is None:
+        return True
+    now = time.monotonic()
+    with _in_flight_lock:
+        at = _in_flight.get(job_id)
+        if at is not None and now - at < _IN_FLIGHT_TTL_S:
+            return False
+        _in_flight[job_id] = now
+        return True
+
+
+def _release_job(job_id: str | None) -> None:
+    if job_id is None:
+        return
+    with _in_flight_lock:
+        _in_flight.pop(job_id, None)
 
 
 def _dispatch_advance(
-    job_id: str | None, project_id: str, source: str, *, force_replan: bool = False
+    job_id: str | None,
+    project_id: str,
+    source: str,
+    *,
+    force_replan: bool = False,
+    custom_headers: dict[str, str] | None = None,
 ) -> tuple[bool, str]:
     """Celery when the broker accepts the task, inline gateway thread otherwise.
 
     The inline path is what makes `make api` alone enough for the Studio: the
     API process runs the exact `advance_job` entrypoint the worker fleet runs,
     with identical resume semantics. Double-dispatch of the same job is
-    guarded (the pipeline is resumable, not re-entrant). Returns
-    (dispatched, detail).
+    claimed FIRST (see _claim_job) — the pipeline is resumable, not
+    re-entrant. Returns (dispatched, detail).
     """
-    args = [job_id, project_id, source, get_settings().database_url]
+    if not _claim_job(job_id):
+        return True, "job already running — watching progress"
+
+    args: list[str | dict[str, str] | None] = [
+        job_id,
+        project_id,
+        source,
+        get_settings().database_url,
+    ]
+    if custom_headers:
+        args.append(custom_headers)
     if force_replan:
         args = [project_id, source, get_settings().database_url]
+        if custom_headers:
+            args.append(custom_headers)
     try:
         from director_os.worker.celery_app import celery_app
 
         task = "directoros.replan_job" if force_replan else "directoros.advance_job"
         celery_app.send_task(task, args=args, retry=False)
+        # fleet path: the claim ages out via TTL — the gateway cannot observe
+        # a remote worker's exit
         return True, "queued on the worker fleet"
     except Exception:  # noqa: BLE001 — no broker must never 500 the Studio
         pass
@@ -238,23 +324,21 @@ def _dispatch_advance(
         _thread_replan(project_id, source)
         return True, "no broker — replan running inline in the gateway process"
 
-    if job_id is not None:
-        with _in_flight_lock:
-            if job_id in _in_flight:
-                return True, "job already running — watching progress"
-            _in_flight.add(job_id)
-
     def _work() -> None:
         from director_os.worker.pipeline import advance_job
 
         try:
-            advance_job(job_id, project_id, source, get_settings().database_url)
+            advance_job(
+                job_id,
+                project_id,
+                source,
+                get_settings().database_url,
+                custom_headers=custom_headers,
+            )
         except Exception as e:  # noqa: BLE001 — run_pipeline persisted the failure
             print(f"[inline pipeline] job {str(job_id)[:8]} failed: {e}", flush=True)
         finally:
-            if job_id is not None:
-                with _in_flight_lock:
-                    _in_flight.discard(job_id)
+            _release_job(job_id)
 
     import threading
 
@@ -310,10 +394,11 @@ def create_project(body: ProjectCreate) -> ProjectOut:
 def list_projects() -> list[ProjectOut]:
     """All projects, newest first (Director Studio project list)."""
     s = session()
-    rows = s.execute(select(ProjectRow).order_by(ProjectRow.created_at.desc()).limit(200)).scalars()
-    return [
-        ProjectOut(id=r.id, title=r.title, niche_skill=r.niche_skill, status=r.status) for r in rows
-    ]
+    rows: list[ProjectRow] = list(
+        s.execute(select(ProjectRow).order_by(ProjectRow.created_at.desc()).limit(200)).scalars()
+    )
+    jobs = _newest_job_map(s, [r.id for r in rows])
+    return [_project_out(r, jobs.get(r.id)) for r in rows]
 
 
 @app.get("/projects/{project_id}", response_model=ProjectOut)
@@ -322,7 +407,8 @@ def get_project(project_id: str) -> ProjectOut:
     row = s.execute(select(ProjectRow).where(ProjectRow.id == project_id)).scalar_one_or_none()
     if row is None:
         raise HTTPException(status_code=404, detail="project not found")
-    return ProjectOut(id=row.id, title=row.title, niche_skill=row.niche_skill, status=row.status)
+    job = _newest_job(s, project_id)
+    return _project_out(row, job)
 
 
 # ------------------------------------------------------------------ read models for the studio
@@ -1776,67 +1862,115 @@ class IngestResponse(BaseModel):
     detail: str
 
 
-def _source_filename(url: str) -> str:
-    """Deterministic, filesystem-safe name for a downloaded media URL."""
-    from urllib.parse import urlparse
+def _newest_job(s: Session, project_id: str) -> JobRow | None:
+    return s.execute(
+        select(JobRow)
+        .where(JobRow.project_id == project_id)
+        .order_by(JobRow.created_at.desc(), JobRow.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
 
-    path = urlparse(url).path
-    base = Path(path).name.strip()
-    if not base:
-        base = "media.mp4"
-    safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in base)
-    if not safe.lower().endswith((".mp4", ".mov", ".mkv", ".webm", ".avi", ".mp3", ".wav")):
-        safe += ".mp4"
-    return safe
+
+def _job_is_running(job: JobRow | None) -> bool:
+    """Healthy unfinished job — the one case the Run button must never 422 on."""
+    return (
+        job is not None
+        and job.error_message is None
+        and (job.progress_pct or 0.0) < 100.0
+        and job.current_stage != "human_gate"
+    )
+
+
+def _pending_source_url(s: Session, project_id: str) -> str | None:
+    """Newest dispatch-event source URL — the worker-side download contract.
+
+    The media_assets row only exists AFTER probe+proxy complete, so during a
+    long download a Run had no source to resume from. The dispatch event
+    (written at every URL dispatch) makes a crashed ingest resumable and
+    keeps the double-run guard honest.
+    """
+    row = s.execute(
+        select(JobEventRow)
+        .where(JobEventRow.project_id == project_id, JobEventRow.kind == "dispatch")
+        .order_by(JobEventRow.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if row is None:
+        return None
+    src = (row.payload or {}).get("source")
+    return str(src) if src else None
+
+
+def _dispatch_event(
+    s: Session, job_id: str, project_id: str, url: str, custom_headers: dict[str, str] | None
+) -> None:
+    s.add(
+        JobEventRow(
+            job_id=job_id,
+            project_id=project_id,
+            kind="dispatch",
+            payload={"source": url, "custom_headers": custom_headers or None},
+        )
+    )
 
 
 @app.post("/projects/{project_id}/ingest", response_model=IngestResponse, status_code=202)
 def ingest_url(project_id: str, body: IngestRequest) -> IngestResponse:
-    """Paste-a-URL ingest: download server-side (kill-safe .part rename),
-    register a queued pipeline job, hand it to the worker fleet.
+    """Paste-a-URL ingest: the WORKER downloads server-side (kill-safe .part
+    rename, UA guardrail, byte progress streamed into the Studio console),
+    registers the queued pipeline job and advances ingest -> perception ->
+    render (crash-safe stages).
 
-    The browser watches the returned `job_id` over SSE; the worker advances
-    ingest -> perception -> render (crash-safe stages)."""
+    This request NEVER blocks on the download itself — the old in-request
+    fetch made the browser hang for the length of a 469 MB bodycam. The
+    browser watches the returned `job_id` over SSE."""
     s = session()
     try:
         if s.get(ProjectRow, project_id) is None:
             raise HTTPException(status_code=404, detail="project not found")
-    finally:
-        s.close()
-    if not body.url.lower().startswith(("http://", "https://")):
-        raise HTTPException(status_code=422, detail="url must be http(s)")
-
-    dest_dir = get_settings().output_dir / "pipeline" / project_id / "sources"
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / _source_filename(body.url)
-    try:
-        source = download(body.url, dest, extra_headers=body.custom_headers or None)
-    except Exception as e:  # httpx errors, bad status codes, disk failures
-        raise HTTPException(status_code=502, detail=f"media download failed: {e}") from e
-
-    s = session()
-    try:
+        vurl = body.url.strip()
+        if not vurl.lower().startswith(("http://", "https://")):
+            raise HTTPException(status_code=422, detail="url must be http(s)")
+        if _job_is_running(_newest_job(s, project_id)):
+            # one case = one pipeline run (CR-006): a second concurrent run
+            # would clobber the reviewed timeline version
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "a pipeline is already running — Stop it first, then ingest "
+                    "the new source (one case = one run)"
+                ),
+            )
         job = JobRow(project_id=project_id, current_stage="ingest", progress_pct=0.0)
         s.add(job)
+        s.flush()  # need job.id before writing the dispatch event
+        _dispatch_event(s, job.id, project_id, vurl, body.custom_headers or None)
         s.commit()
         job_id = job.id
     finally:
         s.close()
 
-    enqueued, detail = _dispatch_advance(job_id, project_id, str(source))
-    return IngestResponse(job_id=job_id, source_path=str(source), enqueued=enqueued, detail=detail)
+    name = Path(vurl.split("?")[0]).name or "ingest.bin"
+    predicted = get_settings().ingest_dir / name
+    enqueued, detail = _dispatch_advance(
+        job_id, project_id, vurl, custom_headers=body.custom_headers or None
+    )
+    return IngestResponse(
+        job_id=job_id, source_path=str(predicted), enqueued=enqueued, detail=detail
+    )
 
 
 # ------------------------------------------------------- run pipeline (Studio one-button)
 class RunRequest(BaseModel):
     """Start (or RESUME) the autonomous pipeline for a project.
 
-    With a `video_url` the gateway downloads it server-side (kill-safe .part
-    rename) exactly like /ingest, then dispatches. Without one, the project's
-    registered media asset (or its newest unfinished job) is resumed — a
-    failed step continues WHERE IT STOPPED; finished stages short-circuit
-    (ASR never re-runs, cached segments never re-encode, fetched sources
-    never re-scrape).
+    With a `video_url` the job row is registered immediately and the WORKER
+    downloads it (kill-safe .part rename, UA guardrail, byte progress in the
+    console) — the request NEVER blocks on the fetch. Without one, the
+    project's registered media asset (or the URL recorded at dispatch time)
+    is resumed — a failed step continues WHERE IT STOPPED; finished stages
+    short-circuit (ASR never re-runs, cached segments never re-encode,
+    fetched sources never re-scrape).
     """
 
     video_url: str | None = None
@@ -1860,79 +1994,135 @@ def run_project(project_id: str, body: RunRequest | None = None) -> RunResponse:
     Resume contract: the project's newest unfinished job is reused when no
     fresh media URL is given; every stage persists its product, so a retry
     continues from the failed stage instead of restarting from scratch.
+
+    Dispatch law (the "Creating... forever" bug): a `video_url` is never
+    downloaded inside this request — the old in-request fetch ran a 469 MB
+    bodycam through the POST and the Studio sat on "Creating..." for minutes
+    with zero feedback. The job registers instantly and the worker downloads
+    with progress. Run during an active ingest returns the running job
+    instead of an error, so the button is always honest.
     """
     body = body or RunRequest()
 
-    if body.video_url is not None and body.video_url.strip():
-        # fresh media: same kill-safe download path as /ingest
-        vurl = _validate_http_url(body.video_url, "video_url")
-        dest_dir = get_settings().output_dir / "pipeline" / project_id / "sources"
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = dest_dir / _source_filename(vurl)
-        try:
-            source = download(vurl, dest, extra_headers=body.custom_headers or None)
-        except Exception as e:  # httpx errors, bad status codes, disk failures
-            raise HTTPException(status_code=502, detail=f"media download failed: {e}") from e
-        source_str = str(source)
+    s = session()
+    reused = False
+    custom_headers: dict[str, str] | None = None
+    try:
+        if s.get(ProjectRow, project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        last = _newest_job(s, project_id)
+        asset = s.execute(
+            select(MediaAssetRow)
+            .where(MediaAssetRow.project_id == project_id)
+            .order_by(MediaAssetRow.id)
+            .limit(1)
+        ).scalar_one_or_none()
 
-        s = session()
-        try:
-            if s.get(ProjectRow, project_id) is None:
-                raise HTTPException(status_code=404, detail="project not found")
+        if body.video_url is not None and body.video_url.strip():
+            # fresh media: register + dispatch — the WORKER downloads
+            vurl = _validate_http_url(body.video_url, "video_url")
+            if _job_is_running(last) and last is not None:
+                # one case = one pipeline run (CR-006): a second concurrent
+                # run would clobber the reviewed timeline version
+                pct = round(float(last.progress_pct or 0.0), 1)
+                return RunResponse(
+                    project_id=project_id,
+                    job_id=last.id,
+                    reused=True,
+                    dispatched=True,
+                    detail=(
+                        f"pipeline already running ({last.current_stage} {pct}%) — new URL "
+                        "not started; Stop it first if you want to switch sources"
+                    ),
+                    stage=last.current_stage,
+                    progress_pct=pct,
+                )
             job = JobRow(project_id=project_id, current_stage="ingest", progress_pct=0.0)
             s.add(job)
+            s.flush()  # need job.id before writing the dispatch event
+            _dispatch_event(s, job.id, project_id, vurl, body.custom_headers or None)
             s.commit()
-            job_id = job.id
-        finally:
-            s.close()
-        reused = False
-    else:
-        # resume path: newest unfinished job + its registered media asset
-        s = session()
-        try:
-            if s.get(ProjectRow, project_id) is None:
-                raise HTTPException(status_code=404, detail="project not found")
-            last = s.execute(
-                select(JobRow)
-                .where(JobRow.project_id == project_id)
-                .order_by(JobRow.created_at.desc(), JobRow.id.desc())
-                .limit(1)
-            ).scalar_one_or_none()
-            asset = s.execute(
-                select(MediaAssetRow)
-                .where(MediaAssetRow.project_id == project_id)
-                .order_by(MediaAssetRow.id)
-                .limit(1)
-            ).scalar_one_or_none()
-            # resume path: newest unfinished job + its registered media asset
-            # (inline `last is not None` keeps mypy's narrowing flowing)
-            if (
+            job_id, source_str = job.id, vurl
+            custom_headers = body.custom_headers or None
+        else:
+            # resume path: newest unfinished job + its source reference
+            if _job_is_running(last) and last is not None:
+                # A job is alive: reuse it — with or WITHOUT the asset row
+                # (during ingest the asset exists only after probe+proxy, so
+                # the old code 422'd here and the Run button "did nothing")
+                job_id = last.id
+                source_ref = (
+                    asset.source_url
+                    if (asset is not None and asset.source_url)
+                    else _pending_source_url(s, project_id)
+                )
+                if source_ref is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"job {last.id[:8]} is mid-ingest but its source reference is "
+                            "missing (gateway restarted?) — paste the URL again via Media → Ingest"
+                        ),
+                    )
+                source_str = source_ref
+                reused = True
+            elif (
                 last is not None
+                and last.error_message is not None
                 and asset is not None
                 and asset.source_url
-                and (last.error_message is not None or (last.progress_pct or 0.0) < 100.0)
             ):
+                # failed/parked job with a registered asset: resume where it
+                # stopped. Resume = fresh attempt: clear the terminal error
+                # BEFORE dispatch so (a) the SSE live stream does not
+                # insta-close on the stale error and (b) the Studio shows the
+                # run as live again. The worker's RunTracker takes over.
                 job_id, source_str, reused = last.id, asset.source_url, True
-                if last.error_message is not None:
-                    # Resume = fresh attempt: clear the terminal error BEFORE
-                    # dispatch so (a) the SSE live stream does not insta-close
-                    # on the stale error and (b) the Studio shows the run as
-                    # live again. The worker's RunTracker takes over from here.
-                    last.error_message = None
-                    s.add(
-                        JobEventRow(
-                            job_id=last.id,
-                            project_id=project_id,
-                            kind="job",
-                            payload={
-                                "stage": last.current_stage,
-                                "progress_pct": round(float(last.progress_pct or 0.0), 1),
-                                "error": None,
-                                "resumed": True,
-                            },
-                        )
+                last.error_message = None
+                s.add(
+                    JobEventRow(
+                        job_id=last.id,
+                        project_id=project_id,
+                        kind="job",
+                        payload={
+                            "stage": last.current_stage,
+                            "progress_pct": round(float(last.progress_pct or 0.0), 1),
+                            "error": None,
+                            "resumed": True,
+                        },
                     )
-                    s.commit()
+                )
+                s.commit()
+            elif last is not None and last.error_message is not None:
+                # failed BEFORE the asset landed (a dead download used to
+                # leave a zombie job with no way back) — the dispatch event
+                # carries the URL for a fresh attempt
+                pending = _pending_source_url(s, project_id)
+                if pending is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            "job failed before the source was registered — provide a "
+                            "video_url (or ingest one first) so the pipeline has media "
+                            "to process"
+                        ),
+                    )
+                job_id, source_str, reused = last.id, pending, True
+                last.error_message = None
+                s.add(
+                    JobEventRow(
+                        job_id=last.id,
+                        project_id=project_id,
+                        kind="job",
+                        payload={
+                            "stage": last.current_stage,
+                            "progress_pct": round(float(last.progress_pct or 0.0), 1),
+                            "error": None,
+                            "resumed": True,
+                        },
+                    )
+                )
+                s.commit()
             elif asset is not None and asset.source_url:
                 # finished pipeline but a finished job exists: re-advance is
                 # harmless (every stage short-circuits) — but a fresh job is
@@ -1949,15 +2139,17 @@ def run_project(project_id: str, body: RunRequest | None = None) -> RunResponse:
                         "so the pipeline has media to process"
                     ),
                 )
-        finally:
-            s.close()
+    finally:
+        s.close()
 
     # Run = explicit resume intent: clear any operator STOP flag so the
     # pipeline advances instead of parking at the first stage boundary
     stop_flag = get_settings().output_dir / "pipeline" / project_id / "STOP"
     stop_flag.unlink(missing_ok=True)
 
-    dispatched, dispatch_detail = _dispatch_advance(job_id, project_id, source_str)
+    dispatched, dispatch_detail = _dispatch_advance(
+        job_id, project_id, source_str, custom_headers=custom_headers
+    )
     s2 = session()
     try:
         job_row = s2.get(JobRow, job_id)
@@ -1998,11 +2190,15 @@ def stop_project(project_id: str) -> dict[str, Any]:
     try:
         if s.get(ProjectRow, project_id) is None:
             raise HTTPException(status_code=404, detail="project not found")
+        newest = _newest_job(s, project_id)
     finally:
         s.close()
     flag = get_settings().output_dir / "pipeline" / project_id / "STOP"
     flag.parent.mkdir(parents=True, exist_ok=True)
     flag.write_text(datetime.now(UTC).isoformat())
+    # the operator just said stop: any dispatch claim on the newest job is
+    # void NOW, or the Stop -> Run resume would bounce off the TTL guard
+    _release_job(newest.id if newest else None)
     return {
         "stopped": True,
         "note": "job parks at the next stage boundary — completed stages are kept; Run resumes",

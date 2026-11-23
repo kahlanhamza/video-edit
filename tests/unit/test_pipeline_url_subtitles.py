@@ -14,7 +14,7 @@ from director_os.core.models import JobStage, ProjectStatus
 from director_os.core.qa_probe import audit_layout_and_policy
 from director_os.otio_engine.segment_cache import VideoRenderSpec
 from director_os.perception.transcript import Transcript, TranscriptSegment, WordTiming
-from director_os.worker.pipeline import PipelineDeps, run_pipeline
+from director_os.worker.pipeline import PipelineDeps, PipelineError, run_pipeline
 
 
 def fake_transcriber_factory(call_log: list[str]):
@@ -163,3 +163,49 @@ def test_pipeline_empty_transcript_yields_empty_ass(fixture_video, pipeline_and_
     result = run_pipeline(fixture_video, pid, deps)
     ass_path = result.otio_path.parent / "subtitles.ass"
     assert ass_path.exists() and ass_path.read_text(encoding="utf-8") == ""
+
+
+def test_download_reports_byte_progress_and_ua(pipeline_and_project, fixture_video):
+    """core.http.download streams progress_cb(received, total) per chunk."""
+    from director_os.core.http import download
+
+    deps, _pid = pipeline_and_project
+    server = _HTTPFileServer(fixture_video.read_bytes())
+    try:
+        seen: list[tuple[int, int | None]] = []
+        dest = deps.settings.ingest_dir / "progress_fixture.mp4"
+        out = download(server.url, dest, progress_cb=lambda r, t: seen.append((r, t)))
+        assert out.exists() and out.stat().st_size == len(server.payload)
+        assert seen, "progress callback never fired"
+        last_received, last_total = seen[-1]
+        assert last_received == len(server.payload)
+        assert last_total == len(server.payload)  # Content-Length known
+        assert seen[0][0] <= last_received  # monotonic
+    finally:
+        server.stop()
+
+
+def test_url_download_failure_records_job_error(pipeline_and_project):
+    """A dead URL must mark the JOB failed — never leave a zombie 'running'.
+
+    Regression for the shipped zombie-job bug: the download used to run
+    BEFORE the tracked failure scope, so a failed fetch raised with the job
+    row untouched (ingest 0%, error NULL, Run clicks said nothing).
+    """
+    deps, pid = pipeline_and_project
+    calls: list[str] = []
+    deps.transcribe = fake_transcriber_factory(calls)
+    # port 1 is guaranteed closed — connect fails fast, no external traffic
+    dead_url = "http://127.0.0.1:1/never_gets_here.mp4"
+
+    with pytest.raises((PipelineError, Exception)):  # noqa: B017 — httpx wraps too
+        run_pipeline(dead_url, pid, deps)
+
+    with deps.sessions() as s:
+        from director_os.core.db import JobRow as JRow
+
+        job = s.query(JRow).filter(JRow.project_id == pid).one_or_none()
+        assert job is not None
+        assert job.error_message, "the job row must record WHERE the run died"
+        assert job.progress_pct < 100.0
+    assert calls == []  # ASR never ran — nothing was spent

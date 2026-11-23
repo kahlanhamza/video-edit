@@ -24,10 +24,12 @@
   --line-1: #282a30;
   --line-2: #3a3c45;
 
-  /* text */
-  --tx-1: #e9ebef;
-  --tx-2: #a4aab5;
-  --tx-3: #6d7480;
+  /* text — the owner's 2026-11-23 audit: "no text clear". The old --tx-3
+     (#6d7480) measured ~4.0:1 on --bg-1, below WCAG AA at 10-11px; both
+     secondaries are lifted so dense panel text reads without squinting. */
+  --tx-1: #eceef2;
+  --tx-2: #b3b9c4;
+  --tx-3: #818996;
 
   /* the single accent */
   --acc: #4d9fff;
@@ -56,6 +58,17 @@
 body {
   background: var(--bg-0);
   color: var(--tx-1);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* keyboard focus is visible everywhere — a focus-free dark UI strands
+   operators who never touch the mouse */
+:focus-visible {
+  outline: 2px solid var(--acc);
+  outline-offset: 1px;
+  border-radius: 4px;
 }
 
 /* ---------- panels ---------- */
@@ -207,6 +220,7 @@ body {
 }
 .input:focus {
   border-color: var(--acc);
+  box-shadow: 0 0 0 2px var(--acc-bg);
 }
 
 textarea.input {
@@ -361,6 +375,77 @@ textarea.input {
 }
 .bar-fill[data-tone="err"] {
   background: var(--err);
+}
+
+/* running bars carry a faint shimmer so "alive" reads even at 0-3% —
+   a static sliver and a stalled bar are visually identical otherwise */
+.bar-indeterminate {
+  background-image: linear-gradient(
+    100deg,
+    transparent 20%,
+    rgba(255, 255, 255, 0.25) 50%,
+    transparent 80%
+  );
+  background-size: 200% 100%;
+  animation: bar-shimmer 1.6s linear infinite;
+}
+@keyframes bar-shimmer {
+  from {
+    background-position: 180% 0;
+  }
+  to {
+    background-position: -80% 0;
+  }
+}
+
+/* ---------- toast (snackbar) ---------- */
+
+.toast {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 100;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  max-width: 460px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: var(--bg-2);
+  border: 1px solid var(--line-2);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  font-size: 12.5px;
+  color: var(--tx-1);
+  animation: toast-in 180ms cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+.toast-ok {
+  border-color: rgba(63, 214, 143, 0.35);
+}
+.toast-err {
+  border-color: rgba(241, 109, 109, 0.4);
+  background: rgba(241, 109, 109, 0.07);
+}
+@keyframes toast-in {
+  from {
+    transform: translateY(10px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+/* case cards lift on hover — the one hover affordance every modern grid has */
+.card-lift {
+  transition:
+    border-color 120ms ease,
+    transform 120ms ease,
+    box-shadow 120ms ease;
+}
+.card-lift:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3);
 }
 
 /* console */

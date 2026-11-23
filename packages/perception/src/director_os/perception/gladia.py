@@ -19,6 +19,7 @@ empty transcript.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,17 @@ from director_os.perception.transcript import Transcript, TranscriptSegment, Wor
 
 DEFAULT_POLL_INTERVAL_S = 2.0
 DEFAULT_TIMEOUT_S = 600.0
+# The 2026-11-23 incident law: a 43-min bodycam's audio is ~20 MB and uploads
+# over home upstream for minutes. The old flat ``timeout=60`` killed the
+# request mid-body ("Server disconnected without sending a response") and
+# Gladia's own edge answered 408 on slow bodies. Uploads get a generous
+# write window; connect stays tight so a dead DNS fails fast.
+DEFAULT_HTTP_TIMEOUT_S = 900.0
+DEFAULT_CONNECT_TIMEOUT_S = 30.0
+UPLOAD_ATTEMPTS = 3
+# Transient provider/network failures worth a retry with backoff. Auth (401/403)
+# and most 4xx are permanent — they must fail loudly, never burn retries.
+RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 
 
 class GladiaError(RuntimeError):
@@ -45,6 +57,7 @@ class GladiaClient:
         poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
         http: httpx.Client | None = None,
         contact_email: str | None = None,
+        log: Callable[[str], None] | None = None,
     ):
         if not api_key:
             raise GladiaError("GLADIA_API_KEY is not configured")
@@ -53,7 +66,12 @@ class GladiaClient:
         self._timeout_s = timeout_s
         self._poll_interval_s = poll_interval_s
         self._contact_email = contact_email
-        self._http = http or httpx.Client(timeout=60.0)
+        self._log = log or (lambda _msg: None)
+        # Long-body upload law: 900s total with a tight connect — the flat
+        # 60s default used to abort large audio uploads mid-flight.
+        self._http = http or httpx.Client(
+            timeout=httpx.Timeout(DEFAULT_HTTP_TIMEOUT_S, connect=DEFAULT_CONNECT_TIMEOUT_S)
+        )
 
     # ------------------------------------------------------------ headers
     def _headers(self, json_body: bool = True) -> dict[str, str]:
@@ -100,18 +118,49 @@ class GladiaClient:
         return self._normalize(payload, asset_id)
 
     def _upload(self, audio_path: Path) -> str:
-        with open(audio_path, "rb") as f:
-            files = {"audio": (audio_path.name, f, "application/octet-stream")}
-            resp = self._http.post(
-                f"{self._base}/v2/upload",
-                headers=build_headers(self._contact_email) | {"x-gladia-key": self._api_key},
-                files=files,
-            )
-        self._raise_for_status(resp, "upload")
-        audio_url = resp.json().get("audio_url")
-        if not audio_url:
-            raise GladiaError(f"upload response missing audio_url: {resp.text[:300]}")
-        return audio_url
+        mib = audio_path.stat().st_size / (1024 * 1024)
+        self._log(
+            f"  [gladia] uploading {audio_path.name} ({mib:.1f} MiB) — "
+            f"up to {UPLOAD_ATTEMPTS} attempt(s)"
+        )
+        last_err: Exception | None = None
+        for attempt in range(1, UPLOAD_ATTEMPTS + 1):
+            try:
+                with open(audio_path, "rb") as f:
+                    files = {"audio": (audio_path.name, f, "application/octet-stream")}
+                    resp = self._http.post(
+                        f"{self._base}/v2/upload",
+                        headers=build_headers(self._contact_email)
+                        | {"x-gladia-key": self._api_key},
+                        files=files,
+                    )
+                if resp.status_code in RETRYABLE_STATUS:
+                    # provider edge timed out / throttled the body — back off
+                    # and resend; the failure text mirrors what the Studio saw
+                    raise GladiaError(f"gladia upload transient HTTP {resp.status_code} — retrying")
+                self._raise_for_status(resp, "upload")
+                audio_url = resp.json().get("audio_url")
+                if not audio_url:
+                    raise GladiaError(f"upload response missing audio_url: {resp.text[:300]}")
+                return audio_url
+            except (httpx.TransportError, GladiaError) as e:
+                permanent = (
+                    isinstance(e, GladiaError)
+                    and "transient" not in str(e)
+                    and "missing audio_url" not in str(e)
+                )
+                if permanent or attempt == UPLOAD_ATTEMPTS:
+                    raise GladiaError(
+                        f"gladia upload failed after {attempt} attempt(s): {e}"
+                    ) from e
+                last_err = e
+                delay = 4.0 * 2 ** (attempt - 1)
+                self._log(
+                    f"  [gladia] upload attempt {attempt}/{UPLOAD_ATTEMPTS} failed ({e}) "
+                    f"— retrying in {delay:.0f}s"
+                )
+                time.sleep(delay)
+        raise GladiaError(f"gladia upload failed: {last_err}")
 
     def _create_job(self, audio_url: str, language: str | None = None) -> str:
         # v2 API (2026-11): `language_behaviour` was removed — `language` is
@@ -119,22 +168,26 @@ class GladiaClient:
         body: dict[str, Any] = {"audio_url": audio_url, "diarization": True}
         if language:
             body["language"] = language
-        resp = self._http.post(f"{self._base}/v2/transcription", headers=self._headers(), json=body)
-        self._raise_for_status(resp, "create job")
-        data = resp.json()
-        job_id = data.get("id")
+        resp = self._request_with_retry(
+            "POST", f"{self._base}/v2/transcription", "create job", json_body=body
+        )
+        job_id = resp.get("id")
         if not job_id:
-            raise GladiaError(f"transcription response missing job id: {resp.text[:300]}")
+            raise GladiaError(f"transcription response missing job id: {str(resp)[:300]}")
         return str(job_id)
 
     def _poll_result(self, job_id: str) -> dict:
         deadline = time.monotonic() + self._timeout_s
         url = f"{self._base}/v2/transcription/{job_id}"
+        last_status: str | None = None
         while True:
-            resp = self._http.get(url, headers=self._headers())
-            self._raise_for_status(resp, f"poll {job_id}")
-            data = resp.json()
+            data = self._request_with_retry("GET", url, f"poll {job_id}")
             status = data.get("status")
+            if status != last_status:
+                # one console line per state change — a 43-min transcription
+                # sits in 'processing' for many minutes and silence reads as death
+                self._log(f"  [gladia] job {job_id[:8]}… status: {status or 'unknown'}")
+                last_status = status
             if status == "done":
                 return data
             if status in ("error", "failed"):
@@ -145,6 +198,36 @@ class GladiaClient:
                     f"(last status: {status})"
                 )
             time.sleep(self._poll_interval_s)
+
+    def _request_with_retry(
+        self,
+        method: str,
+        url: str,
+        what: str,
+        json_body: dict[str, Any] | None = None,
+        attempts: int = 3,
+    ) -> dict:
+        """One provider request with small retries — a dropped connection must
+        never kill a transcription that already paid its upload."""
+        last_err: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                resp = self._http.request(method, url, headers=self._headers(), json=json_body)
+                if resp.status_code in RETRYABLE_STATUS:
+                    raise GladiaError(f"gladia {what} transient HTTP {resp.status_code}")
+                self._raise_for_status(resp, what)
+                return resp.json()
+            except (httpx.TransportError, GladiaError) as e:
+                permanent = isinstance(e, GladiaError) and "transient" not in str(e)
+                if permanent or attempt == attempts:
+                    raise GladiaError(
+                        f"gladia {what} failed after {attempt} attempt(s): {e}"
+                    ) from e
+                last_err = e
+                delay = 2.0 * 2 ** (attempt - 1)
+                self._log(f"  [gladia] {what} attempt {attempt}/{attempts} failed ({e}) — retrying")
+                time.sleep(delay)
+        raise GladiaError(f"gladia {what} failed: {last_err}")
 
     # ------------------------------------------------------------ normalize
     def _normalize(self, payload: dict, asset_id: str) -> Transcript:

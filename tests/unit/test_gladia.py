@@ -71,6 +71,13 @@ def make_client(flow: MockFlow, **kwargs) -> GladiaClient:
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_retry_sleep(monkeypatch):
+    """The retry/backoff law sleeps between attempts — tests assert the ATTEMPT
+    count, not the wall clock; a 4s+8s backoff would triple the suite time."""
+    monkeypatch.setattr("director_os.perception.gladia.time.sleep", lambda _s: None)
+
+
 def test_full_flow_normalizes_transcript(tmp_path):
     flow = MockFlow(
         {
@@ -132,15 +139,89 @@ def test_upload_carries_gladia_key_and_ua(tmp_path):
     ("status", "match"),
     [
         (401, "auth rejected"),
-        (429, "rate-limited"),
-        (500, "HTTP 500"),
+        (404, "HTTP 404"),
     ],
 )
-def test_http_errors_surface_as_gladia_error(tmp_path, status, match):
+def test_permanent_http_errors_fail_fast_no_retry(tmp_path, status, match):
+    """Auth / hard 4xx: fail on the FIRST attempt — retries are for transient
+    failures only; hammering an unauthorized key three times helps nobody."""
     flow = MockFlow({"POST /v2/upload": [httpx.Response(status, text="boom")]})
     client = make_client(flow)
     with pytest.raises(GladiaError, match=match):
         client.transcribe(make_audio(tmp_path), "a1")
+    assert flow.calls.count(("POST", "/v2/upload")) == 1
+
+
+@pytest.mark.parametrize("status", [408, 429, 500, 503])
+def test_transient_http_errors_retry_then_fail(tmp_path, status):
+    """408/429/5xx are transient: 3 attempts with backoff, THEN a loud error
+    (the 2026-11-23 incident: Gladia answered 408 to a slow 469 MB body and
+    the old code treated it as fatal, killing the whole pipeline)."""
+    flow = MockFlow(
+        {"POST /v2/upload": [httpx.Response(status, text="slow body") for _ in range(3)]}
+    )
+    client = make_client(flow)
+    with pytest.raises(GladiaError, match="failed after 3 attempt"):
+        client.transcribe(make_audio(tmp_path), "a1")
+    assert flow.calls.count(("POST", "/v2/upload")) == 3
+
+
+def test_upload_retries_on_408_then_succeeds(tmp_path):
+    """One flaky attempt must not kill a transcription that costs money+minutes."""
+    flow = MockFlow(
+        {
+            "POST /v2/upload": [
+                httpx.Response(408, text="timeout"),
+                httpx.Response(200, json={"audio_url": "https://cdn.gladia.test/a.wav"}),
+            ],
+            "POST /v2/transcription": [httpx.Response(202, json={"id": "job-r"})],
+            "GET /v2/transcription/job-r": [httpx.Response(200, json=done_payload())],
+        }
+    )
+    client = make_client(flow)
+    transcript = client.transcribe(make_audio(tmp_path), "a1")
+    assert transcript.asset_id == "a1"
+    assert flow.calls.count(("POST", "/v2/upload")) == 2
+
+
+def test_upload_retries_on_mid_body_disconnect(tmp_path):
+    """'Server disconnected without sending a response' — the literal error the
+    owner hit — is a transport drop: retried, not fatal."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        return httpx.Response(200, json={"audio_url": "https://cdn.gladia.test/a.wav"})
+
+    client = GladiaClient(
+        api_key="k",
+        base_url="https://api.gladia.test",
+        http=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    url = client._upload(make_audio(tmp_path))
+    assert url == "https://cdn.gladia.test/a.wav"
+    assert calls["n"] == 2
+
+
+def test_upload_backoff_is_logged(tmp_path):
+    """Retry attempts land in the console stream — silence reads as a hang."""
+    lines: list[str] = []
+    flow = MockFlow(
+        {
+            "POST /v2/upload": [
+                httpx.Response(408, text="timeout"),
+                httpx.Response(200, json={"audio_url": "https://cdn.gladia.test/a.wav"}),
+            ],
+            "POST /v2/transcription": [httpx.Response(202, json={"id": "job-l"})],
+            "GET /v2/transcription/job-l": [httpx.Response(200, json=done_payload())],
+        }
+    )
+    client = make_client(flow, log=lines.append)
+    client.transcribe(make_audio(tmp_path), "a1")
+    assert any("attempt 1/3" in line and "retrying" in line for line in lines)
+    assert any("uploading" in line for line in lines)
 
 
 def test_job_failure_status_raises(tmp_path):

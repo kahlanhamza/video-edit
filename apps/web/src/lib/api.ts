@@ -7,6 +7,10 @@ export interface Project {
   title: string;
   niche_skill: string;
   status: string;
+  /** live pipeline truth from the newest job (null = no jobs yet) */
+  job_stage: string | null;
+  job_pct: number | null;
+  job_running: boolean;
 }
 
 export interface Job {
@@ -363,11 +367,18 @@ export interface ProbeOut {
   extra: Record<string, string>;
 }
 
-async function req<T>(path: string, init?: RequestInit): Promise<T> {
+type ReqInit = RequestInit & { timeoutMs?: number };
+
+async function req<T>(path: string, init?: ReqInit): Promise<T> {
+  // Every gateway call is fast now (the worker owns long downloads) — a hung
+  // request is a bug, not a wait. The default timeout keeps the UI honest
+  // instead of spinning a button forever (the "Creating…" bug).
+  const { timeoutMs = 120_000, ...rest } = init ?? {};
   const r = await fetch(`${API_BASE}${path}`, {
     headers: { "Content-Type": "application/json" },
     cache: "no-store",
-    ...init,
+    signal: AbortSignal.timeout(timeoutMs),
+    ...rest,
   });
   if (!r.ok) {
     const body = await r.json().catch(() => ({}));

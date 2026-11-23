@@ -648,15 +648,30 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
             ? `Export${gate && gate.exported_once && gate.pending_ops > 0 ? ` · ${gate.pending_ops} new` : ""}`
             : "Exported ✓"}
         </button>
-        <button className="btn" onClick={runOrResume} disabled={runBusy}>
+        <button
+          className="btn"
+          onClick={runOrResume}
+          disabled={runBusy || running}
+          title={
+            running
+              ? "The pipeline is already working — progress is on the right. Stop it first to restart or switch sources."
+              : jobError
+                ? "Resume from the failed stage — finished stages are never redone"
+                : latestJob
+                  ? "Re-advance the pipeline (finished stages short-circuit)"
+                  : "Run the full pipeline"
+          }
+        >
           <Icon name="play" size={11} />
           {runBusy
             ? "Starting…"
-            : jobError
-              ? "Resume"
-              : latestJob
-                ? "Run again"
-                : "Run pipeline"}
+            : running
+              ? "Running…"
+              : jobError
+                ? "Resume"
+                : latestJob
+                  ? "Run again"
+                  : "Run pipeline"}
         </button>
         <button
           className="btn-ghost"

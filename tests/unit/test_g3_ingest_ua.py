@@ -24,6 +24,8 @@ def test_download_forces_identity_headers(monkeypatch, tmp_path):
     captured = {}
 
     class FakeResponse:
+        headers = {}  # content-length absent -> unknown-total progress path
+
         def raise_for_status(self):
             return None
 
@@ -41,3 +43,33 @@ def test_download_forces_identity_headers(monkeypatch, tmp_path):
     dest = download("https://example.org/clip.webm", tmp_path / "clip.webm")
     assert dest.exists()
     assert captured["headers"]["User-Agent"].startswith("DirectorOS/")
+
+
+def test_download_reports_byte_progress(monkeypatch, tmp_path):
+    """The Studio console law: download progress streams per chunk (2026-11-23
+    — a silent 469 MB fetch read as a hang and Run got clicked ten times)."""
+    seen: list[tuple[int, int | None]] = []
+
+    class FakeResponse:
+        headers = {"content-length": "8"}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self, chunk_size):
+            yield b"aaaa"
+            yield b"bbbb"
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_stream(method, url, headers=None, **kwargs):
+        yield FakeResponse()
+
+    monkeypatch.setattr("director_os.core.http.httpx.stream", fake_stream)
+
+    def cb(received: int, total: int | None) -> None:
+        seen.append((received, total))
+
+    download("https://example.org/clip.webm", tmp_path / "clip.webm", progress_cb=cb)
+    assert seen == [(4, 8), (8, 8)]

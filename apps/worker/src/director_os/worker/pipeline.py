@@ -224,6 +224,65 @@ def stage_ingest(source: Path, project_id: str, deps: PipelineDeps) -> str:
         return row.id
 
 
+def _asr_input_path(asset_id: str, source: Path, project_id: str, deps: PipelineDeps) -> Path:
+    """ASR uploads the COMPRESSED ingest audio, never the raw source.
+
+    The 2026-11-23 incident: a 469 MB bodycam went to Gladia verbatim and the
+    provider edge killed every attempt (HTTP 408 / mid-upload disconnect).
+    Ingest already ships `audio64k.m4a` (AAC 64 kbps mono — ~20 MB for a
+    43-min source) with the proxy bundle; ASR rides that. Legacy assets
+    without a bundle get one extracted on the spot, and only a media file
+    with no audio stream at all falls back to the raw source.
+    """
+    with deps.sessions() as s:
+        row = s.get(MediaAssetRow, asset_id)
+        key = row.r2_audio_key if row is not None else None
+    if key:
+        candidate = Path(key)
+        if candidate.exists() and candidate.stat().st_size > 0:
+            return candidate
+
+    out_dir = deps.settings.output_dir / "pipeline" / project_id / "assets" / asset_id
+    extracted = out_dir / "audio64k.m4a"
+    if extracted.exists() and extracted.stat().st_size > 0:
+        return extracted
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        _run_ffmpeg(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(source),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "48000",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "64k",
+                str(extracted),
+            ],
+            what="ASR audio extraction",
+        )
+        deps.log(f"  [perception] extracted compressed ASR audio -> {extracted.name}")
+        # persist so the next run skips the extraction
+        with deps.sessions() as s:
+            row = s.get(MediaAssetRow, asset_id)
+            if row is not None:
+                row.r2_audio_key = str(extracted)
+                s.commit()
+        return extracted
+    except Exception as e:  # noqa: BLE001 — ASR can still ride the raw source
+        deps.log(f"  [perception] compressed audio extraction failed ({e}) — raw source rides")
+        return source
+
+
 def stage_perception(asset_id: str, source: Path, project_id: str, deps: PipelineDeps) -> dict:
     """Transcribe once; the persisted transcript makes re-runs free (crash resume)."""
     with deps.sessions() as s:
@@ -235,7 +294,10 @@ def stage_perception(asset_id: str, source: Path, project_id: str, deps: Pipelin
 
     if deps.transcribe is None:
         raise PipelineError("no transcribe callable provided (Gladia not configured?)")
-    transcript = deps.transcribe(source, asset_id)
+    asr_media = _asr_input_path(asset_id, source, project_id, deps)
+    mib = asr_media.stat().st_size / (1024 * 1024)
+    deps.log(f"  [perception] ASR input: {asr_media.name} ({mib:.1f} MiB)")
+    transcript = deps.transcribe(asr_media, asset_id)
     payload = transcript.model_dump(mode="json")
 
     with deps.sessions() as s:
@@ -2305,25 +2367,25 @@ def run_pipeline(
     job_id: str | None = None,
     *,
     force_replan: bool = False,
+    custom_headers: dict[str, str] | None = None,
 ) -> PipelineResult:
     """Full autonomous run; safe to re-invoke after a crash at any stage.
 
-    `source` may be a local path or an http(s) URL — URLs are downloaded first
-    through the guardrail UA layer (`core.http.download`), and the pipeline
-    proceeds against the local copy exactly as with a file.
+    `source` may be a local path or an http(s) URL — URLs are downloaded
+    through the guardrail UA layer (`core.http.download`) INSIDE the tracked
+    failure scope below, so a dead download records WHERE the job died
+    instead of leaving a zombie running job. `custom_headers` rides on top
+    of the mandatory identity headers (cookies / referer for FOIA portals).
 
     `force_replan=True` invalidates the planning shortcut (a refreshed
     CaseDossier re-runs Stage 6+ without re-downloading the video or
     re-running Stage 3 ASR — the transcript short-circuit stays intact).
     """
-    if isinstance(source, str) and source.startswith(("http://", "https://")):
-        name = Path(source.split("?")[0]).name or "ingest.bin"
-        dest = deps.settings.ingest_dir / name
-        deps.log(f"[pipeline] downloading source with UA guardrail -> {dest.name}")
-        source = download(source, dest)
-    source = Path(source).resolve()
-    if not source.exists():
-        raise PipelineError(f"source missing: {source}")
+    source_is_url = isinstance(source, str) and source.startswith(("http://", "https://"))
+    if not source_is_url:
+        source = Path(source).resolve()
+        if not source.exists():
+            raise PipelineError(f"source missing: {source}")
 
     with deps.sessions() as s:
         if s.get(ProjectRow, project_id) is None:
@@ -2346,6 +2408,44 @@ def run_pipeline(
         deps.log = tracker.log
 
     try:
+        if source_is_url:
+            # The download lives INSIDE the failure contract: a dead URL used
+            # to raise before the tracker existed and the job row never
+            # learned about it (zombie "running" job, Run clicks said nothing).
+            # As a tracked step it also streams byte progress to the console.
+            name = Path(str(source).split("?")[0]).name or "ingest.bin"
+            dest = deps.settings.ingest_dir / name
+            deps.log(f"[pipeline] downloading source with UA guardrail -> {dest.name}")
+            last_mib = {"v": -8}
+
+            with tracker.step("ingest", f"Download source — {name}") as st:
+
+                def _dl_progress(received: int, total: int | None) -> None:
+                    mib = received >> 20
+                    if total:
+                        st.pct(
+                            5.0 + 85.0 * (received / total),
+                            f"downloading {mib} / {total >> 20} MiB",
+                        )
+                    elif mib >= last_mib["v"] + 8:
+                        last_mib["v"] = mib
+                        st.pct(5.0, f"downloading {mib} MiB")
+
+                source = download(
+                    str(source),
+                    dest,
+                    extra_headers=custom_headers or None,
+                    progress_cb=_dl_progress,
+                )
+                st.pct(95, "download complete")
+        # one unconditional rebind: after the tracked download (URL case) or
+        # the resolve above (local-file case) the source is ALWAYS a local
+        # file — mypy cannot narrow through the source_is_url flag, and the
+        # eight stage calls below need the plain Path
+        source = Path(source).resolve()
+        if not source.exists():
+            raise PipelineError(f"source missing: {source}")
+
         tracker.stage(JobStage.ingest.value, 5.0)
         with tracker.step("ingest", "Ingest source — probe + 480p proxy bundle") as st:
             st.pct(15, "probing source")
@@ -2705,7 +2805,9 @@ def make_deps(
 
 
 def production_transcribe(
-    settings: Settings | None = None, sessions: Any = None
+    settings: Settings | None = None,
+    sessions: Any = None,
+    log: Callable[[str], None] | None = None,
 ) -> Callable[[Path, str], Any] | None:
     """Gladia transcriber when GLADIA_API_KEY is configured, else None.
 
@@ -2716,19 +2818,20 @@ def production_transcribe(
     With `sessions` (the pipeline's own sessionmaker) the client is wrapped in
     the content-addressed ASR cache: identical media is NEVER re-uploaded —
     a retry adopts the transcription Gladia already has, or serves the stored
-    payload outright.
+    payload outright. `log` streams upload/poll progress into the Studio
+    console (the old silent 15-minute transcription read as a hang).
     """
     resolved = settings or get_settings()
     if not resolved.gladia_api_key:
         return None
     from director_os.perception.gladia import GladiaClient
 
-    client = GladiaClient(resolved.gladia_api_key)
+    client = GladiaClient(resolved.gladia_api_key, log=log)
     if sessions is None:
         return client.transcribe
     from director_os.perception.asr_cache import CachedTranscriber
 
-    return CachedTranscriber(client, sessions).transcribe
+    return CachedTranscriber(client, sessions, log=log).transcribe
 
 
 def advance_job(
@@ -2738,6 +2841,7 @@ def advance_job(
     database_url: str,
     *,
     force_replan: bool = False,
+    custom_headers: dict[str, str] | None = None,
 ) -> dict:
     """Fleet entrypoint: resume/advance one pipeline job (crash-safe by design).
 
@@ -2751,11 +2855,23 @@ def advance_job(
     # died at perception with "Gladia not configured" even with a saved key).
     deps = make_deps(database_url)
     if deps.transcribe is None:
-        deps.transcribe = production_transcribe(deps.settings, deps.sessions)
+        # lazy lookup on purpose: run_pipeline rebinds deps.log to the job's
+        # RunTracker after this point — the lambda must resolve the attribute
+        # per call or the Gladia progress lines bypass job_logs + SSE
+        deps.transcribe = production_transcribe(
+            deps.settings, deps.sessions, log=lambda msg: deps.log(msg)
+        )
     # source stays a str: run_pipeline detects http(s) URLs and downloads
     # through the guardrail UA layer — Path()-wrapping here would turn a URL
     # into a bogus relative path and kill URL ingest on the fleet path.
-    result = run_pipeline(source, project_id, deps, job_id=job_id, force_replan=force_replan)
+    result = run_pipeline(
+        source,
+        project_id,
+        deps,
+        job_id=job_id,
+        force_replan=force_replan,
+        custom_headers=custom_headers,
+    )
     return {
         "job_id": result.job_id,
         "final": str(result.final_path),
