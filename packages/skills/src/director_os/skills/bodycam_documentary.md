@@ -61,6 +61,13 @@ BY WORD COUNT and set `dur_s` = words / 2.6:
   (author consecutive narration blocks with different `broll_source_start_s` moments),
   a subtle slow zoom, or an `evidence_fact` / `location_intro` / `map_route` /
   `case_outcome` card.
+- **A1 audio trim (`timeline.trim_audio`)**: the audio track's own trim. It cuts
+  INSIDE the synthesized TTS stem — a vo window `[vo_in_s, vo_out_s]` — and never
+  moves the b-roll window. Use it to shave leading dead air (~0.3-0.6s) or a
+  trailing tail after a re-authored script; the block re-sizes to the window +
+  breathing pad on the next render. The 0.5s floor is a law: never trim a block
+  below one intelligible phrase (one word ~ 0.3s at +5% speed). Raw clips keep
+  their source audio — trim their SOURCE windows with `timeline.trim_clip` instead.
 
 ## Legal & tone precision
 
