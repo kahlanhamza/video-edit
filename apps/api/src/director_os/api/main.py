@@ -6,6 +6,7 @@ M2 adds SSE job progress, agent tool dispatch endpoints and the Human Review Gat
 
 from __future__ import annotations
 
+import contextlib
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -14,6 +15,7 @@ from director_os.agent_runtime.agents import AgentRole, PlannerExecutor, ToolSte
 from director_os.agent_runtime.checkpoint import CheckpointStore
 from director_os.agent_runtime.editing_tools import DirectorToolbox, build_director_registry
 from director_os.agent_runtime.llm import LLMBackendError, build_backend_chain
+from director_os.agent_runtime.ops_tools import register_ops_tools
 from director_os.api.channels import ChannelPublisher, MultiChannelPublisher
 from director_os.api.events import (
     DEFAULT_LIVE_MAX_S,
@@ -24,6 +26,7 @@ from director_os.api.events import (
     job_progress_stream,
     require_job,
 )
+from director_os.api.ops_api import router as ops_router
 from director_os.api.youtube import (
     Chapter,
     DraftMetadata,
@@ -58,6 +61,7 @@ from director_os.core.db import (
 )
 from director_os.core.http import download
 from director_os.core.models import ProjectStatus
+from director_os.core.ops import OpsStore
 from fastapi import FastAPI, File, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -71,6 +75,9 @@ app = FastAPI(
     version="0.2.0",
     description="Autonomous multimodal video editing platform — gateway",
 )
+
+# Op log v1: the everything-is-an-op atom surface (CRUD + fold + SSE stream)
+app.include_router(ops_router)
 
 # Director Studio (M3) talks to this gateway from the browser in dev
 app.add_middleware(
@@ -729,6 +736,7 @@ def agent_dispatch(project_id: str, body: AgentDispatchRequest) -> AgentDispatch
     timeline = store.load_version(project_id, active)
     toolbox = DirectorToolbox(timeline, project_id)
     registry = build_director_registry(toolbox)
+    register_ops_tools(registry, OpsStore(factory, project_id), project_id)
     executor = PlannerExecutor(registry, store, project_id, agent="director_agent", role="director")
     run = executor.execute_plan(
         [ToolStep(tool=body.tool, args=body.args, checkpoint_note=body.checkpoint_note)],
@@ -817,6 +825,7 @@ def agent_plan(project_id: str, body: AgentPlanRequest | None = None) -> AgentPl
     timeline = store.load_version(project_id, active)
     toolbox = DirectorToolbox(timeline, project_id)
     registry = build_director_registry(toolbox)
+    register_ops_tools(registry, OpsStore(factory, project_id), project_id)
     try:
         backend = build_backend_chain(registry, body.niche)
     except LLMBackendError as e:
@@ -1185,7 +1194,12 @@ def get_subtitles(project_id: str) -> list[CueOut]:
 
 @app.patch("/projects/{project_id}/subtitles/{cue_index}", response_model=CueOut)
 def edit_subtitle(project_id: str, cue_index: int, body: CueEditRequest) -> CueOut:
-    """Proofread one cue — difflib word re-alignment (guardrail 5), artifacts rebuilt."""
+    """Proofread one cue — difflib word re-alignment (guardrail 5), artifacts rebuilt.
+
+    The edit ALSO lands as a caption op on the op log (origin=human) so the
+    timeline's history shows who changed what, and undo-by-revoke works."""
+    from director_os.core.ops import OpCreate
+    from director_os.core.ops import OpsStore as _OpsStore
     from director_os.subtitles.store import SubtitleStoreError, edit_cue
 
     s = session()
@@ -1199,6 +1213,25 @@ def edit_subtitle(project_id: str, cue_index: int, body: CueEditRequest) -> CueO
         raise HTTPException(
             status_code=404 if "out of range" in detail else 422, detail=detail
         ) from e
+    if _session_factory is not None:
+        # The cue edit succeeded; the op log is additive — never fail the edit
+        # because history recording hiccuped.
+        with contextlib.suppress(Exception):
+            _OpsStore(_session_factory, project_id).create(
+                OpCreate(
+                    kind="caption",
+                    track="CAPTIONS",
+                    params={
+                        "cue_index": cue_index,
+                        "text": beat.text,
+                        "speaker": beat.speaker,
+                        "start_ms": beat.start_ms,
+                        "end_ms": beat.end_ms,
+                    },
+                    origin="human",
+                    evidence={"source": "subtitle_grid_edit"},
+                )
+            )
     return CueOut(
         index=cue_index,
         text=beat.text,

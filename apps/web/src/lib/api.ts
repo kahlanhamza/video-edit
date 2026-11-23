@@ -77,6 +77,9 @@ export interface NleCaption {
 
 export interface NleEffect {
   id: string;
+  op_id: string | null;
+  op_rev: number | null;
+  kind?: string;
   x: number;
   y: number;
   w: number;
@@ -86,7 +89,11 @@ export interface NleEffect {
   mode: string;
   t_start_s: number | null;
   t_end_s: number | null;
+  frame_start?: number | null;
+  frame_end?: number | null;
   created_by: string;
+  /** "agent" | "human" | "legacy" — op provenance for the timeline badge. */
+  origin?: string;
 }
 
 export interface NleAsset {
@@ -106,6 +113,45 @@ export interface NleTimeline {
   clips: NleClip[];
   captions: NleCaption[];
   effects: NleEffect[];
+  /** Op log cursor + counts (op log v1): the fold the timeline renders. */
+  ops_rev?: number;
+  ops_counts?: { active: number; revoked: number };
+  caption_overrides?: Record<string, Record<string, unknown>>;
+}
+
+// --- op log v1: everything-is-an-op ---
+export interface OpRecord {
+  rev: number;
+  id: string;
+  project_id: string;
+  asset_id: string;
+  kind: string;
+  frame_start: number | null;
+  frame_end: number | null;
+  track: string;
+  params: Record<string, unknown>;
+  origin: "agent" | "human";
+  evidence: Record<string, unknown>;
+  session_id: string;
+  revokes_op_id: string | null;
+  revoked: boolean;
+  created_at: string;
+}
+
+export interface OpsState {
+  project_id: string;
+  rev: number;
+  active_ops: number;
+  revoked_ops: number;
+  ops: OpRecord[];
+  fold: {
+    rev: number;
+    active_ops: number;
+    revoked_ops: number;
+    effects: NleEffect[];
+    caption_overrides: Record<string, Record<string, unknown>>;
+    other: Array<Record<string, unknown>>;
+  };
 }
 
 export interface TimelineVersion {
@@ -379,6 +425,37 @@ export const api = {
     }),
   deleteRedaction: (id: string, regionId: string) =>
     req<void>(`/projects/${id}/redactions/${regionId}`, { method: "DELETE" }),
+  // --- op log v1: every edit is an op (agent or human); undo = revoke ---
+  listOps: (id: string) => req<OpsState>(`/projects/${id}/ops`),
+  createOp: (
+    id: string,
+    op: {
+      kind: string;
+      params?: Record<string, unknown>;
+      origin?: "agent" | "human";
+      evidence?: Record<string, unknown>;
+      frame_start?: number | null;
+      frame_end?: number | null;
+      track?: string;
+      note?: string;
+    },
+  ) =>
+    req<OpRecord>(`/projects/${id}/ops`, {
+      method: "POST",
+      body: JSON.stringify(op),
+    }),
+  revokeOp: (id: string, opId: string, note = "") =>
+    req<OpRecord>(`/projects/${id}/ops/${opId}/revoke`, {
+      method: "POST",
+      body: JSON.stringify({ note }),
+    }),
+  importLegacyOps: (id: string) =>
+    req<{ imported: number; skipped: number; total_regions: number }>(
+      `/projects/${id}/ops/import-legacy`,
+      { method: "POST" },
+    ),
+  opsStreamUrl: (id: string, since = 0) =>
+    `${API_BASE}/projects/${id}/ops/stream?since=${since}`,
   // --- WS4: multi-source case ingest + CaseDossier
   listSources: (id: string) => req<CaseSourceOut[]>(`/projects/${id}/sources`),
   addSource: (id: string, body: AddSourceIn) =>

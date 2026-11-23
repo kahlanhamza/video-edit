@@ -21,6 +21,7 @@ from director_os.agent_runtime.editing_tools import (
     ToolOperationError,
     build_director_registry,
 )
+from director_os.agent_runtime.ops_tools import register_ops_tools
 from director_os.agent_runtime.registry import (
     ToolCall,
     ToolDispatchError,
@@ -46,5 +47,6 @@ __all__ = [
     "ToolSpec",
     "ToolStep",
     "build_director_registry",
+    "register_ops_tools",
     "register_workshop_tools",
 ]

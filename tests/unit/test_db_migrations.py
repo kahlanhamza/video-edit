@@ -73,4 +73,6 @@ def test_alembic_upgrade_head(tmp_path, monkeypatch):
         "segment_cache",
         "agent_tool_logs",
         "jobs",
+        "asr_cache",
+        "timeline_ops",
     } <= tables

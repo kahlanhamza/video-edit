@@ -5,6 +5,10 @@ active OTIO version's clips (video + card overlays + narration audio), the
 caption cue store, the redaction regions (static boxes + tracked windows),
 and the source asset facts. The Studio refetches this whenever a `timeline`
 SSE event fires, so agent-driven cuts appear live.
+
+Op log v1: effect boxes come from the op fold (ops win over legacy regions
+via `params.legacy_region_id`), plus `ops_rev`/`ops_counts` so the Studio
+can show op provenance and react to op-stream events without a job running.
 """
 
 from __future__ import annotations
@@ -13,7 +17,14 @@ import json
 from pathlib import Path
 from typing import Any
 
-from director_os.core.db import MediaAssetRow, PerceptionIndexRow, ProjectRow, TimelineVersionRow
+from director_os.core.db import (
+    MediaAssetRow,
+    PerceptionIndexRow,
+    ProjectRow,
+    TimelineOpRow,
+    TimelineVersionRow,
+)
+from director_os.core.ops import fold_ops, records_from_rows
 from director_os.otio_engine.contract import meta_kind
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
@@ -49,9 +60,17 @@ def build_nle_snapshot(sessions: sessionmaker, project_id: str, output_dir: Path
             .limit(1)
         ).scalar_one_or_none()
         regions: list[dict[str, Any]] = []
+        op_rows: list[Any] = []
         if asset is not None:
             prow = s.get(PerceptionIndexRow, asset.id)
             regions = list((prow.redaction_tracks_json or {}).get("regions", []) if prow else [])
+            op_rows = list(
+                s.execute(
+                    select(TimelineOpRow)
+                    .where(TimelineOpRow.project_id == project_id)
+                    .order_by(TimelineOpRow.rev)
+                ).scalars()
+            )
         otio_json = dict(version_row.otio_json) if version_row else None
         version = version_row.version_num if version_row else None
         asset_facts = (
@@ -76,6 +95,8 @@ def build_nle_snapshot(sessions: sessionmaker, project_id: str, output_dir: Path
         duration = max(duration, c["end_s"])
     for cue in captions:
         duration = max(duration, cue["end_ms"] / 1000.0)
+    op_records = records_from_rows(op_rows)
+    fold = fold_ops(op_records, regions)
     return {
         "project_id": project_id,
         "version": version,
@@ -83,22 +104,10 @@ def build_nle_snapshot(sessions: sessionmaker, project_id: str, output_dir: Path
         "asset": asset_facts,
         "clips": clips,
         "captions": captions,
-        "effects": [
-            {
-                "id": str(r.get("id", "")),
-                "x": int(r.get("x", 0)),
-                "y": int(r.get("y", 0)),
-                "w": int(r.get("w", 0)),
-                "h": int(r.get("h", 0)),
-                "sigma": int(r.get("sigma", 24)),
-                "label": str(r.get("label", "")),
-                "mode": str(r.get("mode", "static")),
-                "t_start_s": r.get("t_start_s"),
-                "t_end_s": r.get("t_end_s"),
-                "created_by": str(r.get("created_by", "")),
-            }
-            for r in regions
-        ],
+        "effects": fold.effects,
+        "ops_rev": fold.rev,
+        "ops_counts": {"active": fold.active_ops, "revoked": fold.revoked_ops},
+        "caption_overrides": fold.caption_overrides,
     }
 
 

@@ -672,6 +672,7 @@ function EffectTrack({
         const start = fx.t_start_s ?? 0;
         const end = fx.t_end_s ?? duration;
         const w = Math.max(6, (end - start) * zoom);
+        const agent = fx.origin === "agent";
         return (
           <div
             key={fx.id}
@@ -682,18 +683,28 @@ function EffectTrack({
               top: 2,
               bottom: 2,
               background: "var(--clip-fx)",
+              outline: agent ? "1px dashed rgba(255,255,255,0.55)" : undefined,
+              outlineOffset: -1,
             }}
-            title={`${fx.label || "blur"} · ${fx.mode}${fx.t_start_s != null ? ` · ${start.toFixed(1)}s–${end.toFixed(1)}s` : " · full length"} · box ${fx.w}x${fx.h}@${fx.x},${fx.y}`}
+            title={`${fx.label || "blur"} · ${fx.mode}${agent ? " · agent op" : ""}${fx.t_start_s != null ? ` · ${start.toFixed(1)}s–${end.toFixed(1)}s` : " · full length"} · box ${fx.w}x${fx.h}@${fx.x},${fx.y}`}
             onClick={() => onSeek(start)}
           >
             <div className="absolute inset-0 flex items-center gap-1 px-1.5">
               <span className="truncate text-[9px] leading-none text-white/90">
                 {fx.label || "blur"} · {fx.mode}
               </span>
-              {onDelete && fx.created_by === "human_edit" && (
+              {agent && (
+                <span
+                  className="shrink-0 rounded bg-black/45 px-1 text-[8px] font-semibold uppercase tracking-wider leading-[1.4] text-white/85"
+                  title="applied by the agent — every op is on the log with its evidence"
+                >
+                  AI
+                </span>
+              )}
+              {onDelete && (fx.op_id || fx.created_by === "human_edit") && (
                 <button
                   className="ml-auto hidden shrink-0 rounded bg-black/40 px-1 text-[9px] leading-none text-white/80 hover:bg-[var(--err)] hover:text-white group-hover:block"
-                  title="delete this studio-drawn box"
+                  title={fx.op_id ? "revoke this op (history kept)" : "delete this studio-drawn box"}
                   onClick={(e) => {
                     e.stopPropagation();
                     onDelete(fx.id);

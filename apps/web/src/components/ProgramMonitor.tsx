@@ -13,7 +13,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { Asset, Redaction, api, assetProxyUrl, assetScrubUrl } from "@/lib/api";
+import { Asset, NleEffect, api, assetProxyUrl, assetScrubUrl } from "@/lib/api";
 import { formatTimecodeFrames, scrubBackground, scrubFrameCount, scrubFrameIndex } from "@/lib/nle";
 import { useNLEShortcuts } from "@/hooks/useNLEShortcuts";
 import { Icon } from "./studio/icons";
@@ -42,7 +42,7 @@ export const ProgramMonitor = forwardRef<
   { projectId, asset, fps, onTimeUpdate, onChanged },
   ref,
 ) {
-  const [regions, setRegions] = useState<Redaction[]>([]);
+  const [regions, setRegions] = useState<NleEffect[]>([]);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showExisting, setShowExisting] = useState(true);
@@ -68,7 +68,10 @@ export const ProgramMonitor = forwardRef<
 
   const reload = useCallback(async () => {
     try {
-      setRegions(await api.listRedactions(projectId));
+      // The op fold merges op-backed blur boxes with legacy regions — one
+      // source of truth for what the program actually blurs (op log v1).
+      const state = await api.listOps(projectId);
+      setRegions(state.fold.effects);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -108,11 +111,19 @@ export const ProgramMonitor = forwardRef<
     const sx = asset.width / rect.width;
     const sy = asset.height / rect.height;
     try {
-      await api.addRedaction(projectId, {
-        x: Math.round(Math.min(draft.x0, draft.x1) * sx),
-        y: Math.round(Math.min(draft.y0, draft.y1) * sy),
-        w: Math.max(1, Math.round(dx * sx)),
-        h: Math.max(1, Math.round(dy * sy)),
+      // A drawn box is an OP (origin=human) — the log keeps who drew what;
+      // the API dual-writes the render-path region automatically.
+      await api.createOp(projectId, {
+        kind: "blur",
+        origin: "human",
+        evidence: { source: "program_monitor_draw" },
+        params: {
+          x: Math.round(Math.min(draft.x0, draft.x1) * sx),
+          y: Math.round(Math.min(draft.y0, draft.y1) * sy),
+          w: Math.max(1, Math.round(dx * sx)),
+          h: Math.max(1, Math.round(dy * sy)),
+          sigma: 24,
+        },
       });
       await reload();
       onChanged();
@@ -121,9 +132,13 @@ export const ProgramMonitor = forwardRef<
     }
   }
 
-  async function removeRegion(id: string) {
+  async function removeRegion(r: NleEffect) {
     try {
-      await api.deleteRedaction(projectId, id);
+      if (r.op_id) {
+        await api.revokeOp(projectId, r.op_id, "removed from the program monitor");
+      } else {
+        await api.deleteRedaction(projectId, r.id);
+      }
       await reload();
       onChanged();
     } catch (e) {
@@ -164,7 +179,9 @@ export const ProgramMonitor = forwardRef<
         >
           <Icon name={showExisting ? "eye" : "eyeOff"} />
         </button>
-        <span className="chip" title="studio-drawn blur boxes">blur boxes: {regions.length}</span>
+        <span className="chip" title="blur boxes on the op log (agent + human)">
+          blur boxes: {regions.length}
+        </span>
       </div>
 
       {/* ---- video surface ---- */}
@@ -241,14 +258,16 @@ export const ProgramMonitor = forwardRef<
             regions.map((r) => (
               <div
                 key={r.id}
-                className="pointer-events-none absolute border border-[var(--err)] bg-[rgba(241,109,109,0.14)]"
+                className="pointer-events-none absolute border bg-[rgba(241,109,109,0.14)]"
                 style={{
                   left: r.x * scaleX,
                   top: r.y * scaleY,
                   width: r.w * scaleX,
                   height: r.h * scaleY,
+                  borderStyle: r.origin === "agent" ? "dashed" : "solid",
+                  borderColor: "var(--err)",
                 }}
-                title={`${r.label || "blur"} ${r.w}x${r.h}@${r.x},${r.y}`}
+                title={`${r.label || "blur"} ${r.w}x${r.h}@${r.x},${r.y} · ${r.origin ?? "legacy"}`}
               />
             ))}
           {draft && (
@@ -341,11 +360,16 @@ export const ProgramMonitor = forwardRef<
             >
               <span className="tcode text-[11px] text-[var(--tx-2)]">
                 {r.label || "blur"} · {r.w}×{r.h} @ {r.x},{r.y}
+                {r.origin === "agent" && (
+                  <span className="ml-1.5 rounded bg-[var(--acc-bg)] px-1 text-[9px] uppercase tracking-wider text-[var(--acc)]">
+                    agent
+                  </span>
+                )}
               </span>
               <button
                 className="icon-btn !h-5 !w-5 opacity-0 group-hover:opacity-100"
-                title="delete blur box"
-                onClick={() => removeRegion(r.id)}
+                title="remove blur box (op-backed boxes are revoked — history kept)"
+                onClick={() => removeRegion(r)}
               >
                 <Icon name="trash" size={12} />
               </button>

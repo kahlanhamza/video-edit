@@ -173,7 +173,7 @@ only when a user opts in.
 | Frame server | **(shipped)** `core/frames.py`, `GET /assets/{id}/frame`, agent tool `frame.grab` (`inspection_tools.py`) |
 | Proxy bundle (480p + scrub sheet + audio) | `core/proxy.py`, built at ingest |
 | Perception index (grounding) | `perception_index` row: transcript words/speakers, shots, audio events, vision insights, redaction tracks |
-| Agent tool registry (31→32 typed tools) | `agent_runtime/registry.py` + `editing_tools` / `inspection_tools` / `workshop_tools` / `critic` |
+| Agent tool registry (32→35 typed tools: ops.list / ops.propose / ops.revoke) | `agent_runtime/registry.py` + `editing_tools` / `inspection_tools` / `workshop_tools` / `ops_tools` / `critic` |
 | Plan-and-execute session + checkpoints | `agent_runtime/director_session.py`, `checkpoint.py`, `session_memory.py` |
 | Live observability (per-step bars, console) | `worker/progress.py` `RunTracker`, `api/events.py` SSE, `useLiveJob` |
 | Segment cache (content-addressed partial renders) | `otio_engine/segment_cache.py` |
@@ -237,9 +237,12 @@ Design rules (all inherited from verified research + our own live sessions):
 ## 4. Roadmap (ordered, each step independently shippable)
 
 1. **Frame server + agent eye** — *done in this push.*
-2. **Op log v1**: `timeline_ops` table + CRUD API + reducer fold; migrate blur
-   regions and caption edits onto it; SSE pushes op events; Studio timeline
-   renders from the fold (it already re-renders on revision events).
+2. **Op log v1** — *shipped:* `timeline_ops` table (migration 0007) + CRUD
+   API + reducer fold (`core/ops.py`); blur regions dual-write/import onto it
+   and caption PATCH edits record caption ops; SSE `ops/stream` pushes every
+   row (undo rides the feed as a revoke tombstone); the NLE snapshot renders
+   effects from the fold (ops supersede legacy by id — never double-render);
+   Studio draws boxes as ops and shows the agent origin badge live.
 3. **SAM 2 selection service**: local ONNX, box/click prompt on frame X →
    tracked mask; `selection.track` agent tool; blur op consumes mask instead
    of a static bbox. YuNet/YOLO path remains the CPU fallback.

@@ -23,6 +23,7 @@ import { Icon, IconName } from "@/components/studio/icons";
 import PipelinePanel from "@/components/studio/PipelinePanel";
 import Timeline from "@/components/studio/Timeline";
 import { useLiveJob } from "@/hooks/useLiveJob";
+import { useOpsStream } from "@/hooks/useOpsStream";
 import {
   api,
   Asset,
@@ -289,6 +290,10 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     onTimelineRevision,
   );
 
+  // op log v1: agent ops (and human ops from other tabs) land live — one
+  // debounced refetch per burst, no job required.
+  useOpsStream(id, reloadNle);
+
   const prevDoneRef = useRef(false);
   useEffect(() => {
     if (live.done && !prevDoneRef.current) {
@@ -440,7 +445,12 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     if (!id) return;
     setEditBusy(true);
     try {
-      await api.deleteRedaction(id, effectId);
+      const fx = nle?.effects.find((e) => e.id === effectId);
+      if (fx?.op_id) {
+        await api.revokeOp(id, fx.op_id, "removed from the studio timeline");
+      } else {
+        await api.deleteRedaction(id, effectId);
+      }
       await reloadNle();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

@@ -203,6 +203,36 @@ class CaseDossierRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class TimelineOpRow(Base):
+    """One edit op — the atom of the frame-level editor (op log v1).
+
+    Append-only: undo = `revoked_at` (never delete — the provenance trail the
+    bodycam-documentary niche legally requires). `rev` is the monotonic
+    cursor the SSE op stream and every client fold use. `evidence` carries
+    the frame ids / transcript windows that justified the op (evidence-before-
+    action law); `revokes_op_id` links explicit supersession.
+    """
+
+    __tablename__ = "timeline_ops"
+
+    rev: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    asset_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    kind: Mapped[str] = mapped_column(String(40))  # blur|inpaint|caption|zoom|...
+    frame_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    frame_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    track: Mapped[str] = mapped_column(String(60), default="V1_master")
+    params: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    origin: Mapped[str] = mapped_column(String(20), default="human")  # agent|human
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    note: Mapped[str] = mapped_column(String(1000), default="")
+    revokes_op_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class ASRCacheRow(Base):
     """Content-addressed external-ASR job cache — never upload the same bytes twice.
 
@@ -234,6 +264,7 @@ ALL_TABLES = (
     MediaAssetRow,
     PerceptionIndexRow,
     TimelineVersionRow,
+    TimelineOpRow,
     SegmentCacheRow,
     AgentToolLogRow,
     JobRow,
