@@ -85,6 +85,7 @@ services:
       R2_SECRET_ACCESS_KEY: directoros-secret
       R2_BUCKET: directoros
       OUTPUT_DIR: /app/output
+      SAM2_SERVICE_URL: ${SAM2_SERVICE_URL:-}
     ports:
       - "8000:8000"
     volumes:
@@ -124,6 +125,7 @@ services:
       R2_SECRET_ACCESS_KEY: directoros-secret
       R2_BUCKET: directoros
       OUTPUT_DIR: /app/output
+      SAM2_SERVICE_URL: ${SAM2_SERVICE_URL:-}
     volumes:
       - outputdata:/app/output
     healthcheck:
@@ -140,6 +142,32 @@ services:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
+
+  # SAM 2 local weight service (optional, gpu profile): promptable video
+  # segmentation for the Studio's click-to-track loop. Torch lives ONLY here
+  # (SKILL law); the checkpoint downloads once onto the sam2weights volume.
+  # Start it with: docker compose --profile gpu up -d --build sam2
+  sam2:
+    build:
+      context: ./gpu_services/sam2
+      dockerfile: Dockerfile
+    profiles: ["gpu"]
+    environment:
+      SAM2_WEIGHTS_DIR: /weights
+      SAM2_WEIGHTS_URL: ${SAM2_WEIGHTS_URL:-}
+      SAM2_WEIGHTS_SHA256: ${SAM2_WEIGHTS_SHA256:-}
+    ports:
+      - "8300:8300"
+    volumes:
+      - sam2weights:/weights
+      # the service reads the same output tree the api/worker write
+      - outputdata:/app/output:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8300/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
 
   # Director Studio web UI — same stack, same one command. The browser on
   # your machine talks to the API at http://localhost:8000 (compose maps it).
@@ -165,3 +193,4 @@ volumes:
   pgdata:
   miniodata:
   outputdata:
+  sam2weights:

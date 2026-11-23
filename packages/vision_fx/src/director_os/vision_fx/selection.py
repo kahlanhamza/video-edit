@@ -26,6 +26,7 @@ renderer, Studio monitor and FaceTracks already speak (one canvas law).
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -574,14 +575,89 @@ def select_from_tracks(
 # ------------------------------------------------------------------ backends
 
 
-class Sam2SelectionBackend:
-    """SAM 2 / EdgeTAM promptable video segmentation (OPTIONAL, env-gated).
+class Sam2ServiceBackend:
+    """SAM 2 over the local weight service (gpu_services/sam2, env-gated).
 
-    Meta's SAM 2 takes a click/box/mask prompt on ONE frame and a streaming
-    memory bank tracks the mask through the video (occlusion-tolerant);
-    EdgeTAM is the on-device variant (22x faster, Apache-2.0). Wired behind
-    `SELECTION_BACKEND=sam2` + the optional `ultralytics` extra + local
-    weights — never downloaded in CI, never a silent dependency.
+    The service boundary keeps torch OUT of the default path: the weight
+    service container owns the checkpoint (named volume, never re-downloaded)
+    and this port is a plain httpx call. `SAM2_SERVICE_URL=http://sam2:8300`
+    switches it on; the response maps 1:1 onto TrackedSelection hits (same
+    RAW-pixel boxes, same interpolation flags), so downstream blur/redaction
+    code cannot tell which backend produced the follow.
+    """
+
+    name = "sam2"
+
+    def __init__(self, base_url: str | None = None, transport: Any = None):
+        self.base_url = (base_url or os.getenv("SAM2_SERVICE_URL") or "").rstrip("/")
+        self._transport = transport  # tests inject httpx.MockTransport here
+
+    @staticmethod
+    def available() -> bool:
+        return bool(os.getenv("SAM2_SERVICE_URL", ""))
+
+    def track(
+        self,
+        video_path: str | Path,
+        prompt: SelectionPrompt,
+        *,
+        frame_start: int,
+        frame_end: int,
+        fps: float,
+        frame_w: int,
+        frame_h: int,
+        **kw: Any,
+    ) -> TrackedSelection:
+        if not self.base_url:
+            raise SelectionNotAvailable(
+                "sam2 service backend unavailable: set SAM2_SERVICE_URL "
+                "(docker compose --profile gpu up sam2) — ncc-cpu stays the default"
+            )
+        import httpx
+
+        payload = {
+            "video_path": str(video_path),
+            "prompt": prompt.model_dump(),
+            "frame_start": frame_start,
+            "frame_end": frame_end,
+            "fps": fps,
+            "frame_w": frame_w,
+            "frame_h": frame_h,
+        }
+        try:
+            if self._transport is not None:  # tests: httpx.MockTransport injection
+                with httpx.Client(transport=self._transport, timeout=600.0) as client:
+                    r = client.post(f"{self.base_url}/track", json=payload)
+            else:
+                r = httpx.post(f"{self.base_url}/track", json=payload, timeout=600.0)
+        except httpx.HTTPError as e:
+            raise SelectionNotAvailable(f"sam2 service unreachable: {e}") from e
+        if r.status_code == 503:
+            raise SelectionNotAvailable(f"sam2 service not ready: {r.json().get('detail')}")
+        if r.status_code == 404:
+            raise SelectionError(f"sam2 service cannot see the video: {r.json().get('detail')}")
+        if r.status_code != 200:
+            raise SelectionError(f"sam2 service failed ({r.status_code}): {r.text[:300]}")
+        data = r.json()
+        return TrackedSelection(
+            backend="sam2",
+            prompt=prompt.model_dump(),
+            anchor_frame=prompt.anchor_frame,
+            fps=fps,
+            frame_start=frame_start,
+            frame_end=frame_end,
+            frame_w=frame_w,
+            frame_h=frame_h,
+            hits=[TrackHit(**h) for h in data.get("hits", [])],
+            n_interpolated=int(data.get("n_interpolated", 0)),
+            mean_score=float(data.get("mean_score", 0.0)),
+        )
+
+
+class Sam2SelectionBackend:
+    """SAM 2 in-process (OPTIONAL, env-gated): needs the ultralytics extra
+    AND the checkpoint file. Prefer Sam2ServiceBackend in deployments —
+    this path exists for a beefy workstation that runs everything local.
     """
 
     name = "sam2"
@@ -599,18 +675,26 @@ class Sam2SelectionBackend:
                 "(uv sync --extra sam2) and set SELECTION_BACKEND=sam2; "
                 "the ncc-cpu backend is the always-available default"
             )
-        try:
-            from ultralytics.models.sam import SAM2VideoPredictor  # noqa: F401
-        except ImportError as e:
-            raise SelectionNotAvailable(f"sam2 backend import failed: {e}") from e
+        weights = os.getenv("SAM2_WEIGHTS", "")
+        if not weights or not Path(weights).exists():
+            raise SelectionNotAvailable(
+                "sam2 weights not configured locally (download sam2.1_hiera_tiny.pt and set "
+                "SAM2_WEIGHTS — or set SAM2_SERVICE_URL to use the weight service); "
+                "ncc-cpu covers selection until then"
+            )
         raise SelectionNotAvailable(
-            "sam2 weights not configured locally (download sam2.1_t.pt and set "
-            "SAM2_WEIGHTS); ncc-cpu covers selection until then"
+            "in-process SAM2 tracking lands with the ultralytics video-predictor "
+            "wiring (roadmap M4); the weight service backend (SAM2_SERVICE_URL) "
+            "is the supported path today"
         )
 
 
 def available_selection_backends() -> dict[str, bool]:
-    return {"ncc-cpu": True, "detector-assist": True, "sam2": Sam2SelectionBackend.available()}
+    return {
+        "ncc-cpu": True,
+        "detector-assist": True,
+        "sam2": Sam2ServiceBackend.available() or Sam2SelectionBackend.available(),
+    }
 
 
 def run_selection(
@@ -633,7 +717,10 @@ def run_selection(
     click was on a non-detected object — the template tracker still owns it).
     """
     if backend == "sam2":
-        return Sam2SelectionBackend().track(
+        chosen: Any = (
+            Sam2ServiceBackend() if Sam2ServiceBackend.available() else Sam2SelectionBackend()
+        )
+        return chosen.track(
             video_path,
             prompt,
             frame_start=frame_start,

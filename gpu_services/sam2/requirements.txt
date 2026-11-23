@@ -1,0 +1,12 @@
+# SAM2 weight service deps — ISOLATED from the repo's default path on purpose:
+# torch only ever exists inside this container (SKILL law: zero heavy SDKs in
+# the default render path; CI never installs this file).
+fastapi>=0.115
+uvicorn>=0.30
+pydantic>=2.7
+torch>=2.3
+torchvision>=0.18
+ultralytics>=8.3.50
+numpy>=1.26
+opencv-python-headless>=4.9
+httpx>=0.27
