@@ -206,6 +206,33 @@ def test_caption_edit_records_op(api_client, tmp_path, monkeypatch):
     del api_main  # imported for session side effects
 
 
+def test_caption_retime_records_window_op_and_validates_tape(api_client, tmp_path):
+    import director_os.api.main as api_main
+    from director_os.core.config import get_settings
+    from director_os.subtitles.ass_builder import CaptionBeat
+    from director_os.subtitles.store import save_cues
+
+    pid = _project(api_client, with_asset=True)  # 100 s tape
+    save_cues(
+        get_settings().output_dir / "pipeline" / pid,
+        [CaptionBeat(index=0, text="raw text", speaker="", start_ms=0, end_ms=900, words=[])],
+    )
+    ok = api_client.patch(f"/projects/{pid}/subtitles/0", json={"start_ms": 500, "end_ms": 2500})
+    assert ok.status_code == 200
+    body = ok.json()
+    assert body["start_ms"] == 500 and body["end_ms"] == 2500
+    state = api_client.get(f"/projects/{pid}/ops").json()
+    ov = state["fold"]["caption_overrides"]["0"]
+    assert ov["start_ms"] == 500 and ov["end_ms"] == 2500, "window rides the op"
+    late = api_client.patch(
+        f"/projects/{pid}/subtitles/0", json={"start_ms": 0, "end_ms": 1000 * 1000 + 1}
+    )
+    assert late.status_code == 422 and "beyond the tape" in late.json()["detail"]
+    half = api_client.patch(f"/projects/{pid}/subtitles/0", json={"start_ms": 700})
+    assert half.status_code == 422 and "together" in half.json()["detail"]
+    del api_main  # imported for session side effects
+
+
 # ---------------------------------------------------------------- adjust
 def test_adjust_supersedes_with_chain_and_keeps_coverage(api_client):
     pid = _project(api_client, with_asset=True)

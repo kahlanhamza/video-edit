@@ -89,6 +89,53 @@ def test_edit_cue_validates(tmp_path):
         edit_cue(base, 0, "   ")
 
 
+def test_edit_cue_retimes_window_and_words_ride_along(tmp_path):
+    """A timing nudge moves the WHOLE window — every word rescales linearly
+    into it, so the karaoke view stays in step with the cue."""
+    base = tmp_path / "sub"
+    _seed(base)
+    beat = edit_cue(base, 0, start_ms=500, end_ms=3600)  # text/speaker untouched
+    assert beat.start_ms == 500 and beat.end_ms == 3600
+    assert beat.text == "unit one contact"
+    assert len(beat.words) == 3
+    # words mapped 0..1800 -> 500..3600 (span 1800 -> 3100)
+    assert beat.words[0].start_ms == 500
+    assert beat.words[-1].end_ms == 3600
+    for a, b in zip(beat.words, beat.words[1:], strict=False):
+        assert b.start_ms >= a.start_ms
+    # text unchanged → no difflib pass, word COUNT preserved (3, not re-split)
+    # artifacts rebuilt with the new window
+    srt = (base / "subtitles.srt").read_text()
+    assert "00:00:00,500 --> 00:00:03,600" in srt
+
+
+def test_edit_cue_text_and_timing_together(tmp_path):
+    base = tmp_path / "sub"
+    _seed(base)
+    beat = edit_cue(base, 0, "roger moving up", start_ms=100, end_ms=1000)
+    assert beat.text == "roger moving up"
+    assert beat.start_ms == 100 and beat.end_ms == 1000
+    assert len(beat.words) >= 2
+    for w in beat.words:
+        assert w.start_ms >= 100 and w.end_ms <= 1000
+
+
+def test_edit_cue_timing_laws(tmp_path):
+    base = tmp_path / "sub"
+    _seed(base)
+    with pytest.raises(SubtitleStoreError, match="together"):
+        edit_cue(base, 0, start_ms=100)  # half a window is a lie
+    with pytest.raises(SubtitleStoreError, match="together"):
+        edit_cue(base, 0, end_ms=100)
+    with pytest.raises(SubtitleStoreError, match="before start"):
+        edit_cue(base, 0, start_ms=900, end_ms=100)
+    with pytest.raises(SubtitleStoreError, match="before start"):
+        edit_cue(base, 0, start_ms=900, end_ms=900)  # zero-length cue
+    # nothing was written by the failed attempts
+    cues = load_cues(base)
+    assert cues[0].start_ms == 0 and cues[0].end_ms == 1800
+
+
 # ------------------------------------------------------------------ studio API
 @pytest.fixture()
 def api_client(tmp_path, monkeypatch):

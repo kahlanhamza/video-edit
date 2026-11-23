@@ -16,8 +16,17 @@ function fmtMs(ms: number): string {
 interface RowState {
   text: string;
   speaker: string;
+  startMs: string;
+  endMs: string;
   saving: boolean;
   saved: boolean;
+}
+
+/** Timing text field parse: whole ms >= 0; empty string = untouched. */
+function parseMs(v: string): number | null {
+  const t = v.trim();
+  if (!/^\d+$/.test(t)) return null;
+  return Number(t);
 }
 
 export default function SubtitleGrid({
@@ -41,7 +50,14 @@ export default function SubtitleGrid({
         Object.fromEntries(
           list.map((c) => [
             c.index,
-            { text: c.text, speaker: c.speaker, saving: false, saved: false },
+            {
+              text: c.text,
+              speaker: c.speaker,
+              startMs: String(c.start_ms),
+              endMs: String(c.end_ms),
+              saving: false,
+              saved: false,
+            },
           ]),
         ),
       );
@@ -63,11 +79,38 @@ export default function SubtitleGrid({
   async function save(index: number) {
     const row = rows[index];
     if (!row?.text.trim()) return;
+    const startMs = parseMs(row.startMs);
+    const endMs = parseMs(row.endMs);
+    if (startMs === null || endMs === null) {
+      setError(`cue ${index}: timing must be whole milliseconds`);
+      return;
+    }
+    if (endMs <= startMs) {
+      setError(`cue ${index}: end must be after start (a zero-length cue is never valid)`);
+      return;
+    }
     updateLocal(index, { saving: true });
     try {
-      const updated = await api.editSubtitle(projectId, index, row.text.trim(), row.speaker);
+      const timing = { start_ms: startMs, end_ms: endMs };
+      const updated = await api.editSubtitle(
+        projectId,
+        index,
+        row.text.trim(),
+        row.speaker,
+        timing,
+      );
       setCues((cs) => cs.map((c) => (c.index === index ? updated : c)));
-      setRows((r) => ({ ...r, [index]: { text: updated.text, speaker: updated.speaker, saving: false, saved: true } }));
+      setRows((r) => ({
+        ...r,
+        [index]: {
+          text: updated.text,
+          speaker: updated.speaker,
+          startMs: String(updated.start_ms),
+          endMs: String(updated.end_ms),
+          saving: false,
+          saved: true,
+        },
+      }));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -88,7 +131,8 @@ export default function SubtitleGrid({
     <div className="space-y-2">
       <div className="flex items-center justify-between">
         <p className="text-[11px] text-[var(--tx-3)]">
-          {cues.length} cue(s) · word timings re-aligned on save (difflib, no drift)
+          {cues.length} cue(s) · text saves re-align word timings (difflib, no
+          drift) · timing saves move the whole window (words rescale)
         </p>
         <a className="btn-ghost !h-6 !px-2 !text-[11px]" href={srtDownloadUrl(projectId)} download>
           download .srt
@@ -109,18 +153,37 @@ export default function SubtitleGrid({
           <tbody>
             {cues.map((c) => {
               const row = rows[c.index];
-              const dirty = row && (row.text !== c.text || row.speaker !== c.speaker);
+              const dirty =
+                row &&
+                (row.text !== c.text ||
+                  row.speaker !== c.speaker ||
+                  row.startMs !== String(c.start_ms) ||
+                  row.endMs !== String(c.end_ms));
               return (
                 <tr key={c.index} className="border-t border-[var(--line-1)] align-top">
                   <td className="px-2 py-1 text-[var(--tx-3)]">{c.index}</td>
                   <td className="px-1 py-1">
                     <button
-                      className="tcode text-[10px] text-[var(--tx-3)] hover:text-[var(--acc)]"
+                      className="tcode mb-0.5 block text-[10px] text-[var(--tx-3)] hover:text-[var(--acc)]"
                       title="seek program monitor here"
                       onClick={() => onSeek?.(c.start_ms / 1000)}
                     >
                       {fmtMs(c.start_ms)}–{fmtMs(c.end_ms)}
                     </button>
+                    <span className="flex items-center gap-0.5">
+                      <input
+                        className="input !h-5 !w-14 !px-1 !text-[10px]"
+                        value={row?.startMs ?? String(c.start_ms)}
+                        title="cue start (ms) — saved with the row; word timings rescale into the new window"
+                        onChange={(e) => updateLocal(c.index, { startMs: e.target.value })}
+                      />
+                      <input
+                        className="input !h-5 !w-14 !px-1 !text-[10px]"
+                        value={row?.endMs ?? String(c.end_ms)}
+                        title="cue end (ms) — saved with the row; must be inside the tape"
+                        onChange={(e) => updateLocal(c.index, { endMs: e.target.value })}
+                      />
+                    </span>
                   </td>
                   <td className="px-1 py-1">
                     <input

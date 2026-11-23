@@ -57,43 +57,81 @@ def load_cues(base_dir: str | Path) -> list[CaptionBeat]:
     return beats
 
 
+def _rescale_words(
+    words: list[WordTiming],
+    old_start: int,
+    old_end: int,
+    new_start: int,
+    new_end: int,
+) -> list[WordTiming]:
+    """Linearly map word timings from the old cue window into the new one —
+    an editor's timing nudge moves every WORD with the cue, never just the
+    shell (the karaoke view must stay in step with the cue it belongs to)."""
+    span_old = max(1, old_end - old_start)
+    span_new = max(1, new_end - new_start)
+    out: list[WordTiming] = []
+    for w in words:
+        s = new_start + round((w.start_ms - old_start) * span_new / span_old)
+        e = new_start + round((w.end_ms - old_start) * span_new / span_old)
+        out.append(
+            WordTiming(word=w.word, start_ms=max(new_start, s), end_ms=max(new_start + 1, e))
+        )
+    return out
+
+
 def edit_cue(
     base_dir: str | Path,
     index: int,
-    text: str,
+    text: str | None = None,
     speaker: str | None = None,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
 ) -> CaptionBeat:
     """Proofread one cue: difflib re-alignment against its raw word timings.
 
     Word count may change freely — equal blocks keep raw timings, replacements
     split the original span by word length, inserts interpolate between
-    neighbors (see `subtitles.align`). The cue keeps its absolute slot.
+    neighbors (see `subtitles.align`). The cue keeps its absolute slot unless
+    an explicit `start_ms`/`end_ms` (set TOGETHER — a half window is a lie)
+    moves it; word timings then rescale linearly into the new window.
     """
     beats = load_cues(base_dir)
     if not 0 <= index < len(beats):
         raise SubtitleStoreError(f"cue index out of range: {index} (n={len(beats)})")
     beat = beats[index]
-    new_text = " ".join(text.split())
+    if (start_ms is None) != (end_ms is None):
+        raise SubtitleStoreError("start_ms and end_ms must be set together (or both omitted)")
+    if start_ms is not None and end_ms is not None and end_ms <= start_ms:
+        raise SubtitleStoreError(f"cue end {end_ms}ms before start {start_ms}ms")
+
+    new_text = " ".join(text.split()) if text is not None else beat.text
     if not new_text:
         raise SubtitleStoreError("cue text cannot be empty")
 
     raw = [RawWord(word=w.word, start_ms=w.start_ms, end_ms=w.end_ms) for w in beat.words]
-    if raw:
+    if raw and new_text != beat.text:
         aligned = align_words(new_text, raw)
         words = [WordTiming(word=w.word, start_ms=w.start_ms, end_ms=w.end_ms) for w in aligned]
     else:
-        words = []
-    # keep the cue inside its original slot even after heavy rewrites
-    if words:
-        end_ms = max(w.end_ms for w in words) if new_text != beat.text else beat.end_ms
-        end_ms = max(end_ms, beat.start_ms + 1)
+        words = [WordTiming(word=w.word, start_ms=w.start_ms, end_ms=w.end_ms) for w in beat.words]
+
+    timing_changed = start_ms is not None and (start_ms != beat.start_ms or end_ms != beat.end_ms)
+    if timing_changed and start_ms is not None and end_ms is not None:
+        # explicit editor window wins — the words ride along, rescaled
+        new_start, new_end = start_ms, end_ms
+        words = _rescale_words(words, beat.start_ms, beat.end_ms, new_start, new_end)
+    elif raw and new_text != beat.text:
+        # keep the cue inside its original slot even after heavy rewrites
+        new_start = beat.start_ms
+        end_ms = max(w.end_ms for w in words) if words else beat.end_ms
+        new_end = max(end_ms, beat.start_ms + 1)
     else:
-        end_ms = beat.end_ms
+        new_start, new_end = beat.start_ms, beat.end_ms
 
     new_beat = CaptionBeat(
         text=new_text,
-        start_ms=beat.start_ms,
-        end_ms=end_ms,
+        start_ms=new_start,
+        end_ms=new_end,
         speaker=speaker if speaker is not None else beat.speaker,
         words=words,
     )

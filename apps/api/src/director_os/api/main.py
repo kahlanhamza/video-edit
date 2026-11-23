@@ -1346,8 +1346,10 @@ class CueOut(BaseModel):
 
 
 class CueEditRequest(BaseModel):
-    text: str = Field(min_length=1, max_length=2000)
+    text: str | None = Field(default=None, min_length=1, max_length=2000)
     speaker: str | None = Field(default=None, min_length=1, max_length=80)
+    start_ms: int | None = Field(default=None, ge=0)
+    end_ms: int | None = Field(default=None, ge=0)
 
 
 def _subtitle_dir(project_id: str) -> Path:
@@ -1376,7 +1378,9 @@ def get_subtitles(project_id: str) -> list[CueOut]:
 
 @app.patch("/projects/{project_id}/subtitles/{cue_index}", response_model=CueOut)
 def edit_subtitle(project_id: str, cue_index: int, body: CueEditRequest) -> CueOut:
-    """Proofread one cue — difflib word re-alignment (guardrail 5), artifacts rebuilt.
+    """Proofread / retime one cue — difflib word re-alignment (guardrail 5),
+    artifacts rebuilt. A timing edit moves the whole cue window (words ride
+    along, rescaled) and must land inside the tape.
 
     The edit ALSO lands as a caption op on the op log (origin=human) so the
     timeline's history shows who changed what, and undo-by-revoke works."""
@@ -1387,9 +1391,25 @@ def edit_subtitle(project_id: str, cue_index: int, body: CueEditRequest) -> CueO
     s = session()
     if s.get(ProjectRow, project_id) is None:
         raise HTTPException(status_code=404, detail="project not found")
+    asset = s.execute(
+        select(MediaAssetRow).where(MediaAssetRow.project_id == project_id).limit(1)
+    ).scalar_one_or_none()
     s.close()
+    if body.end_ms is not None and asset is not None and body.end_ms > asset.duration_s * 1000:
+        raise HTTPException(
+            status_code=422,
+            detail=f"cue end {body.end_ms}ms beyond the tape "
+            f"({int(asset.duration_s * 1000)}ms @ {asset.duration_s:.2f}s)",
+        )
     try:
-        beat = edit_cue(_subtitle_dir(project_id), cue_index, body.text, speaker=body.speaker)
+        beat = edit_cue(
+            _subtitle_dir(project_id),
+            cue_index,
+            body.text,
+            speaker=body.speaker,
+            start_ms=body.start_ms,
+            end_ms=body.end_ms,
+        )
     except SubtitleStoreError as e:
         detail = str(e)
         raise HTTPException(

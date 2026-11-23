@@ -442,10 +442,21 @@ export const api = {
   // --- M3 close-out: proxy player + subtitle grid + blur canvas
   listAssets: (id: string) => req<Asset[]>(`/projects/${id}/assets`),
   listSubtitles: (id: string) => req<Cue[]>(`/projects/${id}/subtitles`),
-  editSubtitle: (id: string, index: number, text: string, speaker?: string) =>
+  editSubtitle: (
+    id: string,
+    index: number,
+    text: string,
+    speaker?: string,
+    timing?: { start_ms: number; end_ms: number },
+  ) =>
     req<Cue>(`/projects/${id}/subtitles/${index}`, {
       method: "PATCH",
-      body: JSON.stringify({ text, speaker: speaker ?? null }),
+      body: JSON.stringify({
+        text,
+        speaker: speaker ?? null,
+        start_ms: timing?.start_ms ?? null,
+        end_ms: timing?.end_ms ?? null,
+      }),
     }),
   listRedactions: (id: string) => req<Redaction[]>(`/projects/${id}/redactions`),
   addRedaction: (
