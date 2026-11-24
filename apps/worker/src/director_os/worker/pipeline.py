@@ -2888,13 +2888,16 @@ def make_deps(
     **overrides: Any,
 ) -> PipelineDeps:
     engine = make_engine(database_url)
+    # import BEFORE create_all: credentials.py maps its tables onto the SAME
+    # Base — a fresh DB crashes `no such table: settings_meta` if create_all
+    # runs before the mapped classes exist (the first-call bug seen live)
+    from director_os.core.credentials import apply_credentials_to_settings
+
     init_models(engine)
     if settings is None:
         # Production path: Studio-saved credentials (Settings UI) override
         # .env — refresh the overlay per job so key changes never need a
         # worker restart. Tests inject explicit settings and skip this.
-        from director_os.core.credentials import apply_credentials_to_settings
-
         apply_credentials_to_settings(engine)
         resolved = get_settings()
     else:

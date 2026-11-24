@@ -172,11 +172,12 @@ class GeminiVisionClient:
             else _env_model_list(os.getenv("VISION_FALLBACK_MODELS", "gemini-3.1-flash-lite"))
         )
 
-    def analyze(self, question: str, frames: Sequence[FrameRef]) -> list[SceneInsight]:
+    def _frames_body(self, question: str, frames: Sequence[FrameRef], prefix: str) -> dict:
+        """Shared multimodal payload: question (+ optional instruction prefix)
+        followed by every frame as stamped inline_data."""
         import base64
-        import json as _json
 
-        parts: list[dict[str, Any]] = [{"text": INSIGHT_INSTRUCTION + question}]
+        parts: list[dict[str, Any]] = [{"text": prefix + question}]
         for f in frames:
             data = base64.b64encode(f.image_path.read_bytes()).decode()
             mime = "image/png" if f.image_path.suffix.lower() == ".png" else "image/jpeg"
@@ -184,11 +185,42 @@ class GeminiVisionClient:
                 {"text": f"frame at {f.timestamp_s}s:"},
             )
             parts.append({"inline_data": {"mime_type": mime, "data": data}})
-        body = {
+        return {
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048},
         }
-        response: dict[str, Any] = self._generate(body, _json)
+
+    @staticmethod
+    def _candidates_text(data: dict[str, Any]) -> str:
+        """Candidate text parts joined; `thought` parts DROPPED — reasoning
+        summaries riding inside the text broke every strict JSON consumer
+        (live E2E: contact-sheet 503s, critic garbage rounds, Phase A parse)."""
+        parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+        return "".join(str(p.get("text", "")) for p in parts if not p.get("thought"))
+
+    def raw_analysis(self, question: str, frames: Sequence[FrameRef]) -> str:
+        """The model's VERBATIM reply (thought-free, fence-stripped).
+
+        The ReAct critic asks for an ACTION OBJECT — `analyze`'s insight-array
+        decode would shred it (object keys iterated as insights, descriptions
+        joined without structure). The critic needs the model's own decision
+        text, not a paraphrase channel."""
+        import json as _json
+
+        response: dict[str, Any] = self._generate(self._frames_body(question, frames, ""), _json)
+        text = self._candidates_text(response).strip()
+        if text.startswith("```"):
+            text = text[3:].removeprefix("json").strip()
+        if text.endswith("```"):
+            text = text[:-3].strip()
+        return text
+
+    def analyze(self, question: str, frames: Sequence[FrameRef]) -> list[SceneInsight]:
+        import json as _json
+
+        response: dict[str, Any] = self._generate(
+            self._frames_body(question, frames, INSIGHT_INSTRUCTION), _json
+        )
         return self._parse(response, frames)
 
     def _generate(self, body: dict[str, Any], _json: Any) -> dict[str, Any]:
@@ -270,10 +302,7 @@ class GeminiVisionClient:
             "tokens_in": int(usage.get("promptTokenCount", 0)),
             "tokens_out": int(usage.get("candidatesTokenCount", 0)),
         }
-        text = "".join(
-            p.get("text", "")
-            for p in data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-        ).strip()
+        text = self._candidates_text(data).strip()
         try:
             if text.startswith("```"):
                 text = text.strip("`").removeprefix("json").strip()

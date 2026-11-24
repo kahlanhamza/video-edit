@@ -134,7 +134,35 @@ def extract_json_payload(text: str, expect: str = "object") -> Any:
     if a == -1 or b == -1 or b <= a:
         head = " ".join(cleaned.split())[:160] or "(empty response)"
         raise ValueError(f"no JSON {expect} in response — got: {head!r}")
-    return json.loads(cleaned[a : b + 1])
+    payload = cleaned[a : b + 1]
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError as first:
+        # Last-chance repair for the LLM syntax slips the strict parse hates
+        # (live E2E: `Expecting ',' delimiter` on EVERY Phase A retry — the
+        # model stacked object keys without a comma). The surgery is
+        # conservative and only accepted when json.loads validates it.
+        repaired = repair_common_llm_json(payload)
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            raise first from first
+
+
+def repair_common_llm_json(text: str) -> str:
+    """The two LLM JSON crimes json.loads cannot forgive: smart quotes and
+    stacked values with the comma forgotten between them (objects AND arrays).
+    Only patterns that are ALWAYS invalid in JSON are touched."""
+    import re as _re
+
+    smart = {"\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019": "'"}
+    fixed = text
+    for bad, good in smart.items():
+        fixed = fixed.replace(bad, good)
+    fixed = _re.sub(r",\s*([}\]])", r"\1", fixed)
+    # bare newline between value-end token and value-start token → comma
+    fixed = _re.sub(r'(["\}\]\w])\s*\n(\s*["\{\[])', r"\1,\n\2", fixed)
+    return fixed
 
 
 def _modal_vlm_fn():
@@ -438,7 +466,10 @@ class GeminiRestBackend:
                 "tokens_out": int(usage.get("candidatesTokenCount", 0)),
             }
             parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-            return "".join(str(p.get("text", "")) for p in parts)
+            # `thought` parts are reasoning summaries, NOT the completion —
+            # joining them prepends prose to the JSON payload and Phase A's
+            # strict parse died on every retry (live E2E evidence)
+            return "".join(str(p.get("text", "")) for p in parts if not p.get("thought"))
         raise LLMBackendError(f"gemini complete_json exhausted fallbacks: {last_err[:200]}")
 
 

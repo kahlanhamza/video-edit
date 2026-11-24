@@ -391,8 +391,19 @@ def vision_critic_adapter(client: Any) -> CriticTurnAdapter | None:
         def ask(self, prompt: str, frames: list[tuple[float, Any]]) -> str:
             from director_os.perception.vision import FrameRef, VisionError
 
+            refs = [FrameRef(timestamp_s=t, image_path=p) for t, p in frames]
+            # raw_analysis first: the critic needs the model's ACTION JSON
+            # verbatim — analyze()'s insight-array decode would shred it
+            # (live E2E: two garbage rounds, failout before any verdict)
+            raw = getattr(client, "raw_analysis", None)
+            if callable(raw):
+                try:
+                    return str(raw(prompt, refs))
+                except VisionError as e:
+                    raise CriticTurnError(str(e)) from e
+                except Exception as e:  # noqa: BLE001 — structural errors surface LOUD too
+                    raise CriticTurnError(f"vision adapter failed: {e}") from e
             try:
-                refs = [FrameRef(timestamp_s=t, image_path=p) for t, p in frames]
                 insights = client.analyze(prompt, refs)
                 return "\n".join(i.description for i in insights)
             except VisionError as e:
@@ -449,6 +460,7 @@ def run_critic(
     prompt = base_prompt
     trace: list[dict[str, Any]] = []
     garbage_streak = 0
+    garbage_detail = ""
     for rnd in range(1, MAX_INSPECT_ROUNDS + 2):
         try:
             text = adapter.ask(prompt, frames)
@@ -459,13 +471,9 @@ def run_critic(
             verdict = parse_review_verdict(text)
             if verdict is None:
                 garbage_streak += 1
-                trace.append(
-                    {
-                        "round": rnd,
-                        "action": "garbage",
-                        "detail": f"unparseable verdict: {str(text)[:160]!r}",
-                    }
-                )
+                garbage_detail = f"unparseable verdict: {str(text)[:160]!r}"
+                trace.append({"round": rnd, "action": "garbage", "detail": garbage_detail})
+                _log(f"  [review] critic round {rnd} unusable ({garbage_detail})")
             else:
                 trace.append({"round": rnd, "action": "verdict", "detail": verdict.verdict})
                 _log(f"  [review] critic verdict round {rnd}: {verdict.verdict}")
@@ -481,7 +489,9 @@ def run_critic(
             )[:INSPECT_BATCH_CAP]
             if not times:
                 garbage_streak += 1
-                trace.append({"round": rnd, "action": "garbage", "detail": "empty inspect times"})
+                garbage_detail = "empty inspect times"
+                trace.append({"round": rnd, "action": "garbage", "detail": garbage_detail})
+                _log(f"  [review] critic round {rnd} unusable ({garbage_detail})")
             else:
                 new = grab_frames(times)
                 have = {round(t, 2) for t, _ in frames}
@@ -513,9 +523,12 @@ def run_critic(
                 if action == "inspect"
                 else f"no JSON object in reply: {str(text)[:160]!r}"
             )
+            garbage_detail = detail
             trace.append({"round": rnd, "action": "garbage", "detail": detail})
+            _log(f"  [review] critic round {rnd} unusable ({detail})")
         if garbage_streak >= 2:
             raise CriticTurnError(
                 "critic produced 2 consecutive unusable rounds — refusing to guess"
+                + (f": {garbage_detail}" if garbage_detail else "")
             )
     raise CriticTurnError(f"critic never reached a verdict in {MAX_INSPECT_ROUNDS + 1} rounds")
