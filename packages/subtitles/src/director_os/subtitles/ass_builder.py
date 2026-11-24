@@ -46,6 +46,16 @@ ROLE_COLORS: dict[str, str] = {
     "narrator": "#70E4FF",  # cyan (&H00FFE470 in the committed header)
 }
 
+# committed v6 karaoke SECONDARY colours — the tint an unsung \k word carries
+# until its beat. pysubs2's default (&H000000FF, pure red) flashed on every
+# line and was NOT the approved look; the 0d56deb header pinned these.
+SECONDARY_ROLE_COLORS: dict[str, str] = {
+    "officer": "#B8C0CC",  # &H00CCC0B8
+    "suspect": "#B39B4D",  # &H004D9BB3
+    "narrator": "#7CA3B8",  # &H00B8A37C
+}
+SECONDARY_DEFAULT = "#B8C0CC"
+
 PALETTE = [
     "#FFFFFF",
     "#3EE6C1",
@@ -99,6 +109,11 @@ def _speaker_color(speaker: str) -> str:
         return role
     idx = int(hashlib.sha1(speaker.encode()).hexdigest(), 16) % len(PALETTE)
     return PALETTE[idx]
+
+
+def _speaker_secondary(speaker: str) -> str:
+    """Committed v6 karaoke secondary; hash-palette speakers share the neutral."""
+    return SECONDARY_ROLE_COLORS.get(speaker.strip().lower(), SECONDARY_DEFAULT)
 
 
 def chunk_cue_words(words: Sequence[dict]) -> list[list[dict]]:
@@ -236,12 +251,17 @@ def build_ass(
         color = pysubs2.Color(
             int(color_hex[0:2], 16), int(color_hex[2:4], 16), int(color_hex[4:6], 16)
         )
+        sec_hex = _speaker_secondary(beat.speaker).lstrip("#")
+        secondary = pysubs2.Color(
+            int(sec_hex[0:2], 16), int(sec_hex[2:4], 16), int(sec_hex[4:6], 16)
+        )
         style_name = f"Lane{lane}_{beat.speaker}".replace(" ", "_")
         if style_name not in subs.styles:
             subs.styles[style_name] = pysubs2.SSAStyle(
                 fontname=FONT_NAME,
                 fontsize=FONT_SIZE,
                 primarycolor=color,
+                secondarycolor=secondary,
                 bold=True,
                 alignment=Alignment.BOTTOM_CENTER,  # numpad 2
                 # committed v4 look: heavy readable outline + soft shadow

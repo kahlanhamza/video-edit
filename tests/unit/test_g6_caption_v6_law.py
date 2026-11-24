@@ -45,6 +45,21 @@ def test_role_colors_officer_white_suspect_gold_narrator_cyan():
     assert "&H00FFE470" in narrator  # cyan #70E4FF
 
 
+def test_karaoke_secondary_colors_match_the_committed_v6_header():
+    # the tint an unsung \k word carries — pysubs2's default (pure red) was
+    # NOT the approved look; 0d56deb pinned &H00CCC0B8 / &H004D9BB3 / &H00B8A37C
+    officer = build_ass([_beat("step out", 0, 1000, "Officer")])
+    suspect = build_ass([_beat("am I in trouble", 0, 1000, "Suspect")])
+    narrator = build_ass([_beat("Eustis, Florida", 0, 1000, "Narrator")])
+    assert "&H00CCC0B8" in officer  # soft gray-blue
+    assert "&H004D9BB3" in suspect  # muted gold
+    assert "&H00B8A37C" in narrator  # muted cyan
+    # and no style line carries the pysubs2 red default any more
+    for ass in (officer, suspect, narrator):
+        styles = [ln for ln in ass.splitlines() if ln.startswith("Style:")]
+        assert all("&H000000FF," not in ln for ln in styles)
+
+
 def test_unknown_speaker_still_gets_a_deterministic_color():
     a = build_ass([_beat("dispatch", 0, 1000, "Dispatch_3")])
     b = build_ass([_beat("dispatch", 0, 1000, "Dispatch_3")])

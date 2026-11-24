@@ -222,6 +222,72 @@ TRANSITION_BRIDGES = {
 }
 
 
+# SHORT bridge variants — the deterministic short-documentary sizing law.
+# Full-length scripts (8 x ~50-70 words) blow the narration-ratio invariant on
+# short masters: a 480s tape plans a ~134-160s master and the fixed scripts
+# alone carry ~108s of narration (ratio 0.67 > 0.52) — the fallback then
+# failed its own retention pre-flight ("narration ratio=0.67", the any-length
+# law broken). Same act keys, same tone, every line distinct, fewer words:
+# the ratio law is enforced by construction instead of hoped for.
+SHORT_NARRATOR_BRIDGES = {
+    "Cold Open": (
+        "The bodycam was already rolling. What it caught next turned a routine "
+        "shift into a criminal case — and the detail that decides everything "
+        "appears early."
+    ),
+    "Act 1: Arrival & Contact": (
+        "It starts like any routine call — small talk, routine questions. But "
+        "the first details already refuse to add up, and the tape keeps rolling."
+    ),
+    "Act 2: Investigation & Friction": (
+        "Now the officers compare what they see with what they were told. The "
+        "answers get rehearsed, and everyone in this frame knows it."
+    ),
+    "Act 3: Escalation": (
+        "This is the turning point — sharper questions, a changing posture. The "
+        "conversation ends here and the procedure takes over."
+    ),
+    "Act 4: The Arrest": (
+        "The arrest caught in full, from both sides of the handcuffs — the part "
+        "every report afterwards has to match."
+    ),
+    "Act 5: Aftermath & Booking": (
+        "After the cuffs come transport, processing, and the tests that decide "
+        "how this case actually ends."
+    ),
+    "Act 6: Verified Outcome": (
+        "Booking finishes, the tests come back, and the record closes the loop "
+        "on everything you just watched — the verified outcome, exactly as filed."
+    ),
+}
+
+SHORT_TRANSITION_BRIDGES = {
+    "Act 1: Arrival & Contact": (
+        "Nothing here looks unusual yet — which is exactly what makes the next "
+        "stretch worth watching."
+    ),
+    "Act 2: Investigation & Friction": (
+        "Watch the answers drift as the same question comes back — the account "
+        "starts straining against the camera."
+    ),
+    "Act 3: Escalation": (
+        "Once that line is crossed there is no walking it back — every sentence "
+        "from here is evidence."
+    ),
+    "Act 4: The Arrest": (
+        "The cuffs turn a roadside conversation into measured, timestamped evidence."
+    ),
+    "Act 5: Aftermath & Booking": (
+        "The final stretch answers the only question that matters: how does the "
+        "record actually close?"
+    ),
+    "Act 6: Verified Outcome": (
+        "If this case told you something the headlines didn't, the next one is "
+        "already on the channel."
+    ),
+}
+
+
 @dataclass
 class _Block:
     kind: str  # raw | narration
@@ -231,7 +297,7 @@ class _Block:
     act: str = ""
 
 
-def _hook_script(case_facts: str, seed: str | None) -> str:
+def _hook_script(case_facts: str, seed: str | None, short: bool = False) -> str:
     """The cold-open hook: 3 punchy lines carrying the who/what/where/when.
 
     Seeds (previously LLM-authored narration) win; the fact line composes a
@@ -240,6 +306,13 @@ def _hook_script(case_facts: str, seed: str | None) -> str:
     if seed:
         return " ".join(seed.split())
     facts = " ".join((case_facts or "").split())
+    if short:
+        if facts:
+            return (
+                f"{facts} The bodycam never stopped rolling — stay for the "
+                "detail that decides this entire case."
+            )
+        return SHORT_NARRATOR_BRIDGES["Cold Open"]
     if facts:
         return (
             f"{facts} The bodycam never stopped rolling — and what it captured "
@@ -314,6 +387,14 @@ def plan_fallback_blocks(
 
     scale = doc_scale(source_duration_s)
     target = max(scale.target_lo, min(scale.target_hi, source_duration_s * 0.28))
+    # SHORT-DOC LAW: below a ~240s master the full-length bridge scripts carry
+    # more narration than the ratio law allows — switch to the short variants
+    # (hook/outro keep the arc) and let the estimate bounds follow.
+    short_doc = target < 240.0
+    narrators = SHORT_NARRATOR_BRIDGES if short_doc else NARRATOR_BRIDGES
+    transitions = SHORT_TRANSITION_BRIDGES if short_doc else TRANSITION_BRIDGES
+    narr_lo = 5.0 if short_doc else 14.0
+    narr_hi = 22.0 if short_doc else 34.0
     intervals = _speech_intervals(transcript)
     seeds = {k: " ".join(v.split()) for k, v in (seed_scripts or {}).items() if v and v.strip()}
     seed_ranges = [r for r in (seed_raw_ranges or []) if r[1] > r[0]]
@@ -329,9 +410,9 @@ def plan_fallback_blocks(
     sting_start = max(0.0, climax[0])
     blocks.append(_Block("raw", sting_start, STING_MAX_S, act="Cold Open"))
     # 2) the hook narration, b-roll riding the climax moment (muted bed)
-    hook = _hook_script(case_facts, seeds.get("hook") or seeds.get("Cold Open"))
+    hook = _hook_script(case_facts, seeds.get("hook") or seeds.get("Cold Open"), short=short_doc)
     blocks.append(
-        _Block("narration", climax[0], _narr_dur(hook, lo=14.0, hi=26.0), hook, "Cold Open")
+        _Block("narration", climax[0], _narr_dur(hook, lo=narr_lo, hi=26.0), hook, "Cold Open")
     )
     # 3) one more short climax beat, audio on, to ride out of the cold open
     if len(hooks) > 1 and scale.target_lo >= 240.0:
@@ -348,30 +429,36 @@ def plan_fallback_blocks(
         _hook_script(
             case_facts,
             (seed_scripts or {}).get("hook") or (seed_scripts or {}).get("Cold Open"),
+            short=short_doc,
         ),
-        lo=14.0,
+        lo=narr_lo,
         hi=26.0,
     )
     narration_total += sum(
-        _narr_dur(seeds.get(bridge_key) or NARRATOR_BRIDGES[bridge_key], lo=14.0, hi=34.0)
-        + _narr_dur(TRANSITION_BRIDGES[close_key], lo=12.0, hi=30.0)
+        _narr_dur(seeds.get(bridge_key) or narrators[bridge_key], lo=narr_lo, hi=narr_hi)
+        + _narr_dur(transitions[close_key], lo=narr_lo, hi=30.0 if not short_doc else 22.0)
         for _name, _lo, _hi, bridge_key, close_key in act_windows
     )
     raw_wanted = max(scale.min_final_s * 0.35, target - narration_total)
-    # ratio safety: cap raw so narration lands 0.32-0.45 of the master — a
-    # clip-heavy cut (ratio < 0.30) fails retention QA by construction
-    raw_total = min(raw_wanted, narration_total * 1.8)
+    # ratio fit BOTH ways (narration-ratio law 0.30..0.52): the old one-sided
+    # cap only stopped the ratio falling BELOW 0.30 — narration-heavy short
+    # docs sailed over 0.52 and failed retention. Floor raw so narration
+    # shares <= 0.48, cap it so the share stays >= 0.32.
+    raw_floor_for_ratio = narration_total * (1.0 - 0.48) / 0.48
+    raw_cap_for_ratio = narration_total * (1.0 - 0.32) / 0.32
+    raw_total = max(raw_wanted, raw_floor_for_ratio, scale.min_final_s * 0.35)
+    raw_total = min(raw_total, raw_cap_for_ratio)
     per_act = raw_total / n_acts
     clips_per_act = max(1, min(3, round(per_act / 35.0)))
     per_clip = min(scale.clip_max_s, max(16.0, per_act / clips_per_act))
 
     for name, lo, hi, bridge_key, close_key in act_windows:
-        bridge = seeds.get(bridge_key) or NARRATOR_BRIDGES[bridge_key]
+        bridge = seeds.get(bridge_key) or narrators[bridge_key]
         blocks.append(
             _Block(
                 "narration",
                 source_duration_s * lo,
-                _narr_dur(bridge, lo=14.0, hi=34.0),
+                _narr_dur(bridge, lo=narr_lo, hi=narr_hi),
                 bridge,
                 name,
             )
@@ -390,14 +477,14 @@ def plan_fallback_blocks(
             for k in range(clips_per_act):
                 start = lo * source_duration_s + k * (w / (clips_per_act + 0.2))
                 blocks.append(_Block("raw", start, min(per_clip, w / clips_per_act), act=name))
-        closing = TRANSITION_BRIDGES[close_key]
+        closing = transitions[close_key]
         if close_key == "Act 6: Verified Outcome":
             closing = seeds.get("outro") or seeds.get(close_key) or closing
         blocks.append(
             _Block(
                 "narration",
                 source_duration_s * hi,
-                _narr_dur(closing, lo=12.0, hi=40.0),
+                _narr_dur(closing, lo=narr_lo, hi=40.0 if not short_doc else 22.0),
                 closing,
                 name,
             )

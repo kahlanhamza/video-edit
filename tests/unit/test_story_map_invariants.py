@@ -171,6 +171,49 @@ def test_fallback_passes_every_retention_invariant(fallback_timeline):
     assert report.ok, [c.detail for c in report.failures]
 
 
+def _short_transcript() -> dict:
+    words = []
+    for start, spk, text in [
+        (6, "Officer", "Unit one to dispatch we have a code four"),
+        (60, "Officer", "dispatch copies show unit one en route"),
+        (140, "Officer", "step out of the vehicle keep your hands"),
+        (225, "Suspect", "I got off work there is nothing in the car"),
+        (300, "Officer", "you are being detained for a field sobriety test"),
+        (355, "Suspect", "I want my lawyer on the phone right now"),
+        (410, "Officer", "stay right there the K nine unit is on the way"),
+        (445, "Suspect", "I did nothing wrong call my lawyer"),
+    ]:
+        for i, w in enumerate(text.split()):
+            s = start + i * 0.35
+            words.append({"text": w, "start_s": s, "end_s": s + 0.3, "speaker": spk})
+    return {"words": words, "segments": []}
+
+
+def test_fallback_short_documentary_respects_narration_ratio_law():
+    """The any-length law at 8 minutes: the fixed long bridges used to carry
+    ~108s of narration onto a ~160s master (ratio 0.67 > 0.52) and the
+    deterministic fallback failed its own retention pre-flight."""
+    from director_os.otio_engine.timeline import build_timeline
+
+    tl = build_timeline(
+        build_fallback_documentary(
+            asset_id="asset_short",
+            source_duration_s=480.0,
+            transcript=_short_transcript(),
+            fps=30,
+            width=640,
+            height=360,
+        )
+    )
+    comp = timeline_composition(tl)
+    ratio = comp.narration_duration_s / comp.final_duration_s
+    assert 0.30 <= ratio <= 0.52, (
+        f"ratio {ratio:.2f} ({comp.narration_duration_s:.0f}s of {comp.final_duration_s:.0f}s)"
+    )
+    report = audit_retention(tl, 480.0)
+    assert report.ok, [c.detail for c in report.failures]
+
+
 def test_fallback_cards_present(fallback_timeline):
     from director_os.otio_engine.compiler import master_track
     from director_os.otio_engine.timeline import track_by_name
