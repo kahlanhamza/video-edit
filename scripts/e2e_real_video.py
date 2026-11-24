@@ -89,6 +89,11 @@ def parse_args() -> argparse.Namespace:
         help="keyless smoke: empty transcript, real pixels/sweep/render (no Gladia)",
     )
     p.add_argument(
+        "--force-replan",
+        action="store_true",
+        help="invalidate the active-timeline shortcut and re-run planning",
+    )
+    p.add_argument(
         "--project-id",
         default=None,
         help="resume an existing project (sandbox-safe: re-invoke until QA passes)",
@@ -285,7 +290,7 @@ def main() -> int:
                 f"ocr={ocr.get('iso', 'not found')}"
             )
 
-    result = run_pipeline(segment, pid, deps)
+    result = run_pipeline(segment, pid, deps, force_replan=args.force_replan)
 
     print("\n================ REAL-FOOTAGE E2E RESULT ================")
     print(f"project:   {result.project_id}")

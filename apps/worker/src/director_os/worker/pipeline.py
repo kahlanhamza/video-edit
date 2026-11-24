@@ -2093,11 +2093,19 @@ def stage_planning(
     CaseDossier re-runs Stage 6 without touching ingest or ASR).
     """
     niche = "bodycam_documentary"
+    # an authored plan (DIRECTOR_PLAN_FILE) IS a replan request — the reuse
+    # shortcut must never shadow it
+    plan_file = os.environ.get("DIRECTOR_PLAN_FILE", "")
     with deps.sessions() as s:
         project = s.get(ProjectRow, project_id)
         if project is not None:
             niche = project.niche_skill or "bodycam_documentary"
-        if project is not None and project.active_otio_version_id is not None and not force_replan:
+        if (
+            project is not None
+            and project.active_otio_version_id is not None
+            and not force_replan
+            and not (plan_file and Path(plan_file).is_file())
+        ):
             version = project.active_otio_version_id
             row = s.execute(
                 select(TimelineVersionRow).where(
