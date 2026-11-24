@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from director_os.otio_engine.contract import RawClipMeta
 from director_os.otio_engine.timeline import (
     ClipSpec,
@@ -289,3 +290,40 @@ def test_detect_faces_ranges_never_decode_cut_footage(monkeypatch: Any) -> None:
     # 1 sampled frame per span (stride = 30 at 1 fps)
     assert det.detect_calls == 2
     assert sweep.stats.frames_sampled == 2
+
+
+def test_clip_plan_t_s_never_negative_for_fractional_start_s() -> None:
+    """A clip starting at a fractional second (203.07s) with boxes exactly on
+    its first frames: clip-local t_s is computed from the INTEGER frame offset
+    — the old frame_idx/fps - start_s drifted negative on sub-frame float
+    error, threw TrackedBox(ge=0) validation, and baked the clip RAW
+    (full-tape run 3: two clips shipped unblurred that way)."""
+    from director_os.vision_fx.trajectory import (
+        PerFrameRedaction,
+        RedactionTrajectory,
+        TrackedBox,
+    )
+    from director_os.worker.pipeline import _clip_plan
+
+    fps = 30
+    start_s = 203.07
+    f0 = int(round(start_s * fps))  # 6092 — 6092/30 - 203.07 = -0.0033
+    boxes = []
+    for i in range(3):
+        fi = f0 + i * fps
+        boxes.append(
+            TrackedBox(frame_idx=fi - f0 + f0, t_s=round(fi / fps, 3), x=10, y=10, w=20, h=20)
+        )
+    plan = PerFrameRedaction(
+        fps=fps,
+        n_frames=f0 + 4 * fps,
+        frame_w=1920,
+        frame_h=1080,
+        trajectories=[RedactionTrajectory(track_id="face_1", boxes=boxes)],
+    )
+    clip = _clip_plan(plan, start_s, 3.0)
+    assert len(clip.trajectories) == 1
+    got = clip.trajectories[0].boxes
+    assert [b.frame_idx for b in got] == [0, 30, 60]
+    assert all(b.t_s >= 0 for b in got), [b.t_s for b in got]
+    assert got[0].t_s == pytest.approx(0.0, abs=1 / fps)

@@ -1322,20 +1322,27 @@ def _clip_plan(plan, start_s: float, dur_s: float):
     f1 = int(round((start_s + dur_s) * fps))
     trajectories: list[RedactionTrajectory] = []
     for tr in plan.trajectories:
-        boxes = [
-            TrackedBox(
-                frame_idx=b.frame_idx - f0,
-                t_s=round(b.frame_idx / fps - start_s, 3),
-                x=b.x,
-                y=b.y,
-                w=b.w,
-                h=b.h,
-                bridged=b.bridged,
-                lead=b.lead,
+        boxes = []
+        for b in tr.boxes:
+            if not f0 <= b.frame_idx < f1:
+                continue
+            local_idx = b.frame_idx - f0
+            # clip-local EXACT frame time: frame_idx/fps - start_s drifts
+            # negative for fractional start_s (203.07s) and ONE bad t_s
+            # threw the whole TrackedBox validation away — baking the clip
+            # RAW, unblurred
+            boxes.append(
+                TrackedBox(
+                    frame_idx=local_idx,
+                    t_s=round(local_idx / fps, 3),
+                    x=b.x,
+                    y=b.y,
+                    w=b.w,
+                    h=b.h,
+                    bridged=b.bridged,
+                    lead=b.lead,
+                )
             )
-            for b in tr.boxes
-            if f0 <= b.frame_idx < f1
-        ]
         if boxes:
             trajectories.append(RedactionTrajectory(track_id=tr.track_id, boxes=boxes))
     return PerFrameRedaction(
