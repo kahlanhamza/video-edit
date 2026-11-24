@@ -1978,11 +1978,32 @@ def _plan_documentary(
             transcript=transcript,
             niche=niche,
         )
-        plan, plan_err = session.plan_macro(buckets, dossier)
+        # AUTHORED-PLAN PATH (DIRECTOR_PLAN_FILE, direct egress): a saved,
+        # human/agent-authored MacroPlan JSON; same snap + hard-number
+        # pre-flight + audit gates — authoring replaces the wire call, never
+        # the law. On rejection the normal LLM chain still runs.
+        saved_plan: tuple[Any, str] | None = None
+        plan_file = os.environ.get("DIRECTOR_PLAN_FILE", "")
+        if plan_file and Path(plan_file).is_file():
+            deps.log(f"  [planning] authored plan: {plan_file}")
+            saved = Path(plan_file).read_text(encoding="utf-8")
+            saved_plan = session.plan_from_saved_json(saved)
+            if saved_plan[0] is None:
+                deps.log(f"  [planning] authored plan unusable ({saved_plan[1]})")
+                saved_plan = None
+            elif saved_plan[1]:
+                deps.log(f"  [planning] authored plan FAILED pre-flight ({saved_plan[1][:300]})")
+                saved_plan = None
+        if saved_plan is not None:
+            plan, plan_err = saved_plan
+            label = "authored_plan"
+        else:
+            plan, plan_err = session.plan_macro(buckets, dossier)
+            label = ""
         if plan is None:
             deps.log(f"  [planning] Phase A failed ({plan_err}) — deterministic fallback")
         else:
-            label = getattr(backend, "model", getattr(backend, "provider", "llm"))
+            label = label or str(getattr(backend, "model", getattr(backend, "provider", "llm")))
             deps.log(
                 f"  [planning] Phase A ok via {label}: {len(plan.acts)} acts, "
                 f"{plan.raw_count} raw, {plan.narration_count} narration, "

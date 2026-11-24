@@ -18,6 +18,9 @@ repairs:
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import director_os.agent_runtime.director_session as ds
 import pytest
 from director_os.agent_runtime.checkpoint import CheckpointStore
@@ -27,6 +30,7 @@ from director_os.agent_runtime.director_session import (
     parse_macro_plan,
     salvage_director_timeline,
 )
+from director_os.agent_runtime.doc_scale import doc_scale
 from director_os.agent_runtime.editing_tools import DirectorToolbox, build_director_registry
 from director_os.otio_engine.compiler import master_track
 from director_os.otio_engine.contract import RawClipMeta
@@ -247,3 +251,129 @@ def test_plan_macro_reflies_preflight_after_refine_and_retries_with_feedback(tmp
     assert backend.calls == 2, backend.calls
     assert "## Previous attempt failed" in backend.users[1]
     assert "keep band" in backend.users[1]
+
+
+# ------------------------------------------------- deep top-up + authored plans
+def test_salvage_tops_up_raw_toward_the_length_floor():
+    """An under-length director timeline whose raw clips are shorter than the
+    ratio allowance: salvage EXTENDS the director's own raw clips toward the
+    length floor (capped by the narration-ratio law), instead of scrapping
+    the program — the 539s live plan that shipped 615s of stock lines."""
+    toolbox = DirectorToolbox(_scaffold(), "p_topup")
+    script = _script_n(
+        50,
+        "A calm hook that rides the word law exactly while the salvage pass "
+        "sizes the raw top-up beneath it for this under-length program.",
+    )
+    toolbox.insert_narration_block(script, dur_s=narr_est_s(script), at_index=0)
+    toolbox.insert_raw_clip(source_start_s=100.0, dur_s=30.0)
+    track = master_track(toolbox.timeline)
+    raw_before = next(
+        it
+        for it in track
+        if (it.metadata.get("director_os") or {}).get("kind") == "raw"
+        and it.source_range.duration.to_seconds() < SOURCE_DUR
+    ).source_range.duration.to_seconds()
+
+    timeline, notes = salvage_director_timeline(toolbox.timeline, SOURCE_DUR)
+    track = master_track(timeline)
+
+    def _real_raws(trk):
+        return [
+            it
+            for it in trk
+            if it.source_range is not None
+            and (it.metadata.get("director_os") or {}).get("kind") == "raw"
+            and it.source_range.duration.to_seconds() < SOURCE_DUR
+        ]
+
+    narr_sum = sum(
+        it.source_range.duration.to_seconds()
+        for it in track
+        if (it.metadata.get("director_os") or {}).get("kind") == "narration"
+    )
+    raw = _real_raws(track)[0].source_range.duration.to_seconds()
+    ratio_cap_raw = narr_sum * (1.0 - 0.32) / 0.32
+    assert raw == pytest.approx(min(raw_before * 1.25, ratio_cap_raw), abs=1.0), raw
+    assert any("raw top-up" in n for n in notes), notes
+
+
+def test_salvage_never_dilutes_narration_below_the_ratio_law():
+    """With narration already too thin relative to raw, the ratio-law cap
+    stops the top-up ENTIRELY — stretching raw past the 0.32 line would swap
+    a length failure for a ratio failure, so salvage refuses to grow it."""
+    toolbox = DirectorToolbox(_scaffold(), "p_ratcap")
+    script = _script_n(
+        40,
+        "A short hook that cannot carry a long master under the ratio law on this tape tonight.",
+    )
+    toolbox.insert_narration_block(script, dur_s=narr_est_s(script), at_index=0)
+    toolbox.insert_raw_clip(source_start_s=100.0, dur_s=400.0)
+
+    timeline, notes = salvage_director_timeline(toolbox.timeline, SOURCE_DUR)
+    track = master_track(timeline)
+    raw = next(
+        it
+        for it in track
+        if (it.metadata.get("director_os") or {}).get("kind") == "raw"
+        and it.source_range.duration.to_seconds() < SOURCE_DUR
+    ).source_range.duration.to_seconds()
+    assert raw == pytest.approx(400.0, abs=0.5), raw
+    assert not any("raw top-up" in n for n in notes), notes
+
+
+def test_authored_plan_rides_the_same_gates(tmp_path):
+    """The authored-plan path (DIRECTOR_PLAN_FILE): the SAME snap + hard-number
+    pre-flight — a compliant saved plan passes clean; a non-compliant one comes
+    back with the concrete problems; garbage comes back unparseable."""
+
+    good = _session(RetryChain(_good_plan_json()), tmp_path, transcript=SILENT_TRANSCRIPT)
+    ok, err = good.plan_from_saved_json(_good_plan_json())
+    assert ok is not None
+    assert err == "", err
+
+    thin = json.loads(_good_plan_json())
+    thin["acts"] = [a for a in thin["acts"][:2]]
+    bad, err = good.plan_from_saved_json(json.dumps(thin))
+    assert bad is not None and err, err
+    assert "narration blocks" in err or "acts" in err, err
+
+    junk, err = good.plan_from_saved_json("not a plan at all")
+    assert junk is None and "unparseable" in err
+
+
+def test_phase_a_prompt_states_the_hard_numbers():
+    """The lite-model convergence fix: the prompt carries the per-tape band,
+    the narration block count, and the rejection consequences explicitly."""
+    from director_os.agent_runtime.director_session import macro_plan_user_prompt
+
+    prompt = macro_plan_user_prompt([], SOURCE_DUR)
+    scale = doc_scale(SOURCE_DUR)
+    assert "Hard numbers for THIS tape" in prompt
+    assert f"{scale.target_lo:.0f}" in prompt and f"{scale.target_hi:.0f}" in prompt
+    assert f"Narration blocks: {scale.narr_lo}" in prompt
+    assert "auto-rejected" in prompt
+
+
+def test_full_tape_authored_plan_passes_gates_with_real_transcript(tmp_path):
+    """The regression that shipped: a plan shaped for the snap (utterance-edge
+    extension) must still land inside the keep band AFTER the real 2627s
+    transcript snaps it — authored ~640s must not explode past 900s (it
+    snaps to ~870s). Opt-in: EUSTIS_PLAN_FILE + EUSTIS_TRANSCRIPT_FILE."""
+    import os
+
+    plan_file = os.environ.get("EUSTIS_PLAN_FILE", "")
+    transcript_file = os.environ.get("EUSTIS_TRANSCRIPT_FILE", "")
+    if (
+        not plan_file
+        or not transcript_file
+        or not (Path(plan_file).is_file() and Path(transcript_file).is_file())
+    ):
+        pytest.skip("eustis fixtures not provided (EUSTIS_PLAN_FILE / EUSTIS_TRANSCRIPT_FILE)")
+    transcript = json.loads(Path(transcript_file).read_text(encoding="utf-8"))
+    session = _session(RetryChain("{}"), tmp_path, transcript=transcript)
+    plan, err = session.plan_from_saved_json(Path(plan_file).read_text(encoding="utf-8"))
+    assert plan is not None, err
+    assert err == "", err
+    total = plan.total_dur_s
+    assert 700.0 <= total <= 900.0, total

@@ -173,6 +173,54 @@ def salvage_director_timeline(timeline, source_duration_s: float) -> tuple[Any, 
         track.remove(first_narr)
         track.insert(0, first_narr)
         notes.append("cold-open narration moved to open the master (hook law)")
+
+    # 3) length top-up — the audit floor is law. Extend the director's OWN raw
+    #    clips ( keeping its speech anchors, its audio, its structure) toward
+    #    the keep-band floor instead of scrapping the program. Two caps keep
+    #    this from trading one audit failure for another: the RATIO LAW (raw
+    #    growth cannot dilute narration below 0.32) and the source clock (a
+    #    raw clip cannot run past EOF). A plan too thin in words to reach the
+    #    floor ratio-cleanly is left short and the caller's audit decides.
+    added = 0.0
+    try:
+        scale = doc_scale(source_duration_s)
+        band_lo = max(scale.target_lo, scale.min_final_s)
+        raws = [
+            it
+            for it in track
+            if _kind(it) == "raw"
+            and it.source_range is not None
+            and it.source_range.duration.to_seconds() < source_duration_s
+        ]  # exclude the untouched full-length scaffold clip (execute drops it)
+        narr_sum = sum(
+            it.source_range.duration.to_seconds()
+            for it in track
+            if _kind(it) == "narration" and it.source_range is not None
+        )
+        raw_sum = sum(
+            it.source_range.duration.to_seconds() for it in raws if it.source_range is not None
+        )
+        need_ratio = narr_sum * (1.0 - 0.32) / 0.32
+        target_raw = min(need_ratio, band_lo - narr_sum)
+        if raws and raw_sum > 0.0 and narr_sum + raw_sum < band_lo and target_raw > raw_sum:
+            factor = min(1.25, target_raw / raw_sum)
+            for it in raws:
+                sr = it.source_range
+                start = sr.start_time.to_seconds()
+                cur = sr.duration.to_seconds()
+                ceiling = max(1.0, source_duration_s - 0.5 - start)
+                new = min(cur * factor, ceiling)
+                if new - cur >= 0.5:
+                    r = sr.start_time.rate or rate
+                    it.source_range = ot_time.TimeRange(
+                        start_time=ot_time.RationalTime(start * r, r),
+                        duration=ot_time.RationalTime(new * r, r),
+                    )
+                    added += new - cur
+        if added:
+            notes.append(f"raw top-up +{added:.0f}s toward the length floor (source intact)")
+    except Exception:
+        return timeline, notes
     return timeline, notes
 
 
@@ -404,6 +452,17 @@ Plan a COMPLETE {scale.target_lo:.0f}-{scale.target_hi:.0f}s documentary
 {source_duration_s / 60:.0f}-min video. The structure scales with the source
 length — a shorter tape gets fewer, tighter acts; a long tape gets the full
 arc. Never plan longer than the source.
+
+## Hard numbers for THIS tape (the plan is MECHANICALLY audited against
+exactly these — violating one rejects the whole plan before execution)
+- TOTAL master length (sum of EVERY clip's duration): {scale.target_lo:.0f}-
+  {scale.target_hi:.0f}s. Count your own durations and make the sum land
+  inside the band; a plan that sums under {scale.min_final_s:.0f}s is
+  auto-rejected — size the raw stretches up, not the narration.
+- Narration blocks: {scale.narr_lo}–{scale.narr_hi} in total (Cold Open hook +
+  act commentary + outro all count). Fewer blocks = auto-rejection, no matter
+  how good the writing is.
+- Raw clips: {scale.raw_min}–{scale.raw_max} (see Hard rules below).
 
 Structure (acts[0] is the Cold Open) — the GENERAL arc for this niche, not a
 template:
@@ -1121,6 +1180,29 @@ class DirectorSession:
         if best is not None:
             return best, last_err  # structurally valid but truncated: Phase B repairs
         return None, last_err
+
+    # -------------------------------------------------- authored-plan path
+    def plan_from_saved_json(self, saved: str) -> tuple[MacroPlan | None, str]:
+        """Director-authored plan injection — the model writes the script, the
+        SAME gates judge it (speech snap + hard-number pre-flight). Returns
+        (plan, "") when the plan would pass Phase A's own laws; a parseable
+        but non-compliant plan returns (plan, problems) so the caller can log
+        and fall through; unparseable returns (None, err).
+
+        Used when the routing chain cannot produce a compliant plan (capacity
+        downgrades, quota) but a compliant authored plan exists: the audit LAW
+        still runs — authoring bypasses no gate, it only replaces the wire
+        call.
+        """
+        try:
+            plan = parse_macro_plan(saved)
+            plan, _ = snap_plan_to_speech(plan, self.transcript, self.source_duration_s)
+        except (ValueError, ValidationError, json.JSONDecodeError) as e:
+            return None, f"authored plan unparseable ({e})"
+        problems = self._plan_problems(plan)
+        if problems:
+            return plan, "; ".join(problems)
+        return plan, ""
 
     def _honest_total(self, plan: MacroPlan) -> float:
         total = 0.0
