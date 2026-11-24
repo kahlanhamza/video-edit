@@ -130,3 +130,37 @@ could brick the stack).
 **Consequences:** no restart for key rotation; CI stays hermetic (probes
 transport-injected, MockTransport-pinned); a settings-vault wipe degrades to
 .env behavior; adding a provider = one catalog entry + one probe function.
+
+## ADR-0011 — Content safety gate: benign categories only, violence vetoed at plan time (2026-11-24)
+
+**Status:** Accepted (owner directive: "no dangerous incidents, extreme violence or gun
+shots — only shoplifting, trespassing, first amendment auditors")
+
+**Context:** The launch dossier v1 picked OWI/DUI/crash veins (Romo, Coates, the OSHP
+near-strike, the Parker DWI crash). The owner redefined the menu: benign incident
+categories only. The only honest signal available at plan time is TEXT — the case
+facts and the transcript.
+
+**Decision:** `agent_runtime/content_policy.py` — two layers. (1) VETO (always on):
+word-boundary markers for gunfire/weapon discharge/shooting/death/stabbing/standoff/
+SWAT/serious assault refuse the case outright, and `vetoed_ranges()` marks their
+transcript windows so no raw clip is cut inside one. Deliberately conservative —
+tasers, cuffs and holds are standard arrest content in the benign categories and are
+NOT markers. (2) ALLOWLIST (strict mode, default): non-empty case facts must match an
+on-menu category (shoplifting / retail theft, trespassing, first-amendment audit) or
+the planner refuses; empty case facts pass the veto only (documented, not silent).
+The deterministic planner enforces both at entry: intervals, seed ranges, hook
+fallbacks, the grid fallback and the floor top-up all respect veto ranges.
+`CONTENT_POLICY_MODE=veto_only` downgrades to veto-only for non-channel flows.
+
+**Alternatives rejected:** ingest-time manual review (necessary but not enforceable);
+LLM classification (no key in the sandbox; the deterministic text gate is testable
+and hermetic); vetoing all use-of-force words (a veto that fires on every arrest
+vetoes the niche).
+
+**Consequences:** the v1 launch picks can never be planned again; a violent utterance
+inside a benign case is excluded, not fatal to the case; the LLM-director path
+(Phase A/B tools) inherits the case gate only when it routes through the fallback
+planner — tool-level enforcement (`timeline.insert_raw_clip`) is follow-up work, and
+muted b-roll riding narration blocks is not re-anchored in v1 (a marker is audible,
+so its footage lives in speech windows raw clips draw from).

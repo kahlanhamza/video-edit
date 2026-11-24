@@ -382,8 +382,27 @@ def plan_fallback_blocks(
     between), outro close. Seed scripts (a previous LLM-authored plan) and
     seed raw ranges win over the generic bridges / speech-anchored picks when
     supplied.
+
+    CONTENT SAFETY LAW (ADR-0011, owner directive 2026-11-24): the case gate
+    runs first (violent/off-menu cases are refused, never planned), and no
+    raw clip is cut from a transcript window carrying a violent marker —
+    candidate intervals, seed ranges, hook fallbacks, and the floor top-up
+    all respect the veto ranges.
     """
+    from director_os.agent_runtime.content_policy import (
+        ContentPolicyError,
+        clip_safe_span,
+        drop_vetoed,
+        evaluate_case,
+        first_safe_window,
+        vetoed_ranges,
+    )
     from director_os.agent_runtime.doc_scale import doc_scale
+
+    verdict = evaluate_case(case_facts)
+    if not verdict.allowed:
+        raise ContentPolicyError(verdict.reason)
+    veto = vetoed_ranges(transcript)
 
     scale = doc_scale(source_duration_s)
     target = max(scale.target_lo, min(scale.target_hi, source_duration_s * 0.28))
@@ -395,7 +414,7 @@ def plan_fallback_blocks(
     transitions = SHORT_TRANSITION_BRIDGES if short_doc else TRANSITION_BRIDGES
     narr_lo = 5.0 if short_doc else 14.0
     narr_hi = 22.0 if short_doc else 34.0
-    intervals = _speech_intervals(transcript)
+    intervals = drop_vetoed(_speech_intervals(transcript), veto)
     seeds = {k: " ".join(v.split()) for k, v in (seed_scripts or {}).items() if v and v.strip()}
     seed_ranges = [r for r in (seed_raw_ranges or []) if r[1] > r[0]]
     act_windows = _act_windows(source_duration_s)
@@ -405,10 +424,19 @@ def plan_fallback_blocks(
     # --- COLD OPEN (hook-first): climax sting + hook narration ≤8s in
     hook_a, hook_b = HOOK_REGION
     hooks = _top_intervals(intervals, (hook_a, hook_b), source_duration_s, 4)[:2]
-    climax = hooks[0] if hooks else (source_duration_s * hook_a, source_duration_s * hook_a + 24.0)
+    if hooks:
+        climax = hooks[0]
+    else:
+        safe = clip_safe_span(source_duration_s * hook_a, 24.0, veto) or first_safe_window(
+            source_duration_s, 24.0, veto
+        )
+        climax = safe
     # 1) the sting: ≤STING_MAX_S of the climax WITH its raw audio — the ear-catch
     sting_start = max(0.0, climax[0])
-    blocks.append(_Block("raw", sting_start, STING_MAX_S, act="Cold Open"))
+    # a veto-trimmed fallback climax may be shorter than the sting — the
+    # sting may never overrun the safe window back into vetoed footage
+    sting_dur = min(STING_MAX_S, max(0.5, climax[1]))
+    blocks.append(_Block("raw", sting_start, sting_dur, act="Cold Open"))
     # 2) the hook narration, b-roll riding the climax moment (muted bed)
     hook = _hook_script(case_facts, seeds.get("hook") or seeds.get("Cold Open"), short=short_doc)
     blocks.append(
@@ -464,19 +492,24 @@ def plan_fallback_blocks(
             )
         )
         act_ranges = _seed_ranges_in(
-            seed_ranges, lo, hi, source_duration_s, max_ranges=clips_per_act
+            seed_ranges, lo, hi, source_duration_s, max_ranges=clips_per_act, veto_ranges=veto
         ) or _top_intervals(intervals, (lo, hi), source_duration_s, clips_per_act)
         if act_ranges:
             for a, b in act_ranges:
                 # budget-driven length: the speech anchor justifies the window,
                 # the act budget sizes it (long-tail dead air falls out)
                 d = min(per_clip, max(per_clip - 3.0, b - a + 1.5))
-                blocks.append(_Block("raw", max(0.0, a - 0.5), d, act=name))
+                raw_span = clip_safe_span(max(0.0, a - 0.5), d, veto)
+                if raw_span is None:
+                    continue
+                blocks.append(_Block("raw", raw_span[0], raw_span[1], act=name))
         else:  # fixed grid fallback inside the window
             w = (hi - lo) * source_duration_s
             for k in range(clips_per_act):
                 start = lo * source_duration_s + k * (w / (clips_per_act + 0.2))
-                blocks.append(_Block("raw", start, min(per_clip, w / clips_per_act), act=name))
+                grid_span = clip_safe_span(start, min(per_clip, w / clips_per_act), veto)
+                if grid_span is not None:
+                    blocks.append(_Block("raw", grid_span[0], grid_span[1], act=name))
         closing = transitions[close_key]
         if close_key == "Act 6: Verified Outcome":
             closing = seeds.get("outro") or seeds.get(close_key) or closing
@@ -509,7 +542,10 @@ def plan_fallback_blocks(
         need = aim - total
         factor = min(1.35, (raw_sum + need) / raw_sum)
         for blk in raws:
-            blk.dur_s = min(75.0, blk.dur_s * factor)
+            # the extension may never cross into a veto range
+            grown = min(75.0, blk.dur_s * factor)
+            grown_safe = clip_safe_span(blk.source_start_s, grown, veto)
+            blk.dur_s = min(grown, grown_safe[1]) if grown_safe else blk.dur_s
     return blocks
 
 
@@ -519,14 +555,25 @@ def _seed_ranges_in(
     hi: float,
     source_duration_s: float,
     max_ranges: int = 3,
+    veto_ranges: list[tuple[float, float, str]] | None = None,
 ) -> list[tuple[float, float]]:
-    """Seed raw clips (source-clock) that fall inside the [lo, hi] act window."""
+    """Seed raw clips (source-clock) that fall inside the [lo, hi] act window.
+
+    Seed ranges come from a previous LLM-authored plan and bypass the
+    interval filter, so every seed is trimmed off the veto ranges before it
+    can become a raw clip (a vetoed seed shrinks or drops entirely).
+    """
     a0, a1 = lo * source_duration_s, hi * source_duration_s
     picked = [
         (max(a, a0), min(b, a1))
         for a, b in seed_ranges
         if b > a0 and a < a1 and min(b, a1) - max(a, a0) >= 4.0
     ]
+    if veto_ranges:
+        from director_os.agent_runtime.content_policy import clip_safe_span
+
+        trimmed = [s for s in (clip_safe_span(a, b - a, veto_ranges) for a, b in picked) if s]
+        picked = [(a, a + d) for a, d in trimmed]
     picked.sort(key=lambda p: -(p[1] - p[0]))
     return sorted(picked[:max_ranges])
 
