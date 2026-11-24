@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -54,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--slug", required=True, help="deliverable filename stem")
     p.add_argument(
         "--corner",
-        default="bottom_right",
+        default="top_left",  # owner directive 2026-11-25: the badge never hides captions
         choices=("top_left", "top_right", "bottom_left", "bottom_right"),
     )
     p.add_argument("--render", default="1920x1080", help="master geometry WxH")
@@ -170,6 +171,20 @@ def finalize(master: Path, ass: Path | None, out: Path, corner: str) -> Path:
 
 def main() -> int:
     args = parse_args()
+    # --- production standing laws (owner rules, enforced here so a documentary
+    # run can never silently skip them):
+    #   POST_FX=1                 tracked blur + deep-filter audio + caption burn
+    #                             on the ASSEMBLED master (owner rule 2026-11-19)
+    #   AUDIO_MODE=isolate_2bus   production bodycam audio (make_deps docstring)
+    #   AUDIO_ENHANCER=deepfilter the neural speech enhancer
+    #   REDACT_MODE=tracked       trajectories, not static boxes
+    for name, value in (
+        ("POST_FX", "1"),
+        ("AUDIO_MODE", "isolate_2bus"),
+        ("AUDIO_ENHANCER", "deepfilter"),
+        ("REDACT_MODE", "tracked"),
+    ):
+        os.environ.setdefault(name, value)
     settings = get_settings()
     src = Path(args.source)
     assert src.exists(), f"source missing: {src}"

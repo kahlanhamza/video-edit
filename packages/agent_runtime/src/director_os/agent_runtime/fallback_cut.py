@@ -417,10 +417,13 @@ def plan_fallback_blocks(
 
     scale = doc_scale(source_duration_s)
     target = max(scale.target_lo, min(scale.target_hi, source_duration_s * 0.28))
-    # SHORT-DOC LAW: below a ~240s master the full-length bridge scripts carry
+    # SHORT-DOC LAW: below a ~400s master the full-length bridge scripts carry
     # more narration than the ratio law allows — switch to the short variants
-    # (hook/outro keep the arc) and let the estimate bounds follow.
-    short_doc = target < 240.0
+    # (hook/outro keep the arc) and let the estimate bounds follow. The
+    # threshold rides the 50-65% keep band (owner-ratified 2026-11-25): an
+    # 8-min tape now plans a ~240s master, where full bridges measured 0.58
+    # narration ratio (the 251s tape-1 lineage) — short bridges keep it legal.
+    short_doc = target < 400.0
     narrators = SHORT_NARRATOR_BRIDGES if short_doc else NARRATOR_BRIDGES
     transitions = SHORT_TRANSITION_BRIDGES if short_doc else TRANSITION_BRIDGES
     narr_lo = 5.0 if short_doc else 14.0
