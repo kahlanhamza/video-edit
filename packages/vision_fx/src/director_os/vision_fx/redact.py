@@ -88,8 +88,15 @@ def clip_region_time(region: BlurRegion, seg_start_s: float, seg_dur_s: float) -
 
 def _safe_sigmas(sigma: int, box_w: int, box_h: int) -> tuple[int, int]:
     """boxblur radius must be < half the plane size — luma AND chroma planes differ
-    on yuv420p (chroma is half-res), so clamp them independently."""
-    luma = max(0, min(sigma, (min(box_w, box_h) - 1) // 2))
+    on yuv420p (chroma is half-res), so clamp them independently.
+
+    The crop plane is EVEN on yuv420p: an odd crop size (43) rounds down to 42
+    before the blur sees it, so the clamp derives from the even size — radius
+    21 on a 43px region killed the segment render (tape-1 wire fact).
+    """
+    plane = min(box_w, box_h)
+    plane -= plane % 2  # the crop's actual even plane size
+    luma = max(0, min(sigma, (plane - 1) // 2))
     chroma = max(0, min(sigma, (min(box_w // 2, box_h // 2) - 1) // 2))
     return luma, chroma
 
