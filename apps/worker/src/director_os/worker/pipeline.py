@@ -1917,8 +1917,9 @@ def _plan_documentary(
     dur: float,
     fps: int,
     card_fields: dict,
+    niche: str = "bodycam_documentary",
 ) -> tuple[Any, int]:
-    """LLM 6-act story-map path with deterministic fallback (>= 15 min sources)."""
+    """LLM 6-act story-map path with deterministic fallback (>= 15 min sources)."""  # noqa: E501
     from director_os.agent_runtime.checkpoint import CheckpointStore
     from director_os.agent_runtime.director_session import DirectorSession
     from director_os.agent_runtime.editing_tools import DirectorToolbox, build_director_registry
@@ -1947,7 +1948,13 @@ def _plan_documentary(
         toolbox = DirectorToolbox(scaffold, project_id, (deps.video.w, deps.video.h))
         registry = build_director_registry(toolbox)
         session = DirectorSession(
-            registry, store, project_id, backend, source_duration_s=dur, transcript=transcript
+            registry,
+            store,
+            project_id,
+            backend,
+            source_duration_s=dur,
+            transcript=transcript,
+            niche=niche,
         )
         plan, plan_err = session.plan_macro(buckets, dossier)
         if plan is None:
@@ -1995,6 +2002,7 @@ def _plan_documentary(
         width=deps.video.w,
         height=deps.video.h,
         project_id=project_id,
+        niche=niche,
     )
     timeline = build_timeline(spec)
     _apply_audio_mode(timeline, deps)
@@ -2030,9 +2038,12 @@ def stage_planning(
     `force_replan=True` invalidates the active-version shortcut (a refreshed
     CaseDossier re-runs Stage 6 without touching ingest or ASR).
     """
+    niche = "bodycam_documentary"
     with deps.sessions() as s:
         project = s.get(ProjectRow, project_id)
-        if project.active_otio_version_id is not None and not force_replan:
+        if project is not None:
+            niche = project.niche_skill or "bodycam_documentary"
+        if project is not None and project.active_otio_version_id is not None and not force_replan:
             version = project.active_otio_version_id
             row = s.execute(
                 select(TimelineVersionRow).where(
@@ -2068,7 +2079,14 @@ def stage_planning(
     # 1-minute slice (Eustis postmortem), never an 8s-grained full dump
     if dur >= DOCUMENTARY_MIN_SOURCE_S:
         return _plan_documentary(
-            asset_id, transcript, project_id, deps, dur=dur, fps=fps, card_fields=card_fields
+            asset_id,
+            transcript,
+            project_id,
+            deps,
+            dur=dur,
+            fps=fps,
+            card_fields=card_fields,
+            niche=niche,
         )
 
     n_segments = max(1, math.ceil(dur / AUTO_CUT_MAX_SEGMENT_S))

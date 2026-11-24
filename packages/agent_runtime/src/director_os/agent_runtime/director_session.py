@@ -256,11 +256,39 @@ HOOK_PROMPT_LAW = """## HOOK-FIRST LAW (non-negotiable — think like a real pro
   execution."""
 
 
+# Niche arcs — the body arc is the ONE bodycam-flavored structure; every
+# other niche (audits, retail, trespassing, anything escalated) plans the
+# GENERAL escalation arc. The owner directive 2026-11-24: this is the
+# narration/commentary editor for escalated incidents, not an arrest-only tool.
+ARC_BODYCAM = (
+    "2+. Body acts: arrival/contact -> investigation/friction -> escalation/turning\n"
+    "   point -> arrest/detention -> aftermath/booking -> verified outcome — include\n"
+    "   the beats this footage ACTUALLY has, in order, and drop what it doesn't.\n"
+    "   Miranda readings, policy violations, and sobriety/field tests are HIGHLIGHTS\n"
+    "   to surface whenever present — never force them into a beat they don't belong\n"
+    "   to. Trim boilerplate (a Miranda reading = intro + waiver, never the full recital)."
+)
+ARC_GENERIC = (
+    "2+. Body acts: arrival/contact -> friction/questions -> escalation/turning\n"
+    "   point -> the peak (detention/citation/confrontation/endgame) -> aftermath ->\n"
+    "   verified outcome — include the beats this footage ACTUALLY has, in order,\n"
+    "   and drop what it doesn't. The footage's OWN peak beats (demands, refusals,\n"
+    "   admissions, contradictions, unexpected turns) are HIGHLIGHTS to surface\n"
+    "   whenever present — never force a template beat into footage without it."
+)
+NICHE_ARCS = {"bodycam_documentary": ARC_BODYCAM}
+NICHE_ENDING_LAW = {
+    "bodycam_documentary": "(never drop the arrest/booking ending)",
+}
+GENERIC_ENDING_LAW = "(never drop the resolution/outcome ending)"
+
+
 def macro_plan_user_prompt(
     buckets: list[StoryBucket],
     source_duration_s: float,
     dossier_json: dict[str, Any] | None = None,
     transcript: dict | None = None,
+    niche: str = "bodycam_documentary",
 ) -> str:
     """Phase A prompt: story index + FULL dialogue + dossier + editorial laws.
 
@@ -271,6 +299,8 @@ def macro_plan_user_prompt(
     from director_os.agent_runtime.story_map import render_full_transcript
 
     scale = doc_scale(source_duration_s)
+    arc = NICHE_ARCS.get(niche, ARC_GENERIC)
+    ending_law = NICHE_ENDING_LAW.get(niche, GENERIC_ENDING_LAW)
     dossier_block = ""
     if dossier_json:
         dossier_block = (
@@ -297,18 +327,13 @@ Plan a COMPLETE {scale.target_lo:.0f}-{scale.target_hi:.0f}s documentary
 length — a shorter tape gets fewer, tighter acts; a long tape gets the full
 arc. Never plan longer than the source.
 
-Structure (acts[0] is the Cold Open) — the GENERAL arrest/incident arc, not a
+Structure (acts[0] is the Cold Open) — the GENERAL arc for this niche, not a
 template:
 1. Cold Open Hook ({STING_MAX_S:.0f}s sting + the hook narration, context lands
    ≤30s): a ≤{STING_MAX_S:.0f}s climax raw sting (PULLED FROM LATER IN THE
    VIDEO, raw audio on) + the {WORDS_COLD[0]}-{WORDS_COLD[1]} word narration hook
    setting date/location/mystery from the dossier only, over muted climax b-roll.
-2+. Body acts: arrival/contact -> investigation/friction -> escalation/turning
-   point -> arrest/detention -> aftermath/booking -> verified outcome — include
-   the beats this footage ACTUALLY has, in order, and drop what it doesn't.
-   Miranda readings, policy violations, and sobriety/field tests are HIGHLIGHTS
-   to surface whenever present — never force them into a beat they don't belong
-   to. Trim boilerplate (a Miranda reading = intro + waiver, never the full recital).
+{arc}
 
 {
             NARRATION_PROMPT_LAW.format(
@@ -331,7 +356,7 @@ Hard rules:
   dialogue or decisive action (dead air is cut automatically, so pick windows
   by what is SAID, not by the clock).
 - Clip starts must span the WHOLE file: earliest within the first 15%, latest
-  ending inside the final 25% (never drop the arrest/booking ending).
+  ending inside the final 25% {ending_law}.
 - Cut dead air and logistics (keys, phone details, radio spelling); KEEP
   ironic, emotional, and incriminating exchanges — and keep them COMPLETE
   (a clip may extend past its window to finish the punchline; say so in `note`).
@@ -540,6 +565,7 @@ def refine_plan_quotes(
     backend: Any,
     source_duration_s: float,
     problems_fn=None,
+    niche: str = "bodycam_documentary",
 ) -> tuple[MacroPlan, str]:
     """The Quote-Grounded Refinement pass (one extra completion, soft-fail).
 
@@ -561,9 +587,7 @@ def refine_plan_quotes(
     ]
     if not windows:
         return plan, ""
-    system = compose_agent_prompt(
-        agent="director_agent", role="director", niche="bodycam_documentary"
-    )
+    system = compose_agent_prompt(agent="director_agent", role="director", niche=niche)
     user = (
         "## Quote-grounded refinement of an accepted documentary plan\n"
         "Here is the ACCEPTED plan JSON. Improve it using the transcript quotes: "
@@ -602,6 +626,7 @@ def critic_refine_plan(
     backend: Any,
     source_duration_s: float,
     problems_fn=None,
+    niche: str = "bodycam_documentary",
 ) -> tuple[MacroPlan, str]:
     """The Legal & Documentary QA Critic pass (the notebook's second LLM stage).
 
@@ -619,9 +644,7 @@ def critic_refine_plan(
     full_dialogue = render_full_transcript(transcript or {})
     if not full_dialogue:
         return plan, ""
-    system = compose_agent_prompt(
-        agent="director_agent", role="critic", niche="bodycam_documentary"
-    )
+    system = compose_agent_prompt(agent="director_agent", role="critic", niche=niche)
     user = f"""You are a strict Legal & Documentary QA Critic reviewing an AI-generated Edit Plan.
 Compare the draft plan against the FULL DIALOGUE TRANSCRIPT below.
 
@@ -903,11 +926,13 @@ class DirectorSession:
         phase_a_retries: int = 3,  # the notebook law: 3 generation attempts
         transcript: dict | None = None,  # enables ASR snap + quote refinement
         quote_refine: bool = True,
+        niche: str = "bodycam_documentary",  # selects the skill playbook + arc
     ):
         self.registry = registry
         self.store = store
         self.project_id = project_id
         self.backend = backend
+        self.niche = niche
         self.source_duration_s = source_duration_s
         self.scale = doc_scale(source_duration_s)
         self.max_turns = max_turns
@@ -935,11 +960,13 @@ class DirectorSession:
         """
         from director_os.agent_runtime.llm import LLMBackendError
 
-        system = compose_agent_prompt(
-            agent="director_agent", role="director", niche="bodycam_documentary"
-        )
+        system = compose_agent_prompt(agent="director_agent", role="director", niche=self.niche)
         user = macro_plan_user_prompt(
-            buckets, self.source_duration_s, dossier_json, transcript=self.transcript
+            buckets,
+            self.source_duration_s,
+            dossier_json,
+            transcript=self.transcript,
+            niche=self.niche,
         )
         feedback = ""
         last_err = ""
@@ -979,6 +1006,7 @@ class DirectorSession:
                         self.backend,
                         self.source_duration_s,
                         problems_fn=self._plan_problems,
+                        niche=self.niche,
                     )
                     if critic_note:
                         last_err = critic_note
@@ -988,6 +1016,7 @@ class DirectorSession:
                         self.backend,
                         self.source_duration_s,
                         problems_fn=self._plan_problems,
+                        niche=self.niche,
                     )
                     if refine_note:
                         last_err = refine_note

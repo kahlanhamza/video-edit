@@ -288,6 +288,247 @@ SHORT_TRANSITION_BRIDGES = {
 }
 
 
+# NICHE-GENERAL law (owner directive 2026-11-24): every non-bodycam niche
+# (first amendment audit, retail theft, trespassing, ...) shares the GENERIC
+# act layout below — the same escalation arc with neutral act names (the peak
+# may be a detention, a citation, a confrontation, or just an endgame; the
+# tape decides, not the label). Same windows, same bridge-key structure, no
+# bodycam/officer/arrest lexicon anywhere in the generic tables.
+GENERIC_ACT_SETS: dict[int, tuple[tuple[str, float, float, str, str], ...]] = {
+    3: (
+        (
+            "Act 1: Contact & Friction",
+            0.02,
+            0.38,
+            "Act 1: Arrival & Contact",
+            "Act 2: Friction & Refusal",
+        ),
+        ("Act 2: The Peak", 0.38, 0.74, "Act 3: The Peak", "Act 4: The Endgame"),
+        (
+            "Act 3: Aftermath & Outcome",
+            0.74,
+            1.00,
+            "Act 5: Aftermath & Processing",
+            "Act 6: Verified Outcome",
+        ),
+    ),
+    4: (
+        (
+            "Act 1: Arrival & Contact",
+            0.02,
+            0.25,
+            "Act 1: Arrival & Contact",
+            "Act 1: Arrival & Contact",
+        ),
+        (
+            "Act 2: Friction & Refusal",
+            0.25,
+            0.50,
+            "Act 2: Friction & Refusal",
+            "Act 2: Friction & Refusal",
+        ),
+        ("Act 3: The Peak & Endgame", 0.50, 0.74, "Act 3: The Peak", "Act 4: The Endgame"),
+        (
+            "Act 4: Aftermath & Outcome",
+            0.74,
+            1.00,
+            "Act 5: Aftermath & Processing",
+            "Act 6: Verified Outcome",
+        ),
+    ),
+    5: (
+        (
+            "Act 1: Arrival & Contact",
+            0.02,
+            0.15,
+            "Act 1: Arrival & Contact",
+            "Act 1: Arrival & Contact",
+        ),
+        (
+            "Act 2: Friction & Refusal",
+            0.15,
+            0.38,
+            "Act 2: Friction & Refusal",
+            "Act 2: Friction & Refusal",
+        ),
+        ("Act 3: The Peak", 0.38, 0.58, "Act 3: The Peak", "Act 3: The Peak"),
+        ("Act 4: The Endgame", 0.58, 0.80, "Act 4: The Endgame", "Act 4: The Endgame"),
+        (
+            "Act 5: Aftermath & Outcome",
+            0.80,
+            1.00,
+            "Act 5: Aftermath & Processing",
+            "Act 6: Verified Outcome",
+        ),
+    ),
+}
+GENERIC_ACT_SETS[6] = tuple(
+    (name, lo, hi, name, name)
+    for name, lo, hi in (
+        ("Act 1: Arrival & Contact", 0.02, 0.15),
+        ("Act 2: Friction & Refusal", 0.15, 0.38),
+        ("Act 3: The Peak", 0.38, 0.58),
+        ("Act 4: The Endgame", 0.58, 0.74),
+        ("Act 5: Aftermath & Processing", 0.74, 0.88),
+        ("Act 6: Verified Outcome", 0.88, 1.00),
+    )
+)
+
+# Generic-niche bridges — same keys as the generic act tables, zero
+# bodycam/officer/arrest lexicon. Full-length variants first.
+NARRATOR_BRIDGES_GENERIC = {
+    "Cold Open": (
+        "The camera was already rolling. What it caught next turned an ordinary "
+        "encounter into a legal fight — and every second of it is on tape. Stay "
+        "with the first thirty seconds, because the detail that decides this "
+        "entire recording appears before anyone says a word."
+    ),
+    "Act 1: Arrival & Contact": (
+        "It starts like any other encounter. Small talk, routine questions — and "
+        "the first small details that will not add up later. Watch how casually "
+        "this begins; nothing about the next forty minutes is casual. One side "
+        "is filming for the record, the other is deciding how this ends, and "
+        "the gap between them is where this whole story lives."
+    ),
+    "Act 2: Friction & Refusal": (
+        "Now the requests turn into friction. Someone asks, someone refuses, "
+        "and the polite phase quietly expires. Notice how the same demand gets "
+        "repeated three different ways, and how the room tightens a little more "
+        "each time."
+    ),
+    "Act 3: The Peak": (
+        "This is the turning point. The demands get sharper, the choices get "
+        "narrower, and everyone here knows the next minute decides how this "
+        "recording ends. From here on, every sentence spoken on this tape gets "
+        "replayed later, line by line, under much less forgiving lighting."
+    ),
+    "Act 4: The Endgame": (
+        "The endgame itself — the detention, the citation, the confrontation, "
+        "whatever form this peak takes, caught in full. Listen closely to what "
+        "gets said in these seconds; it is the part every account afterwards "
+        "has to match."
+    ),
+    "Act 5: Aftermath & Processing": (
+        "What follows the peak matters just as much: names, numbers, paperwork, "
+        "and the details that lock the record in place — the part that decides "
+        "how this story actually ends. Paperwork does not get nervous, and it "
+        "does not forget."
+    ),
+    "Act 6: Verified Outcome": (
+        "The encounter winds down, the paperwork comes out, and the record "
+        "closes the loop on everything you just watched. This is the verified "
+        "outcome, exactly as the public record states it. Every claim from the "
+        "last forty minutes now meets the one thing it cannot argue with — the "
+        "result."
+    ),
+}
+
+TRANSITION_BRIDGES_GENERIC = {
+    "Act 1: Arrival & Contact": (
+        "Nothing about these first minutes looks unusual — and that is exactly "
+        "what makes the next part worth watching. Keep an eye on the small "
+        "details, because the story turns on them."
+    ),
+    "Act 2: Friction & Refusal": (
+        "By this point the requests are straining against the refusals. What "
+        "comes next is the moment patience expires and the situation hardens — "
+        "so watch the frame, and listen to every word."
+    ),
+    "Act 3: The Peak": (
+        "Once that line is crossed there is no walking it back. The next "
+        "stretch of tape is the part every account afterwards has to match, "
+        "second by second."
+    ),
+    "Act 4: The Endgame": (
+        "With the peak behind, the encounter shifts from confrontation to "
+        "paperwork — names, numbers, and the details that turn memory into a "
+        "record."
+    ),
+    "Act 5: Aftermath & Processing": (
+        "The final stretch answers the only question that matters: how does "
+        "this encounter actually end? The verified outcome is next, and it "
+        "lands differently once you have watched how it unfolded."
+    ),
+    "Act 6: Verified Outcome": (
+        "That is the full arc, start to finish, exactly as the camera recorded "
+        "it. The next one is already on the channel — and it opens with the "
+        "same rule this one proved: the camera keeps rolling whether anyone "
+        "behaves or not."
+    ),
+}
+
+SHORT_NARRATOR_BRIDGES_GENERIC = {
+    "Cold Open": (
+        "The camera was already rolling. What it caught next turned an ordinary "
+        "encounter into a legal fight — and the detail that decides everything "
+        "appears early."
+    ),
+    "Act 1: Arrival & Contact": (
+        "It starts like any routine encounter — small talk, routine questions. "
+        "But the first details already refuse to add up, and the camera keeps "
+        "rolling."
+    ),
+    "Act 2: Friction & Refusal": (
+        "Now the requests meet refusals. The polite phase quietly expires, and "
+        "everyone in this frame knows it."
+    ),
+    "Act 3: The Peak": (
+        "This is the turning point — sharper demands, narrowing choices. The "
+        "conversation ends here and the situation takes over."
+    ),
+    "Act 4: The Endgame": (
+        "The endgame caught in full — the part every account afterwards has to match."
+    ),
+    "Act 5: Aftermath & Processing": (
+        "After the peak come names, numbers, and paperwork — the details that "
+        "decide how this story actually ends."
+    ),
+    "Act 6: Verified Outcome": (
+        "The paperwork comes out and the record closes the loop on everything "
+        "you just watched — the verified outcome, exactly as filed."
+    ),
+}
+
+SHORT_TRANSITION_BRIDGES_GENERIC = {
+    "Act 1: Arrival & Contact": (
+        "Nothing here looks unusual yet — which is exactly what makes the next "
+        "stretch worth watching."
+    ),
+    "Act 2: Friction & Refusal": (
+        "Watch the requests meet refusals — the polite phase is straining at the seams."
+    ),
+    "Act 3: The Peak": (
+        "Once that line is crossed there is no walking it back — every sentence "
+        "from here is on the record."
+    ),
+    "Act 4: The Endgame": ("The peak turns confrontation into measured, timestamped record."),
+    "Act 5: Aftermath & Processing": (
+        "The final stretch answers the only question that matters: how does "
+        "the record actually close?"
+    ),
+    "Act 6: Verified Outcome": (
+        "If this case told you something the headlines didn't, the next one is "
+        "already on the channel."
+    ),
+}
+
+
+def _niche_tables(niche: str, short_doc: bool) -> tuple[dict, dict[str, str], dict[str, str]]:
+    """Act sets + bridge tables for a niche; ANY non-bodycam niche gets the
+    generic tables (the generic escalated-incident arc)."""
+    if niche == "bodycam_documentary":
+        return (
+            ACT_SETS,
+            SHORT_NARRATOR_BRIDGES if short_doc else NARRATOR_BRIDGES,
+            SHORT_TRANSITION_BRIDGES if short_doc else TRANSITION_BRIDGES,
+        )
+    return (
+        GENERIC_ACT_SETS,
+        SHORT_NARRATOR_BRIDGES_GENERIC if short_doc else NARRATOR_BRIDGES_GENERIC,
+        SHORT_TRANSITION_BRIDGES_GENERIC if short_doc else TRANSITION_BRIDGES_GENERIC,
+    )
+
+
 @dataclass
 class _Block:
     kind: str  # raw | narration
@@ -297,29 +538,35 @@ class _Block:
     act: str = ""
 
 
-def _hook_script(case_facts: str, seed: str | None, short: bool = False) -> str:
+def _hook_script(
+    case_facts: str, seed: str | None, short: bool = False, generic: bool = False
+) -> str:
     """The cold-open hook: 3 punchy lines carrying the who/what/where/when.
 
     Seeds (previously LLM-authored narration) win; the fact line composes a
     clean hook otherwise. Never editorializes guilt — public-record framing.
+    `generic=True` swaps the bodycam lexicon for the neutral camera framing
+    (any escalated-incident niche).
     """
     if seed:
         return " ".join(seed.split())
     facts = " ".join((case_facts or "").split())
+    camera = "The camera never stopped rolling" if generic else "The bodycam never stopped rolling"
     if short:
         if facts:
-            return (
-                f"{facts} The bodycam never stopped rolling — stay for the "
-                "detail that decides this entire case."
-            )
-        return SHORT_NARRATOR_BRIDGES["Cold Open"]
+            return f"{facts} {camera} — stay for the detail that decides this entire case."
+        return (SHORT_NARRATOR_BRIDGES_GENERIC if generic else SHORT_NARRATOR_BRIDGES)["Cold Open"]
     if facts:
+        if generic:
+            return (
+                f"{facts} {camera} — and what it captured turned an ordinary "
+                "encounter into a legal fight. Every second of it is on tape."
+            )
         return (
-            f"{facts} The bodycam never stopped rolling — and what it captured "
-            "turned a routine shift into a criminal case. Every second of it "
-            "is on tape."
+            f"{facts} {camera} — and what it captured turned a routine shift "
+            "into a criminal case. Every second of it is on tape."
         )
-    return NARRATOR_BRIDGES["Cold Open"]
+    return (NARRATOR_BRIDGES_GENERIC if generic else NARRATOR_BRIDGES)["Cold Open"]
 
 
 def _narr_dur(script: str, *, lo: float = 12.0, hi: float = 34.0) -> float:
@@ -356,13 +603,15 @@ def _top_intervals(
     return sorted(in_win[:count])
 
 
-def _act_windows(source_duration_s: float):
-    """Act layout scaled to the source length (doc_scale act count)."""
+def _act_windows(source_duration_s: float, niche: str = "bodycam_documentary"):
+    """Act layout scaled to the source length (doc_scale act count), chosen
+    for the niche (generic escalation arc for every non-bodycam niche)."""
     from director_os.agent_runtime.doc_scale import doc_scale
 
     n = doc_scale(source_duration_s)
     n_acts = max(3, min(6, round((n.target_lo + n.target_hi) / 2 / 110)))
-    return ACT_SETS.get(n_acts, ACT_SETS[6])
+    sets = _niche_tables(niche, short_doc=False)[0]
+    return sets.get(n_acts, sets[6])
 
 
 def plan_fallback_blocks(
@@ -372,6 +621,7 @@ def plan_fallback_blocks(
     seed_scripts: dict[str, str] | None = None,
     seed_raw_ranges: list[tuple[float, float]] | None = None,
     case_facts: str = "",
+    niche: str = "bodycam_documentary",
 ) -> list[_Block]:
     """Pure deterministic planner: the full-arc block list (HOOK-FIRST law).
 
@@ -391,14 +641,13 @@ def plan_fallback_blocks(
     # more narration than the ratio law allows — switch to the short variants
     # (hook/outro keep the arc) and let the estimate bounds follow.
     short_doc = target < 240.0
-    narrators = SHORT_NARRATOR_BRIDGES if short_doc else NARRATOR_BRIDGES
-    transitions = SHORT_TRANSITION_BRIDGES if short_doc else TRANSITION_BRIDGES
+    _sets, narrators, transitions = _niche_tables(niche, short_doc)
     narr_lo = 5.0 if short_doc else 14.0
     narr_hi = 22.0 if short_doc else 34.0
     intervals = _speech_intervals(transcript)
     seeds = {k: " ".join(v.split()) for k, v in (seed_scripts or {}).items() if v and v.strip()}
     seed_ranges = [r for r in (seed_raw_ranges or []) if r[1] > r[0]]
-    act_windows = _act_windows(source_duration_s)
+    act_windows = _act_windows(source_duration_s, niche)
 
     blocks: list[_Block] = []
 
@@ -410,7 +659,12 @@ def plan_fallback_blocks(
     sting_start = max(0.0, climax[0])
     blocks.append(_Block("raw", sting_start, STING_MAX_S, act="Cold Open"))
     # 2) the hook narration, b-roll riding the climax moment (muted bed)
-    hook = _hook_script(case_facts, seeds.get("hook") or seeds.get("Cold Open"), short=short_doc)
+    hook = _hook_script(
+        case_facts,
+        seeds.get("hook") or seeds.get("Cold Open"),
+        short=short_doc,
+        generic=niche != "bodycam_documentary",
+    )
     blocks.append(
         _Block("narration", climax[0], _narr_dur(hook, lo=narr_lo, hi=26.0), hook, "Cold Open")
     )
@@ -430,6 +684,7 @@ def plan_fallback_blocks(
             case_facts,
             (seed_scripts or {}).get("hook") or (seed_scripts or {}).get("Cold Open"),
             short=short_doc,
+            generic=niche != "bodycam_documentary",
         ),
         lo=narr_lo,
         hi=26.0,
@@ -543,6 +798,7 @@ def build_fallback_documentary(
     seed_scripts: dict[str, str] | None = None,
     seed_raw_ranges: list[tuple[float, float]] | None = None,
     case_facts: str = "",
+    niche: str = "bodycam_documentary",
 ) -> TimelineSpec:
     """The deterministic 6-act documentary timeline spec (QA-invariant-safe)."""
     blocks = plan_fallback_blocks(
@@ -551,6 +807,7 @@ def build_fallback_documentary(
         seed_scripts=seed_scripts,
         seed_raw_ranges=seed_raw_ranges,
         case_facts=case_facts,
+        niche=niche,
     )
 
     master: list[ClipSpec | GapSpec] = []
@@ -626,7 +883,11 @@ def build_fallback_documentary(
         first_body,
         "location_intro",
         "CASE FILE",
-        "Bodycam footage — public record",
+        (
+            "Recorded on scene — public record"
+            if niche != "bodycam_documentary"
+            else "Bodycam footage — public record"
+        ),
         4.0,
     )
     _card_at(
