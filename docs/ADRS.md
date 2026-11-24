@@ -131,7 +131,7 @@ could brick the stack).
 transport-injected, MockTransport-pinned); a settings-vault wipe degrades to
 .env behavior; adding a provider = one catalog entry + one probe function.
 
-## ADR-0011 — Content safety gate: benign categories only, violence vetoed at plan time (2026-11-24)
+## ADR-0013 — Content safety gate: benign categories only, violence vetoed at plan time (2026-11-24)
 
 **Status:** Accepted (owner directive: "no dangerous incidents, extreme violence or gun
 shots — only shoplifting, trespassing, first amendment auditors")
@@ -164,3 +164,37 @@ inside a benign case is excluded, not fatal to the case; the LLM-director path
 planner — tool-level enforcement (`timeline.insert_raw_clip`) is follow-up work, and
 muted b-roll riding narration blocks is not re-anchored in v1 (a marker is audible,
 so its footage lives in speech windows raw clips draw from).
+
+## ADR-0014 — Foreign narration is detected and replaced, never shipped (2026-11-24)
+
+**Status:** Accepted (owner directive: "some of the videos if you get it from YouTube
+they already have narrations and commentary segments on it, and they maybe also have
+captions, so we must also detect those narration segments and replace them with our own")
+
+**Context:** YouTube-sourced tapes (Law&Crime et al.) carry the source channel's
+narration/commentary. Shipping their voice is (a) a copyright exposure, (b) a brand
+failure — the channel's thesis is OUR narration. Captions are covered by the v6
+caption law's narrator-on-broll isolation (muted beds never carry raw cues); the
+remaining leak path is raw-clip AUDIO.
+
+**Decision:** `agent_runtime/foreign_media.py` — transcript-based detection, two
+signals, deliberately conservative: (1) channel-language markers (greeting/CTA/
+video-framing/comment-prompt/news framing — regexes on diarized turns); (2) narrator-
+speaker detection (a speaker whose turns monologue — >=45s total, >=8s mean turn,
+<35% alternation with other speakers). `foreign_narration_ranges()` merges + pads the
+windows; the deterministic planner excludes them from EVERY raw (audio-on) decision
+the same way the violence veto excludes windows — candidate intervals, seeds, hook
+fallbacks, grid fallback, floor top-up. Their pixels stay available as muted b-roll
+under our narration blocks (that IS the replacement), and the caption law guarantees
+narration blocks carry only our narrator's cues.
+
+**Alternatives rejected:** audio fingerprinting (no reliable lib in-sandbox, the
+transcript is the honest signal); excluding the windows entirely from b-roll (needless
+— muted pixels under our voice are the replacement, not a leak); frame-based burned-
+caption auto-remediation (the caption_guard reports the collision; lane shifting is a
+human call, not an automatic one).
+
+**Consequences:** every planner path (deterministic, LLM-directed via fallback) is
+protected by construction; the production report lists every replaced window with its
+reason label; a pure raw release (The Day's audit tape) detects zero windows — the
+detector is honest about absence, not eager to flag.

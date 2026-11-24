@@ -383,11 +383,17 @@ def plan_fallback_blocks(
     seed raw ranges win over the generic bridges / speech-anchored picks when
     supplied.
 
-    CONTENT SAFETY LAW (ADR-0011, owner directive 2026-11-24): the case gate
+    CONTENT SAFETY LAW (ADR-0013, owner directive 2026-11-24): the case gate
     runs first (violent/off-menu cases are refused, never planned), and no
     raw clip is cut from a transcript window carrying a violent marker —
     candidate intervals, seed ranges, hook fallbacks, and the floor top-up
     all respect the veto ranges.
+
+    FOREIGN NARRATION LAW (owner directive 2026-11-24): YouTube-sourced tapes
+    carry the source channel's narration/commentary. Every foreign-narration
+    window is excluded from RAW (audio-on) clips the same way the violence
+    veto excludes windows — the beats are replaced by our own narration,
+    with the source pixels available only as muted b-roll.
     """
     from director_os.agent_runtime.content_policy import (
         ContentPolicyError,
@@ -398,11 +404,16 @@ def plan_fallback_blocks(
         vetoed_ranges,
     )
     from director_os.agent_runtime.doc_scale import doc_scale
+    from director_os.agent_runtime.foreign_media import foreign_narration_ranges
 
     verdict = evaluate_case(case_facts)
     if not verdict.allowed:
         raise ContentPolicyError(verdict.reason)
     veto = vetoed_ranges(transcript)
+    foreign = foreign_narration_ranges(transcript)
+    # audio-exclusion list: violence vetoes + foreign narrator windows —
+    # every RAW (audio-on) clip decision below respects this list
+    excluded = [*veto, *foreign]
 
     scale = doc_scale(source_duration_s)
     target = max(scale.target_lo, min(scale.target_hi, source_duration_s * 0.28))
@@ -414,7 +425,7 @@ def plan_fallback_blocks(
     transitions = SHORT_TRANSITION_BRIDGES if short_doc else TRANSITION_BRIDGES
     narr_lo = 5.0 if short_doc else 14.0
     narr_hi = 22.0 if short_doc else 34.0
-    intervals = drop_vetoed(_speech_intervals(transcript), veto)
+    intervals = drop_vetoed(_speech_intervals(transcript), excluded)
     seeds = {k: " ".join(v.split()) for k, v in (seed_scripts or {}).items() if v and v.strip()}
     seed_ranges = [r for r in (seed_raw_ranges or []) if r[1] > r[0]]
     act_windows = _act_windows(source_duration_s)
@@ -427,8 +438,8 @@ def plan_fallback_blocks(
     if hooks:
         climax = hooks[0]
     else:
-        safe = clip_safe_span(source_duration_s * hook_a, 24.0, veto) or first_safe_window(
-            source_duration_s, 24.0, veto
+        safe = clip_safe_span(source_duration_s * hook_a, 24.0, excluded) or first_safe_window(
+            source_duration_s, 24.0, excluded
         )
         climax = safe
     # 1) the sting: ≤STING_MAX_S of the climax WITH its raw audio — the ear-catch
@@ -492,14 +503,14 @@ def plan_fallback_blocks(
             )
         )
         act_ranges = _seed_ranges_in(
-            seed_ranges, lo, hi, source_duration_s, max_ranges=clips_per_act, veto_ranges=veto
+            seed_ranges, lo, hi, source_duration_s, max_ranges=clips_per_act, veto_ranges=excluded
         ) or _top_intervals(intervals, (lo, hi), source_duration_s, clips_per_act)
         if act_ranges:
             for a, b in act_ranges:
                 # budget-driven length: the speech anchor justifies the window,
                 # the act budget sizes it (long-tail dead air falls out)
                 d = min(per_clip, max(per_clip - 3.0, b - a + 1.5))
-                raw_span = clip_safe_span(max(0.0, a - 0.5), d, veto)
+                raw_span = clip_safe_span(max(0.0, a - 0.5), d, excluded)
                 if raw_span is None:
                     continue
                 blocks.append(_Block("raw", raw_span[0], raw_span[1], act=name))
@@ -507,7 +518,7 @@ def plan_fallback_blocks(
             w = (hi - lo) * source_duration_s
             for k in range(clips_per_act):
                 start = lo * source_duration_s + k * (w / (clips_per_act + 0.2))
-                grid_span = clip_safe_span(start, min(per_clip, w / clips_per_act), veto)
+                grid_span = clip_safe_span(start, min(per_clip, w / clips_per_act), excluded)
                 if grid_span is not None:
                     blocks.append(_Block("raw", grid_span[0], grid_span[1], act=name))
         closing = transitions[close_key]
@@ -542,9 +553,9 @@ def plan_fallback_blocks(
         need = aim - total
         factor = min(1.35, (raw_sum + need) / raw_sum)
         for blk in raws:
-            # the extension may never cross into a veto range
+            # the extension may never cross into a veto or foreign-narration range
             grown = min(75.0, blk.dur_s * factor)
-            grown_safe = clip_safe_span(blk.source_start_s, grown, veto)
+            grown_safe = clip_safe_span(blk.source_start_s, grown, excluded)
             blk.dur_s = min(grown, grown_safe[1]) if grown_safe else blk.dur_s
     return blocks
 

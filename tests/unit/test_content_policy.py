@@ -1,4 +1,4 @@
-"""Content safety law — the benign-footage gate (ADR-0011, owner directive 2026-11-24).
+"""Content safety law — the benign-footage gate (ADR-0013, owner directive 2026-11-24).
 
 The channel ships only benign incident categories (shoplifting, trespassing,
 first-amendment audits); extreme violence and gunfire are vetoed at plan

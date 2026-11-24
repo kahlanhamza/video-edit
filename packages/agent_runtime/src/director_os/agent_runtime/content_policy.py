@@ -26,7 +26,7 @@ window whose transcript contains a violent marker, and ``clip_safe_span``
 trims any planned window off a veto range. Muted b-roll riding narration
 blocks is not re-anchored in v1 — a violence marker is spoken/audible, so
 its footage lives inside speech windows that raw clips draw from; the
-residual risk is documented in ADR-0011, not hidden.
+residual risk is documented in ADR-0013, not hidden.
 """
 
 from __future__ import annotations

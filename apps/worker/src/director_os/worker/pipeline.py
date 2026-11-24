@@ -2842,13 +2842,16 @@ def make_deps(
     **overrides: Any,
 ) -> PipelineDeps:
     engine = make_engine(database_url)
+    # import credentials BEFORE create_all — SettingsMetaRow registers itself
+    # on the shared Base at import time; importing it after init_models left
+    # fresh production databases without the settings_meta table
+    from director_os.core.credentials import apply_credentials_to_settings  # noqa: F401
+
     init_models(engine)
     if settings is None:
         # Production path: Studio-saved credentials (Settings UI) override
         # .env — refresh the overlay per job so key changes never need a
         # worker restart. Tests inject explicit settings and skip this.
-        from director_os.core.credentials import apply_credentials_to_settings
-
         apply_credentials_to_settings(engine)
         resolved = get_settings()
     else:
