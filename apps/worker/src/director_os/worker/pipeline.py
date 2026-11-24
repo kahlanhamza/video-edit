@@ -1014,8 +1014,7 @@ def _hydrate_blur_regions(payload_regions: list[dict] | list[Any]) -> list[Any]:
     from director_os.core.models import BlurRegion
 
     return [
-        r if isinstance(r, BlurRegion) else BlurRegion.model_validate(r)
-        for r in payload_regions
+        r if isinstance(r, BlurRegion) else BlurRegion.model_validate(r) for r in payload_regions
     ]
 
 
