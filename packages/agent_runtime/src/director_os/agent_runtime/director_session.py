@@ -98,6 +98,84 @@ def narr_est_s(script: str) -> float:
     return max(NARR_DUR_MIN_S, min(NARR_DUR_MAX_S, words / PLAN_WPS + NARR_TAIL_PAD_S))
 
 
+def salvage_director_timeline(timeline, source_duration_s: float) -> tuple[Any, list[str]]:
+    """Deterministic truth-pass on the DIRECTOR's timeline — salvage, never scrap.
+
+    The stock fallback discards the model's whole program when the audit
+    complains (live E2E: the owner watched the canned narration despite a
+    real 21-tool-call director run). This pass repairs the two purely
+    MECHANICAL violations before the final audit:
+
+    1. narration durations follow the WORD LAW (narr_est_s of the actual
+       script), never the model's undersize dur_s habit — the words decide
+       how long the block rides; a too-short b-roll window is WIDENED to fit
+       (the window is mute footage, the voice is the law);
+    2. the HOOK: the first narration block opens the master (a cold-open raw
+       sting may precede it — moving the narration before the first raw item
+       satisfies the 8s law).
+
+    Returns (timeline, notes); what is still broken is the caller's audit
+    problem (agent-quality narration cannot be manufactured here without
+    pasting stock lines — the thing this pass exists to prevent)."""
+    import opentimelineio.opentime as ot_time
+    from director_os.otio_engine.compiler import master_track
+
+    notes: list[str] = []
+    try:
+        track = master_track(timeline)
+    except Exception:
+        return timeline, notes
+    items = list(track)
+    rate = 30.0
+
+    def _kind(item: Any) -> str:
+        if item.source_range is None:
+            return "gap"
+        meta = (item.metadata.get("director_os") or {}) if item.metadata else {}
+        return str(meta.get("kind", "?"))
+
+    # 1) narration truth-retime (the word law)
+    retimed = 0
+    for item in items:
+        meta = (item.metadata.get("director_os") or {}) if item.metadata else {}
+        if meta.get("kind") != "narration" or item.source_range is None:
+            continue
+        script = str(meta.get("script_text", ""))
+        if not script.strip():
+            continue
+        sr = item.source_range
+        s = sr.start_time.to_seconds()
+        est = narr_est_s(script)
+        b0, b1 = meta.get("broll_range") or (None, None)
+        if b0 is not None and b1 is not None and b1 > b0 and float(b1) - float(b0) < est:
+            # WIDEN the muted b-roll window to fit the words. The window is
+            # just mute footage — capping the voice at a stale window re-codes
+            # the undersize dur_s bug the word law exists to kill (the window
+            # was built from that same undersize dur_s),
+            est = min(est, max(1.0, source_duration_s - float(b0)))
+        est = max(1.0, min(est, max(1.0, source_duration_s - s)))
+        cur = item.source_range.duration.to_seconds()
+        if abs(cur - est) >= 0.5:
+            r = sr.start_time.rate or rate
+            item.source_range = ot_time.TimeRange(
+                start_time=ot_time.RationalTime(s * r, r),
+                duration=ot_time.RationalTime(est * r, r),
+            )
+            meta["broll_range"] = [s, s + est]
+            retimed += 1
+    if retimed:
+        notes.append(f"narration retimed to word-law duration on {retimed} block(s)")
+
+    # 2) hook ordering — first narration opens the master
+    narr_idx = next((i for i, it in enumerate(items) if _kind(it) == "narration"), None)
+    if narr_idx is not None and any(_kind(it) == "raw" for it in items[:narr_idx]):
+        first_narr = items[narr_idx]
+        track.remove(first_narr)
+        track.insert(0, first_narr)
+        notes.append("cold-open narration moved to open the master (hook law)")
+    return timeline, notes
+
+
 class PlanRawClip(BaseModel):
     type: Literal["raw"] = "raw"
     source_start_s: float = Field(ge=0.0)
@@ -1020,6 +1098,18 @@ class DirectorSession:
                     )
                     if refine_note:
                         last_err = refine_note
+                    # re-flight AFTER the refiners: critic/quote refinement can
+                    # reorder/raw-ify the cold open or change block counts, and
+                    # the pre-flight above last ran BEFORE it (live E2E: the
+                    # refined plan shipped a 35s raw hook that failed the
+                    # timeline audit AFTER a full 2-minute execute)
+                    post = self._plan_problems(plan)
+                    if post:
+                        feedback = "; ".join(post)
+                        last_err = feedback
+                        if best is None or self._honest_total(plan) > self._honest_total(best):
+                            best = plan
+                        continue
                 return plan, ""
             except (ValueError, ValidationError, json.JSONDecodeError) as e:
                 # quote the raw head so the log says WHY it did not parse —
@@ -1101,6 +1191,16 @@ class DirectorSession:
                     f"narration ratio {ratio:.2f} outside 0.30..0.52 "
                     "(rich commentary, not a sprinkle, not a podcast)"
                 )
+        honest = self._honest_total(plan)
+        if honest > scale.target_hi:
+            # keep-band CAP: the doc law keeps 28-35% of the tape — a master
+            # above target_hi failed the live run's audit AFTER a full execute
+            problems.append(
+                f"total plan duration {honest:.0f}s > target {scale.target_hi:.0f}s "
+                f"(keep band for {self.source_duration_s:.0f}s source: "
+                f"{scale.target_lo:.0f}-{scale.target_hi:.0f}s) — tighten: shorter "
+                "raw stretches and fuller narration, not more raw"
+            )
         if plan.raw_count < scale.raw_min:
             problems.append(f"only {plan.raw_count} raw clips (< {scale.raw_min})")
         if plan.raw_count > scale.raw_max:

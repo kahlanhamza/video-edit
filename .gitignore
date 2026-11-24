@@ -25,3 +25,5 @@ data/media/
 data/models/
 output/
 .eustis_pid
+bin/
+test-results/

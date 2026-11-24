@@ -65,9 +65,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-face-regions", type=int, default=6)
     p.add_argument(
         "--redaction-backend",
-        choices=("yunet", "modal", "none"),
+        choices=("tracked", "yunet", "modal", "none"),
         default="yunet",
-        help="yuNet CPU sweep (offline) | Modal GPU YOLO-face+plate+ByteTrack | skip",
+        help="3-pass YOLO+GMC tracked (default when models present) | yuNet CPU | Modal GPU | skip",
     )
     p.add_argument(
         "--vision",

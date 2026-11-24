@@ -82,7 +82,8 @@ def _good_plan_json() -> str:
     """A word-count-law plan (hook-first): cold open = 4s silent-gap sting +
     50-word hook narration (<=8s in, context <=32s), 12 mid blocks of 60 words
     (~23.9s each at 2.6 w/s), an 85-word outro, and 14 raw windows aligned to
-    real utterances (41.1s snapped pieces) — ~919s total, ratio ~0.37."""
+    real utterances (41.1s snapped pieces) — ~885s total, ratio ~0.40
+    (inside the 736-900s keep band)."""
     acts = [
         {
             "name": "Cold Open",
@@ -116,8 +117,8 @@ def _good_plan_json() -> str:
                 ),
                 "dur_s": 22.0,
             },
-            {"type": "raw", "source_start_s": float(u), "dur_s": 45.0},
-            {"type": "raw", "source_start_s": float(u + 180), "dur_s": 45.0},
+            {"type": "raw", "source_start_s": float(u), "dur_s": 42.0},
+            {"type": "raw", "source_start_s": float(u + 180), "dur_s": 42.0},
             {
                 "type": "narration",
                 "script": _script_n(

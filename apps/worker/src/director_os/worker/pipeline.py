@@ -1967,6 +1967,15 @@ def _plan_documentary(
                 f"{plan.total_dur_s:.0f}s"
             )
             timeline, report = session.execute(plan, scaffold)
+            # SALVAGE BEFORE SCRAP: the word-law narration retime + hook order
+            # fix are mechanical; throwing the director's program away and
+            # shipping the stock fallback for them is how the owner ended up
+            # hearing canned lines on a real 21-tool-call run (live evidence)
+            from director_os.agent_runtime.director_session import salvage_director_timeline
+
+            timeline, salvage_notes = salvage_director_timeline(timeline, dur)
+            if salvage_notes:
+                deps.log(f"  [planning] director salvage: {'; '.join(salvage_notes)}")
             retention = audit_retention(timeline, dur)
             if retention.ok and report.steps_failed == 0:
                 _apply_audio_mode(timeline, deps)
@@ -1991,7 +2000,9 @@ def _plan_documentary(
                 return timeline, version
             deps.log(
                 f"  [planning] LLM plan rejected (steps_failed={report.steps_failed}, "
-                f"retention_ok={retention.ok}) — deterministic fallback"
+                f"retention_ok={retention.ok}: "
+                f"{' ; '.join(c.detail for c in retention.failures)[:400]}) "
+                "— deterministic fallback"
             )
 
     spec = build_fallback_documentary(
