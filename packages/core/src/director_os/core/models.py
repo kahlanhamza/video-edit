@@ -67,6 +67,7 @@ class JobStage(enum.StrEnum):
     narration = "narration"
     subtitles = "subtitles"
     qa = "qa"
+    review = "review"
     ship_pack = "ship_pack"
     human_gate = "human_gate"
     render = "render"

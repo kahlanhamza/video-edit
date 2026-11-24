@@ -112,6 +112,11 @@ class PipelineDeps:
     # --- POST-FX (owner rule 2026-11-19): tracked blur + audio enhancement +
     # caption burn run ONLY on the assembled deliverable, never the raw source
     post_fx: bool = False
+    # --- DAILIES REVIEW (the closed agentic loop): after QA the rendered
+    # master is sampled + looked at; bounded repairs may mutate the timeline
+    # and force one re-render. Off when no viewer is available (honest skip).
+    review_pass: bool = True
+    review_backend_factory: Callable[[], Any] | None = None
     log: Callable[[str], None] = lambda _msg: None
     # --- live observability (Studio full-visibility mandate): one RunTracker
     # per run streams steps/logs/timeline revisions into job_* rows for SSE
@@ -2669,75 +2674,98 @@ def run_pipeline(
                     )
                     _downgrade_2bus_audio_mode(timeline)
 
-        tracker.stage(JobStage.render.value, 60.0)
-        _check_stop(deps, project_id)
-        with tracker.step("render", "Render master — segment cache, misses only") as st:
-            report, otio_path = stage_render(
+        # Range(2): render pass 1, dailies review may repair, render pass 2.
+        # The closed agentic loop — the master is LOOKED at before the gate.
+        for _review_round in range(2):
+            tracker.stage(JobStage.render.value, 60.0)
+            _check_stop(deps, project_id)
+            with tracker.step("render", "Render master — segment cache, misses only") as st:
+                report, otio_path = stage_render(
+                    timeline,
+                    project_id,
+                    source,
+                    asset_id,
+                    deps,
+                    enhanced_audio=enhance_info.enhanced_audio_map() if enhance_info else None,
+                    narration_audio=narration_audio if narration_clips else None,
+                )
+                st.pct(96, f"{report.rendered} rendered / {report.cached} cached")
+            # the disk now carries THIS program (ops@max_rev + active version) —
+            # stamp the gate in EVERY redact mode, not only the tracked path,
+            # or the Export button lies "dirty" forever on default projects
+            _stamp_export_gate(deps, project_id, asset_id)
+
+            tracker.stage(JobStage.subtitles.value, 85.0)
+            _check_stop(deps, project_id)
+            with tracker.step("subtitles", "Caption build — 2-row karaoke .ass + .srt"):
+                stage_subtitles(timeline, transcript, project_id, deps)
+
+            # POST-FX (owner rule): blur + enhance + captions run ONLY now, on the
+            # assembled deliverable — never on the 43-min source. QA audits
+            # THIS file.
+            post_fx_report = None
+            final_for_qa = report.final_path
+            if deps.post_fx:
+                tracker.stage(JobStage.qa.value, 88.0)
+                with tracker.step(
+                    "post_fx", "Post-FX on the deliverable — tracked blur + burn-in"
+                ) as st:
+                    try:
+                        from director_os.worker.post_fx import stage_post_fx
+
+                        post_fx_report = stage_post_fx(
+                            report.final_path,
+                            timeline,
+                            transcript,
+                            project_id,
+                            deps,
+                            narration_clips=narration_clips,
+                        )
+                        final_for_qa = post_fx_report.final_path or report.final_path
+                    except Exception as e:  # noqa: BLE001
+                        st.skip(f"FAILED ({e}) — QA audits the un-post-fx'd master")
+                        deps.log(f"  [post-fx] FAILED ({e}) — QA audits the un-post-fx'd master")
+
+            tracker.stage(JobStage.qa.value, 90.0)
+            _check_stop(deps, project_id)
+            # expected duration = the DAG's frame-quantized total (what ffmpeg truly
+            # renders), NOT the raw OTIO sum — unquantized sums accumulate per-segment
+            # frame rounding and fail QA on long cuts (live: 4.92 s over 329 segments)
+            with tracker.step("qa", "Technical QA audit — loudness, duration, retention"):
+                audit = stage_qa(
+                    final_for_qa,
+                    report.total_dur_s,
+                    job_id,
+                    project_id,
+                    deps,
+                    transcript=transcript,
+                    enhance_info=enhance_info,
+                    raw_source=source,
+                    timeline=timeline,
+                    source_duration_s=_source_duration(deps, asset_id),
+                )
+                if not audit.ok:
+                    raise PipelineError(f"QA failed: {[c.detail for c in audit.failures]}")
+
+            # DAILIES REVIEW — the render is evidenced, not trusted. Applied
+            # repairs mutate the timeline, persist a version, and the loop
+            # re-renders (segment cache: misses only) + re-audits. Round 1 is
+            # the post-repair pass; the review never re-enters (bounded).
+            if _review_round == 1 or not deps.review_pass:
+                break
+            from director_os.worker.review_pass import stage_review
+
+            review = stage_review(final_for_qa, timeline, [], project_id, deps)
+            if review.status != "applied":
+                break
+            _persist_timeline_version(
                 timeline,
                 project_id,
-                source,
-                asset_id,
                 deps,
-                enhanced_audio=enhance_info.enhanced_audio_map() if enhance_info else None,
-                narration_audio=narration_audio if narration_clips else None,
+                created_by="review_agent",
+                note=f"dailies review round {_review_round}: {len(review.applied)} repair(s)",
             )
-            st.pct(96, f"{report.rendered} rendered / {report.cached} cached")
-        # the disk now carries THIS program (ops@max_rev + active version) —
-        # stamp the gate in EVERY redact mode, not only the tracked path,
-        # or the Export button lies "dirty" forever on default projects
-        _stamp_export_gate(deps, project_id, asset_id)
-
-        tracker.stage(JobStage.subtitles.value, 85.0)
-        _check_stop(deps, project_id)
-        with tracker.step("subtitles", "Caption build — 2-row karaoke .ass + .srt"):
-            stage_subtitles(timeline, transcript, project_id, deps)
-
-        # POST-FX (owner rule): blur + enhance + captions run ONLY now, on the
-        # assembled deliverable — never on the 43-min source. QA audits
-        # THIS file.
-        post_fx_report = None
-        final_for_qa = report.final_path
-        if deps.post_fx:
-            tracker.stage(JobStage.qa.value, 88.0)
-            with tracker.step(
-                "post_fx", "Post-FX on the deliverable — tracked blur + burn-in"
-            ) as st:
-                try:
-                    from director_os.worker.post_fx import stage_post_fx
-
-                    post_fx_report = stage_post_fx(
-                        report.final_path,
-                        timeline,
-                        transcript,
-                        project_id,
-                        deps,
-                        narration_clips=narration_clips,
-                    )
-                    final_for_qa = post_fx_report.final_path or report.final_path
-                except Exception as e:  # noqa: BLE001
-                    st.skip(f"FAILED ({e}) — QA audits the un-post-fx'd master")
-                    deps.log(f"  [post-fx] FAILED ({e}) — QA audits the un-post-fx'd master")
-
-        tracker.stage(JobStage.qa.value, 90.0)
-        _check_stop(deps, project_id)
-        # expected duration = the DAG's frame-quantized total (what ffmpeg truly
-        # renders), NOT the raw OTIO sum — unquantized sums accumulate per-segment
-        # frame rounding and fail QA on long cuts (live: 4.92 s over 329 segments)
-        with tracker.step("qa", "Technical QA audit — loudness, duration, retention"):
-            audit = stage_qa(
-                final_for_qa,
-                report.total_dur_s,
-                job_id,
-                project_id,
-                deps,
-                transcript=transcript,
-                enhance_info=enhance_info,
-                raw_source=source,
-                timeline=timeline,
-                source_duration_s=_source_duration(deps, asset_id),
-            )
-            if not audit.ok:
-                raise PipelineError(f"QA failed: {[c.detail for c in audit.failures]}")
+            deps.log("[review] repairs applied — re-render (cache hits elsewhere)")
 
         # Stage 10 — Creator Ship Pack (YouTube upload is disabled; this folder
         # is what the human ships). Soft-fail: a pack glitch never unpublishes
@@ -2869,6 +2897,13 @@ def make_deps(
     # documentary runs; explicit overrides always win; tests stay hermetic
     overrides.setdefault(
         "post_fx", os.getenv("POST_FX", "").strip().lower() in {"1", "true", "yes"}
+    )
+    # REVIEW_PASS env default — ON: a QA-passed master still earns an actual
+    # look when a vision/LLM viewer is configured (the pass self-skips, loudly,
+    # when none is). Explicit overrides always win; tests stay hermetic.
+    overrides.setdefault(
+        "review_pass",
+        os.getenv("REVIEW_PASS", "on").strip().lower() not in {"0", "false", "off", "no"},
     )
     return PipelineDeps(
         sessions=make_session_factory(engine),
