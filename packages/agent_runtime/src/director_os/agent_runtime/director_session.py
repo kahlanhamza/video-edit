@@ -446,9 +446,7 @@ def _clip_pieces(
     return [(a, b - a) for a, b in runs if b > a]
 
 
-def enforce_raw_budget(
-    plan: MacroPlan, source_duration_s: float
-) -> tuple[MacroPlan, float]:
+def enforce_raw_budget(plan: MacroPlan, source_duration_s: float) -> tuple[MacroPlan, float]:
     """The word-count law for raw windows: an inflated LLM raw total buys nothing.
 
     The doc_scale raw budget (target_hi * 0.7) is the planning law. Free-tier
