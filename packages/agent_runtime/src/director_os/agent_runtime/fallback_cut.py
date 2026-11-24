@@ -513,6 +513,116 @@ SHORT_TRANSITION_BRIDGES_GENERIC = {
 }
 
 
+# Long-tape DEEP-DIVE bridges — one EXTRA observation beat per act, spent
+# only by the keep-band top-up (below). They exist because the ratio law
+# (0.30..0.52 narration share) cannot be satisfied by stretching raw alone:
+# every distinct body/transition script is already in the timeline, so a raw
+# extension past ~2.2x the narration total drops the share below 0.30 and the
+# fallback fails its own invariants (the 2627s tape shipped 775s masters at
+# ratio 0.25). Each line is a fresh REWATCH angle — no repeated stock text.
+DEEP_DIVE_BRIDGES = {
+    "Act 1: Arrival & Contact": (
+        "Slow the tape down and replay the first three minutes. The officer "
+        "asks the same question twice, word for word, and both answers go on "
+        "the record. Nothing about the framing is accidental — the angle, the "
+        "distance, and the timing were all decided before anyone reached for "
+        "the door handle."
+    ),
+    "Act 2: Investigation & Friction": (
+        "Every veteran viewer knows this stretch: the moment the story starts "
+        "over. The account you just heard gets restated with one new detail, "
+        "then a second. Compare them side by side and the timeline stops "
+        "matching — the exact reason this portion gets replayed in every "
+        "review."
+    ),
+    "Act 3: Escalation": (
+        "There is a full minute in this window where nobody raises their "
+        "voice, and it is still the most important minute of the night. "
+        "Volume is not the story here — choreography is. Watch who moves "
+        "first, who steps back, and who reaches for something, because those "
+        "three decisions close every question that follows."
+    ),
+    "Act 4: The Arrest": (
+        "From the moment the escalation peaks, the clock starts on procedure, "
+        "and procedure has a script of its own. The commands become short, "
+        "the hands become visible, and every second is now logged twice — "
+        "once by the camera and once by the people living it."
+    ),
+    "Act 5: Aftermath & Booking": (
+        "The quiet part of the tape is where the paperwork earns its keep. "
+        "Times get confirmed, names get spelled, and the numbers on the form "
+        "have to agree with the numbers on the recording. Any gap between "
+        "them would surface right here, and you can watch for it yourself."
+    ),
+    "Act 6: Verified Outcome": (
+        "Before a case like this closes, the record gets one final "
+        "read-through. Everything you watched is checked against the outcome "
+        "that was filed, and the tape either agrees with the paperwork or it "
+        "does not. On this recording, the full arc you just saw closes on the "
+        "record."
+    ),
+}
+
+DEEP_DIVE_BRIDGES_GENERIC = {
+    "Act 1: Arrival & Contact": (
+        "Slow the recording down and replay the first three minutes. The same "
+        "question gets asked twice, word for word, and both answers land on "
+        "the record. Nothing about the framing is accidental — the angle, the "
+        "distance, and the timing were all decided before this encounter ever "
+        "began."
+    ),
+    "Act 2: Friction & Refusal": (
+        "Every veteran viewer knows this stretch: the moment the story starts "
+        "over. The account you just heard gets restated with one new detail, "
+        "then a second. Compare them side by side and the timeline stops "
+        "matching — the exact reason this portion gets replayed in every "
+        "review."
+    ),
+    "Act 3: The Peak": (
+        "There is a full minute in this window where nobody raises their "
+        "voice, and it is still the most important minute of the recording. "
+        "Volume is not the story here — choreography is. Watch who moves "
+        "first, who steps back, and who stands their ground, because those "
+        "decisions close every question that follows."
+    ),
+    "Act 4: The Endgame": (
+        "From the moment the peak arrives, the clock starts on procedure, and "
+        "procedure has a script of its own. The requests become short, the "
+        "answers become careful, and every second is now logged twice — once "
+        "by the camera and once by the people living it."
+    ),
+    "Act 5: Aftermath & Processing": (
+        "The quiet part of the tape is where the record earns its keep. Times "
+        "get confirmed, names get spelled, and the details on the form have "
+        "to agree with the details on the recording. Any gap would surface "
+        "right here, and you can watch for it yourself."
+    ),
+    "Act 6: Verified Outcome": (
+        "Before any case like this closes, the record gets one final "
+        "read-through. Everything you watched is checked against the outcome "
+        "that was filed, and the tape either agrees with the paperwork or it "
+        "does not. On this recording, the full arc you just saw closes on the "
+        "record."
+    ),
+}
+
+
+def _deep_dive_table(short_doc: bool, generic: bool) -> dict[str, tuple[str, str]]:
+    """The top-up beat pool keyed like ACT_SETS bridge keys; each entry carries
+    (act display name, script) so the inserted block reads in its act."""
+    if generic:
+        table = DEEP_DIVE_BRIDGES_GENERIC
+        acts = GENERIC_ACT_SETS
+    else:
+        table = DEEP_DIVE_BRIDGES
+        acts = ACT_SETS
+    return {
+        key: (act_name, script)
+        for act_name, _lo, _hi, key, _close in acts[6]
+        if (script := table.get(key))
+    }
+
+
 def _niche_tables(niche: str, short_doc: bool) -> tuple[dict, dict[str, str], dict[str, str]]:
     """Act sets + bridge tables for a niche; ANY non-bodycam niche gets the
     generic tables (the generic escalated-incident arc)."""
@@ -679,6 +789,10 @@ def plan_fallback_blocks(
     #     CLOSES it (context before footage, momentum after), speech-anchored
     #     raw clips between; the last act's closing line is the outro
     n_acts = len(act_windows)
+    # per-act insertion slots for the deep-dive top-up (index AFTER each act's
+    # closing narration — the beat reads as the act's final observation) plus
+    # the b-roll anchor each beat rides on
+    act_slots: list[tuple[int, str, float]] = []
     narration_total = _narr_dur(
         _hook_script(
             case_facts,
@@ -708,6 +822,7 @@ def plan_fallback_blocks(
     per_clip = min(scale.clip_max_s, max(16.0, per_act / clips_per_act))
 
     for name, lo, hi, bridge_key, close_key in act_windows:
+        act_slots.append((len(blocks), bridge_key, source_duration_s * lo))
         bridge = seeds.get(bridge_key) or narrators[bridge_key]
         blocks.append(
             _Block(
@@ -745,26 +860,48 @@ def plan_fallback_blocks(
             )
         )
 
-    # --- floor top-up: rounding + skipped cold-open beats + the TTS re-time
-    #     shrink (real Brian speaks faster than the plan estimate) can leave
-    #     the SHIPPED master under the length-scaled floor — extend the raw
-    #     blocks proportionally with a measured-pace safety margin. Raw spans
-    #     are speech-anchored exacts; a few extra seconds ride into the
-    #     following pause, never a silent stall.
+    # --- keep-band top-up: rounding + skipped cold-open beats + the TTS
+    #     re-time shrink (real Brian speaks faster than the plan estimate) can
+    #     leave the SHIPPED master under the length-scaled floor — extend the
+    #     raw blocks proportionally with a measured-pace safety margin. The
+    #     AIM is the keep-band floor (target_lo — 28% of the tape), NOT the
+    #     hard 600s doc floor: the full-tape run shipped 615s of a 2627s tape
+    #     (23%, the owner watched a 10-minute cut of a law that says 12-15
+    #     minutes). Raw spans are speech-anchored exacts; extra seconds ride
+    #     into the following pause, never a silent stall.
     floor = scale.min_final_s
-    aim = floor + max(25.0, floor * 0.05)
-    for _pass in range(3):
-        total = sum(blk.dur_s for blk in blocks)
+    aim = max(scale.target_lo, floor) + max(25.0, max(scale.target_lo, floor) * 0.05)
+    narration_total = sum(blk.dur_s for blk in blocks if blk.kind == "narration")
+    deep_table = _deep_dive_table(short_doc=False, generic=niche != "bodycam_documentary")
+    for _pass in range(10):
+        raw_sum = sum(blk.dur_s for blk in blocks if blk.kind == "raw")
+        total = narration_total + raw_sum
         if total >= aim:
             break
-        raws = [blk for blk in blocks if blk.kind == "raw"]
-        raw_sum = sum(r.dur_s for r in raws)
-        if not raws:
+        # RATIO LAW FIRST: stretching raw dilutes the (fixed) narration share
+        # toward 0.25 on long masters — once narration drifts below ~0.34 of
+        # the master, spend a deep-dive beat (one per act, in act order) so
+        # the cut grows with CONTENT, not dead raw seconds.
+        if narration_total / total < 0.34:
+            pos, key, anchor = act_slots.pop(0)
+            act_name, script = deep_table[key]
+            d = _narr_dur(script, lo=narr_lo, hi=40.0 if not short_doc else 22.0)
+            blocks.insert(pos, _Block("narration", anchor, d, script, act_name))
+            narration_total += d
+            act_slots = [(p + 1, k, a) for p, k, a in act_slots]
+            continue
+        if not raw_sum:
             break
         need = aim - total
-        factor = min(1.35, (raw_sum + need) / raw_sum)
-        for blk in raws:
-            blk.dur_s = min(75.0, blk.dur_s * factor)
+        # cap raw growth at the 0.32 narration-share line (safe margin above
+        # the 0.30 hard floor) — beyond it the fallback fails its own audit
+        share_cap_raw = narration_total * (1.0 - 0.32) / 0.32
+        if raw_sum >= share_cap_raw:
+            break
+        factor = min(1.35, (raw_sum + min(need, share_cap_raw - raw_sum)) / raw_sum)
+        for blk in blocks:
+            if blk.kind == "raw":
+                blk.dur_s = min(75.0, blk.dur_s * factor)
     return blocks
 
 
