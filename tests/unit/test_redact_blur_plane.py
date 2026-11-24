@@ -18,12 +18,12 @@ def test_radius_clamps_to_the_even_plane():
 
 
 def test_blur_chain_never_emits_an_illegal_radius():
+    import re
+
     regions = [
         BlurRegion(bbox=BBox(x=10, y=10, w=43, h=43), sigma=21),
         BlurRegion(bbox=BBox(x=200, y=120, w=41, h=37), sigma=18),
     ]
     cmd = build_blur_chain("[v0]", "[vout]", regions, 1920, 1080)
-    for token in cmd.replace(";", ":").split(":"):
-        if "luma_radius" in token:
-            r = int(token.split("=")[1])
-            assert r < 21, token
+    radii = [int(r) for r in re.findall(r"luma_radius=(\d+)", cmd)]
+    assert radii and all(r < 21 for r in radii), radii
