@@ -31,3 +31,21 @@ def test_baked_source_none_when_mode_not_tracked(tmp_path):
     deps = make_deps(f"sqlite:///{tmp_path}/e.db", redact_backend=None)
     out = _tracked_redacted_source(deps, "p1", tmp_path / "src.mp4", "asset1", tmp_path)
     assert out is None
+
+
+def test_hydrate_blur_regions_round_trips_payload_dicts():
+    """The tracked payload is persisted as JSON dicts; stage_redaction must
+    re-hydrate them to BlurRegion models before the shared model_dump build
+    (live full-tape run 3: 'dict' object has no attribute 'model_dump')."""
+    from director_os.core.models import BlurRegion
+    from director_os.worker.pipeline import _hydrate_blur_regions
+
+    model = BlurRegion.model_validate(
+        {"bbox": {"x": 1, "y": 2, "w": 3, "h": 4}, "mode": "tracked", "track_id": "face_1"}
+    )
+    payload = [model.model_dump(mode="json"), {"bbox": {"x": 5, "y": 6, "w": 7, "h": 8}}]
+    out = _hydrate_blur_regions(payload)
+    assert all(isinstance(r, BlurRegion) for r in out)
+    twice = _hydrate_blur_regions(out)
+    assert [r.model_dump(mode="json") for r in out] == [r.model_dump(mode="json") for r in twice]
+    assert out[1].mode == "static"

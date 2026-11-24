@@ -829,7 +829,10 @@ def stage_redaction(
                         asset_id=asset_id,
                         keep_ranges=keep_ranges,
                     )
-                    regions = tracked_payload["regions"]
+                    # the tracked payload is already JSON-dumped (it carries the
+                    # per-frame plan contract) — re-hydrate the region dicts so
+                    # the shared model_dump below sees BlurRegion models again
+                    regions = _hydrate_blur_regions(tracked_payload["regions"])
                     source_tag = tracked_payload["source"]
                     stats = tracked_payload["stats"]
                     tracked_extra = {
@@ -1001,6 +1004,19 @@ def _sweep_kept_ranges(
             (plate_tracks if tr.track_id.startswith("plate_") else face_tracks).append(tr)
         max_end = max(max_end, end)
     return face_tracks, plate_tracks, int(round(max_end * 30))
+
+
+def _hydrate_blur_regions(payload_regions: list[dict] | list[Any]) -> list[Any]:
+    """JSON-dumped payload regions -> BlurRegion models (dicts re-validated,
+    models ride through). The tracked payload is persisted as raw dicts (it
+    carries the per-frame plan contract), but the shared payload build below
+    calls model_dump on every region — the dicts must become models again."""
+    from director_os.core.models import BlurRegion
+
+    return [
+        r if isinstance(r, BlurRegion) else BlurRegion.model_validate(r)
+        for r in payload_regions
+    ]
 
 
 def _tracked_redaction_payload(
