@@ -21,19 +21,13 @@ def _frame_with_captions(dest: Path, w: int = 640, h: int = 360) -> Path:
     # footage texture: soft vertical bands in the LOWER third (ground/pavement)
     for x in range(0, w, 24):
         d.rectangle([x, int(h * 0.75), x + 24, h], fill=(40 + x % 9, 38, 36))
-    # burned caption text inside the bottom quarter
-    try:
-        from PIL import ImageFont
-
-        font = ImageFont.truetype(FONT, 26)
-    except Exception:  # pragma: no cover - font fallback
-        font = None
-    d.text(
-        (w // 2 - 180, int(h * 0.86)),
-        "YOU NEED TO STEP BACK PLEASE",
-        fill=(255, 255, 255),
-        font=font,
-    )
+    # burned caption TEXT-STROKE pattern: tall thin white bars inside the
+    # bottom quarter — deterministic on every host (no font dependency: the
+    # CI runner lacks the Noto font and PIL's fallback font scores 0.009)
+    y0, y1 = int(h * 0.84), int(h * 0.95)
+    for i in range(18):
+        x = 90 + i * 26
+        d.rectangle([x, y0, x + 9, y1], fill=(255, 255, 255))
     im.save(dest)
     return dest
 
