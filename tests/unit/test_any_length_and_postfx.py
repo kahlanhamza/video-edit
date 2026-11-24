@@ -400,7 +400,7 @@ def test_master_caption_cues_cover_narration_and_raw_speech():
     }
     beats, counts = build_master_caption_cues(timeline, transcript, narration_words)
     assert counts["narration"] >= 1 and counts["raw"] >= 1 and counts["total"] == len(beats)
-    narr_beats = [b for b in beats if b.speaker == "NARRATOR"]
+    narr_beats = [b for b in beats if b.speaker == "Narrator"]
     raw_beats = [b for b in beats if b.speaker == "Officer"]
     assert narr_beats and raw_beats
     # narration cues ride the MASTER clock (after the 10s raw clip)

@@ -315,12 +315,21 @@ def stage_perception(asset_id: str, source: Path, project_id: str, deps: Pipelin
 def stage_proofread(asset_id: str, transcript: dict, project_id: str, deps: PipelineDeps) -> dict:
     """Police-jargon proofread + Officer/Suspect role tagging — persisted, idempotent.
 
+    Two-tier law (the committed v6 "LLM operator supervisor" + the manual
+    sandbox workflow):
+    1. DETERMINISTIC FLOOR — jargon corrections ("ten four" -> "10-4") re-timed
+       via difflib alignment, diarization labels ranked into documentary roles.
+       Always available, never billed.
+    2. LLM SUPERVISOR (when an LLM rung is reachable) — the notebook pass:
+       readable speaker turns go to the LLM in batches of 70 with the case
+       facts; it fixes real ASR mishearings ("I got a super suit" -> "I got
+       off work"), assigns TRUE Officer/Suspect roles, masks profanity, and
+       drops garble (clean_text=""). Every correction is WORD-LOCKED back onto
+       the original ASR timestamps — sync cannot drift.
+
     Product lives in `perception_index.transcript_json["proofread"]` (the same
-    durability contract as ASR): jargon corrections ("ten four" -> "10-4",
-    "DL" -> "driver's license") re-timed via difflib alignment, diarization
-    labels mapped to documentary roles. Downstream consumers (subtitles,
-    narration, Director planning) read the tagged words; crash-resume never
-    re-derives the pass.
+    durability contract as ASR). Downstream consumers (subtitles, narration,
+    Director planning) read the tagged words; crash-resume never re-derives.
     """
     with deps.sessions() as s:
         row = s.get(PerceptionIndexRow, asset_id)
@@ -332,6 +341,36 @@ def stage_proofread(asset_id: str, transcript: dict, project_id: str, deps: Pipe
     from director_os.subtitles.proofread import prepare_transcript
 
     proof = prepare_transcript(transcript)
+
+    # tier 2: the LLM supervisor pass (soft-fail — the floor always stands)
+    try:
+        backend = _director_backend(deps)
+    except Exception as e:  # noqa: BLE001 — supervisor is an upgrade, never a gate
+        backend = None
+        deps.log(f"  [supervisor] backend unavailable ({e})")
+    if backend is not None:
+        from director_os.subtitles.supervisor import supervise_transcript
+
+        case_facts = None
+        dossier = _load_dossier(project_id, deps)
+        if dossier:
+            case_facts = {
+                k: dossier.get(k)
+                for k in ("subject", "location", "date", "agency", "charges_or_outcome")
+                if dossier.get(k)
+            } or None
+        supervised = supervise_transcript(
+            {**(transcript or {}), "words": proof["words"]},
+            getattr(backend, "complete_json", None),
+            case_facts=case_facts,
+            log=deps.log,
+        )
+        if supervised is not None:
+            # keep the deterministic jargon corrections the supervisor saw the
+            # post-correction words through; merge their corrections list
+            supervised["corrections"] = [*proof.get("corrections", []), *supervised["corrections"]]
+            proof = supervised
+
     with deps.sessions() as s:
         row = s.get(PerceptionIndexRow, asset_id)
         if row is None:
@@ -341,8 +380,9 @@ def stage_proofread(asset_id: str, transcript: dict, project_id: str, deps: Pipe
         s.commit()
     roles = proof.get("speaker_roles") or {}
     deps.log(
-        f"  [proofread] {len(proof['words'])} word(s), {len(proof['corrections'])} jargon "
-        f"fix(es), roles: {roles if roles else '(no diarization)'}"
+        f"  [proofread] {len(proof['words'])} word(s), {len(proof['corrections'])} correction(s), "
+        f"roles: {roles if roles else '(no diarization)'}"
+        + (" [supervised]" if proof.get("supervised") else " [deterministic]")
     )
     return proof
 
@@ -2104,78 +2144,48 @@ def _timeline_from_json(otio_json: dict):
 
 
 def stage_subtitles(timeline, transcript: dict, project_id: str, deps: PipelineDeps) -> Path:
-    """Build the karaoke .ass sidecar from the transcript (deterministic, free).
+    """Persist the MASTER-CLOCK cue store — the v6 "caption truth" law.
+
+    The cue list is built on the EDITED TIMELINE (what the viewer sees), never
+    on the raw source clock: narrator cues from the TTS word sidecars rebased
+    per narration block, raw-speech cues remapped through each kept raw clip's
+    source->master window, and narration b-roll blocks NEVER carry raw captions
+    (narrator-on-broll isolation). Building cues off the 43-minute source and
+    burning them on a ~10-minute master was the v5 regression the v6 commit
+    fixed at the root — the whole store now shares ONE builder with post-fx
+    (`build_master_caption_cues`), so the Studio grid, the program monitor and
+    the final burn all read the same truth.
 
     Word source: the PROOFREAD product when present (jargon-corrected,
     Officer/Suspect role-tagged — stage_proofread), else the raw ASR words.
-    No paid API and a pure function of (timeline rate, transcript), so crash-
-    resume is satisfied by recomputation — the stage never blocks recovery.
     Output lands next to the timeline: output/pipeline/<project>/subtitles.{json,ass,srt}.
     The JSON cue store is what the Director Studio subtitle grid reads/edits.
     """
-    from director_os.subtitles.ass_builder import CaptionBeat, WordTiming
-    from director_os.subtitles.store import save_cues
+    import json as _json
 
-    # proofread first (tagged roles drive the 2-row speaker colors); raw words
-    # keep the stage usable before/without the proofread pass
-    proof = (transcript or {}).get("proofread") or {}
-    words_src = [w for w in proof.get("words", []) if w.get("text")] or [
-        w for w in transcript.get("words", []) if w.get("text")
-    ]
-    # the proofread shape uses "text" (transcript contract); normalize raw too
-    words = []
-    for w in words_src:
-        item = dict(w)
-        if not item.get("text") and item.get("word"):
-            item["text"] = item["word"]
-        words.append(item)
-    if not words:
-        deps.log("  [subtitles] transcript empty — skipping ass build")
-        sub_dir = deps.settings.output_dir / "pipeline" / project_id
-        save_cues(sub_dir, [])
-        return sub_dir / "subtitles.ass"
+    from director_os.subtitles.master_cues import build_master_caption_cues, narration_word_stamps
+    from director_os.subtitles.store import save_cues
 
     sub_dir = deps.settings.output_dir / "pipeline" / project_id
 
-    beats: list[CaptionBeat] = []
-    MAX_WORDS, MAX_S = 6, 3.5
-    run: list[dict] = []
+    # narration word stamps ride the stage_narration manifest (persisted BEFORE
+    # this stage runs — the pipeline order guarantees narration + retime first)
+    manifest = sub_dir / "narration" / "clips.json"
+    narration_clips: list[dict] = []
+    if manifest.exists():
+        try:
+            narration_clips = list(_json.loads(manifest.read_text()).get("clips") or [])
+        except (ValueError, OSError):
+            narration_clips = []
 
-    def _flush() -> None:
-        if not run:
-            return
-        beats.append(
-            CaptionBeat(
-                text=" ".join(w["text"] for w in run),
-                start_ms=int(run[0]["start_s"] * 1000),
-                end_ms=int(run[-1]["end_s"] * 1000),
-                speaker=run[0].get("speaker") or "Unknown",
-                words=[
-                    WordTiming(
-                        word=w["text"],
-                        start_ms=int(w["start_s"] * 1000),
-                        end_ms=int(w["end_s"] * 1000),
-                    )
-                    for w in run
-                ],
-            )
-        )
-        run.clear()
-
-    for w in words:
-        if run:
-            same_speaker = (run[0].get("speaker") or "Unknown") == (w.get("speaker") or "Unknown")
-            too_long = w["end_s"] * 1000 - run[0]["start_s"] * 1000 > MAX_S * 1000
-            too_many = len(run) >= MAX_WORDS
-            boundary = w["start_s"] - run[-1]["end_s"] > 1.0  # >1s hole: new cue
-            if too_many or too_long or boundary or not same_speaker:
-                _flush()
-        run.append(w)
-    _flush()
-
+    narration_words = narration_word_stamps(narration_clips)
+    beats, counts = build_master_caption_cues(timeline, transcript, narration_words)
     save_cues(sub_dir, beats)
     out = sub_dir / "subtitles.ass"
-    deps.log(f"  [subtitles] {len(beats)} cue(s) -> subtitles.ass + srt + json")
+    deps.log(
+        f"  [subtitles] {counts['total']} master-clock cue(s) "
+        f"({counts['narration']} narration / {counts['raw']} raw) -> subtitles.ass + srt + json"
+    )
     return out
 
 

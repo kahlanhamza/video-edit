@@ -161,3 +161,99 @@ def story_map_prompt(buckets: list[StoryBucket], source_duration_s: float) -> st
         "1-minute buckets: [mm:ss] (speakers) <visual tags> cuts ~audio; speech lines below)\n"
         + render_story_map(buckets)
     )
+
+
+# ---------------------------------------------------------------- full dialogue
+TURN_MERGE_GAP_S = 1.8  # same-speaker utterances closer than this are one turn
+TURN_MAX_CHARS = 240
+FULL_TRANSCRIPT_CHAR_BUDGET = 60_000  # ~= 15k tokens — every word of a 45-min tape
+
+
+def build_transcript_turns(transcript: dict) -> list[dict]:
+    """The notebook's condensed FULL transcript — every speaker turn, timestamped.
+
+    The 1-minute story index caps speech at 360 chars/bucket: the LLM sees
+    HIGHLIGHTS, not the dialogue, and writes generic commentary. The manual
+    sandbox workflow (the owner's notebook) feeds the WHOLE condensed
+    transcript — utterances merged into turns (same speaker, gap <= 1.8s,
+    <= 240 chars each) with `[mm:ss-mm:ss] (s.s-e.s) Speaker: text` lines —
+    which is what makes specific, contradiction-quoting narration possible.
+
+    Segments are preferred (diarized, sentence-shaped); words are the fallback.
+    """
+    turns: list[dict] = []
+    if transcript.get("segments"):
+        for seg in transcript.get("segments", []):
+            text = str(seg.get("text", "")).strip()
+            if not text:
+                continue
+            spk = f"S{seg.get('speaker', '?')}" if seg.get("speaker") is not None else "S?"
+            turns.append(
+                {
+                    "spk": spk,
+                    "start": float(seg.get("start_s", 0.0)),
+                    "end": float(seg.get("end_s", 0.0)),
+                    "text": text,
+                }
+            )
+    else:
+        words = [w for w in transcript.get("words", []) if w.get("text")]
+        for w in words:
+            spk = f"S{w.get('speaker', '?')}" if w.get("speaker") is not None else "S?"
+            if (
+                turns
+                and turns[-1]["spk"] == spk
+                and float(w.get("start_s", 0.0)) - turns[-1]["end"] <= TURN_MERGE_GAP_S
+                and len(turns[-1]["text"]) < TURN_MAX_CHARS
+            ):
+                turns[-1]["end"] = float(w.get("end_s", 0.0))
+                turns[-1]["text"] += " " + str(w["text"]).strip()
+            else:
+                turns.append(
+                    {
+                        "spk": spk,
+                        "start": float(w.get("start_s", 0.0)),
+                        "end": float(w.get("end_s", 0.0)),
+                        "text": str(w["text"]).strip(),
+                    }
+                )
+
+    # split oversized turns (a 240-char cap keeps lines readable)
+    out: list[dict] = []
+    for t in turns:
+        if len(t["text"]) <= TURN_MAX_CHARS:
+            out.append(t)
+            continue
+        words = t["text"].split()
+        cur: list[str] = []
+        cur_chars = 0
+        for tok in words:
+            if cur and cur_chars + len(tok) + 1 > TURN_MAX_CHARS:
+                out.append({**t, "text": " ".join(cur)})
+                cur, cur_chars = [], 0
+            cur.append(tok)
+            cur_chars += len(tok) + 1
+        if cur:
+            out.append({**t, "text": " ".join(cur)})
+    return out
+
+
+def render_full_transcript(transcript: dict, char_budget: int = FULL_TRANSCRIPT_CHAR_BUDGET) -> str:
+    """The timestamped full-dialogue block the Director prompt reads."""
+    turns = build_transcript_turns(transcript)
+    if not turns:
+        return ""
+    lines = []
+    used = 0
+    for t in turns:
+        line = (
+            f"[{t['start'] / 60:02.0f}:{t['start'] % 60:02.0f}-"
+            f"{t['end'] / 60:02.0f}:{t['end'] % 60:02.0f}] "
+            f"({t['start']:.1f}-{t['end']:.1f}s) {t['spk']}: {t['text']}"
+        )
+        if used + len(line) > char_budget:
+            lines.append("…(older dialogue truncated at the token budget)")
+            break
+        lines.append(line)
+        used += len(line) + 1
+    return "\n".join(lines)

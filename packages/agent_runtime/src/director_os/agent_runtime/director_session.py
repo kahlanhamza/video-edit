@@ -59,7 +59,11 @@ from director_os.agent_runtime.plan_invariants import (
     timeline_composition,
 )
 from director_os.agent_runtime.prompting import compose_agent_prompt
-from director_os.agent_runtime.story_map import StoryBucket, story_map_prompt
+from director_os.agent_runtime.story_map import (
+    StoryBucket,
+    render_full_transcript,
+    story_map_prompt,
+)
 from pydantic import BaseModel, Field, ValidationError
 
 # ------------------------------------------------------------ Phase A models
@@ -256,7 +260,16 @@ def macro_plan_user_prompt(
     buckets: list[StoryBucket],
     source_duration_s: float,
     dossier_json: dict[str, Any] | None = None,
+    transcript: dict | None = None,
 ) -> str:
+    """Phase A prompt: story index + FULL dialogue + dossier + editorial laws.
+
+    The full condensed transcript is the notebook law — the highlight-only
+    story index produced generic narration (the owner's weak-script report);
+    specific commentary needs the actual words.
+    """
+    from director_os.agent_runtime.story_map import render_full_transcript
+
     scale = doc_scale(source_duration_s)
     dossier_block = ""
     if dossier_json:
@@ -264,8 +277,16 @@ def macro_plan_user_prompt(
             "\n\n## Verified case dossier (use ONLY these facts; never invent "
             "charges, names, or verdicts)\n" + json.dumps(dossier_json, ensure_ascii=False)[:4000]
         )
+    full_dialogue = render_full_transcript(transcript or {})
+    dialogue_block = (
+        "\n\n## FULL DIALOGUE TRANSCRIPT (every turn, timestamped — quote real "
+        "lines in notes and reference exact contradictions)\n" + full_dialogue
+        if full_dialogue
+        else ""
+    )
     return (
         story_map_prompt(buckets, source_duration_s)
+        + dialogue_block
         + dossier_block
         + f"""
 
@@ -327,11 +348,15 @@ Hard rules:
 
 
 def parse_macro_plan(text: str) -> MacroPlan:
-    """Lenient parse: strip code fences, take the outermost JSON object."""
-    from director_os.agent_runtime.llm import strip_code_fences
+    """Lenient parse: strip think-blocks/code fences, take the outermost object.
 
-    cleaned = strip_code_fences(text)
-    data = json.loads(cleaned)
+    Reasoning models wrap JSON in <think>...</think>; proxies sometimes add
+    prose around the payload — `extract_json_payload` finds the object either
+    way (the Phase A "Expecting value: char 0" failure class).
+    """
+    from director_os.agent_runtime.llm import extract_json_payload
+
+    data = extract_json_payload(text, expect="object")
     if not isinstance(data, dict):
         raise ValueError("macro plan is not a JSON object")
     return MacroPlan.model_validate(data)
@@ -571,6 +596,78 @@ def refine_plan_quotes(
     return revised, ""
 
 
+def critic_refine_plan(
+    plan: MacroPlan,
+    transcript: dict | None,
+    backend: Any,
+    source_duration_s: float,
+    problems_fn=None,
+) -> tuple[MacroPlan, str]:
+    """The Legal & Documentary QA Critic pass (the notebook's second LLM stage).
+
+    The first-draft plan hallucinates (an ASR misheard word becomes a
+    narcotics accusation), mis-times the day, or skips high-drama beats. The
+    critic — a separate strict completion over the FULL transcript — audits
+    facts, adds the missing beats, and forbids verdict-in-hook. Guardrails:
+    the returned plan must parse, re-snap to speech, keep a sane act count,
+    and pass `_plan_problems`; ANY failure keeps the accepted plan untouched
+    ("Keeping previous plan safely and continuing" — the notebook's law).
+    """
+    if backend is None or getattr(backend, "complete_json", None) is None:
+        return plan, ""
+    scale = doc_scale(source_duration_s)
+    full_dialogue = render_full_transcript(transcript or {})
+    if not full_dialogue:
+        return plan, ""
+    system = compose_agent_prompt(
+        agent="director_agent", role="critic", niche="bodycam_documentary"
+    )
+    user = f"""You are a strict Legal & Documentary QA Critic reviewing an AI-generated Edit Plan.
+Compare the draft plan against the FULL DIALOGUE TRANSCRIPT below.
+
+FIX THESE SPECIFIC ISSUES IF PRESENT:
+1. FACT & HALLUCINATION AUDIT: remove or fix any narration claim based on an
+   unverified single-word ASR mishearing (do NOT accuse someone of hard
+   narcotics if the dialogue only describes alcohol/medication; skip garbled
+   ASR lines rather than repeating hallucinations). Fix any wrong time-of-day
+   (check transcript clues like "4-5 p.m." vs morning). No invented charges,
+   names, or verdicts.
+2. MISSING HIGH-DRAMA BEATS: add 1-3 skipped high-value raw clips (cognitive /
+   orientation checks, begging right before handcuffs, witness interaction,
+   the booking/testing confrontation) with commentary blocks, so the arc runs
+   from the first 10% through the final 25% of the tape.
+3. NO DUPLICATE RE-TELLING & NO VERDICT IN THE HOOK: the hook narration must
+   tease the mystery, never spoil the outcome; narration right before a raw
+   clip must never reveal that clip's punchline.
+4. NARRATION QUALITY: every narration block 50-80 words of specific,
+   contradiction-quoting commentary grounded in the transcript below — never
+   generic filler.
+
+Return ONLY the revised JSON object in the SAME schema (title, acts, cards) —
+no prose, no markdown fences.
+
+## DRAFT PLAN
+{plan.model_dump_json()}
+
+## FULL DIALOGUE TRANSCRIPT
+{full_dialogue[:48000]}"""
+    try:
+        text = backend.complete_json(system, user, max_tokens=8192)
+        revised = parse_macro_plan(text)
+    except Exception as e:  # noqa: BLE001 — a dead backend/parse never breaks planning
+        return plan, f"critic parse failed — kept accepted plan ({type(e).__name__})"
+    if len(revised.acts) > scale.act_max + 1:
+        return plan, "critic inflated the act count — kept accepted plan"
+    revised, _ = snap_plan_to_speech(revised, transcript, source_duration_s)
+    if problems_fn is not None:
+        problems = problems_fn(revised)
+        if problems:
+            return plan, "critic plan failed pre-flight — kept accepted plan: " + "; ".join(
+                problems
+            )
+    return revised, ""
+
+
 # ------------------------------------------------------------ Phase B expansion
 def _as_block(blk: PlanRawClip | PlanNarration | dict) -> PlanRawClip | PlanNarration:
     """Coerce a stray dict into its model (defensive against mutated plans)."""
@@ -803,7 +900,7 @@ class DirectorSession:
         backend,  # FallbackChain | GeminiRestBackend | OpenAICompatBackend
         source_duration_s: float,
         max_turns: int = 30,  # >= 25 mandated: the loop may not die at 1-2 calls
-        phase_a_retries: int = 2,
+        phase_a_retries: int = 3,  # the notebook law: 3 generation attempts
         transcript: dict | None = None,  # enables ASR snap + quote refinement
         quote_refine: bool = True,
     ):
@@ -841,7 +938,9 @@ class DirectorSession:
         system = compose_agent_prompt(
             agent="director_agent", role="director", niche="bodycam_documentary"
         )
-        user = macro_plan_user_prompt(buckets, self.source_duration_s, dossier_json)
+        user = macro_plan_user_prompt(
+            buckets, self.source_duration_s, dossier_json, transcript=self.transcript
+        )
         feedback = ""
         last_err = ""
         best: MacroPlan | None = None
@@ -871,6 +970,18 @@ class DirectorSession:
                         best = plan
                     continue
                 if self.transcript and self.quote_refine:
+                    # critic first (fact/hallucination audit + missing beats,
+                    # the notebook's second stage), then quote-grounded window
+                    # refinement against the real dialogue
+                    plan, critic_note = critic_refine_plan(
+                        plan,
+                        self.transcript,
+                        self.backend,
+                        self.source_duration_s,
+                        problems_fn=self._plan_problems,
+                    )
+                    if critic_note:
+                        last_err = critic_note
                     plan, refine_note = refine_plan_quotes(
                         plan,
                         self.transcript,

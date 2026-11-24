@@ -107,106 +107,16 @@ def build_master_caption_cues(
     transcript: dict,
     narration_words: dict[str, list[dict]],
 ) -> tuple[list, dict[str, int]]:
-    """Master-clock caption beats: NARRATOR (TTS stamps) + raw speech (remapped).
+    """Master-clock caption beats — the SHARED builder (subtitles.master_cues).
 
-    narration_words maps script_text -> [{"word","start_s","end_s"}] from the
-    persisted TTS sidecars (already re-based onto the trimmed stem by
-    generate_tts). Raw-speech words come from the transcript (source clock)
-    and are remapped through each kept raw clip's window; words inside
-    narration b-roll windows are skipped (the bed is muted there).
+    Kept as a thin re-export so the historical import path keeps working; the
+    law lives in ONE implementation now (`director_os.subtitles.master_cues`)
+    and `stage_subtitles` persists the SAME cues into the Studio store, so the
+    grid, the program monitor and this burn can never disagree again.
     """
-    from director_os.otio_engine.compiler import master_track
-    from director_os.otio_engine.contract import NarratorClipMeta, RawClipMeta, parse_clip_meta
-    from director_os.otio_engine.timeline import is_gap, item_duration_s
-    from director_os.subtitles.ass_builder import CaptionBeat, WordTiming
+    from director_os.subtitles.master_cues import build_master_caption_cues as _build
 
-    beats: list[CaptionBeat] = []
-
-    def _flush_run(run: list[tuple[str, float, float]], speaker: str) -> None:
-        if not run:
-            return
-        beats.append(
-            CaptionBeat(
-                text=" ".join(w for w, _s, _e in run),
-                start_ms=int(run[0][1] * 1000),
-                end_ms=int(run[-1][2] * 1000),
-                speaker=speaker,
-                words=[
-                    WordTiming(word=w, start_ms=int(s * 1000), end_ms=int(e * 1000))
-                    for w, s, e in run
-                ],
-            )
-        )
-
-    MAX_WORDS, MAX_S = 6, 3.5
-    narr_cues = raw_cues = 0
-
-    track = master_track(timeline)
-    t_master = 0.0
-    for item in track:
-        dur = item_duration_s(item)
-        if dur <= 0:
-            continue
-        if is_gap(item):
-            t_master += dur
-            continue
-        meta = parse_clip_meta(item)
-        sr = getattr(item, "source_range", None)
-        src0 = sr.start_time.to_seconds() if sr is not None else 0.0
-
-        if isinstance(meta, NarratorClipMeta):
-            words = narration_words.get(meta.script_text, [])
-            run: list[tuple[str, float, float]] = []
-            for w in words:
-                w_start = t_master + float(w.get("start_s", 0.0))
-                w_end = min(t_master + dur, t_master + float(w.get("end_s", 0.0)))
-                if w_end <= w_start:
-                    continue
-                if run:
-                    too_long = w_end - run[0][1] > MAX_S
-                    too_many = len(run) >= MAX_WORDS
-                    if too_long or too_many:
-                        _flush_run(run, "NARRATOR")
-                        narr_cues += 1
-                        run = []
-                run.append((str(w.get("word", "")).strip(), w_start, w_end))
-            if run:
-                _flush_run(run, "NARRATOR")
-                narr_cues += 1
-        elif isinstance(meta, RawClipMeta):
-            # remap transcript words inside [src0, src0+dur) onto the master clock
-            run2: list[tuple[str, float, float]] = []
-            speaker = "Unknown"
-            for w in transcript.get("words", []) or []:
-                text = str(w.get("text") or w.get("word") or "").strip()
-                if not text:
-                    continue
-                ws, we = float(w.get("start_s", 0.0)), float(w.get("end_s", 0.0))
-                if we <= src0 or ws >= src0 + dur:
-                    continue
-                m_start = t_master + max(0.0, ws - src0)
-                m_end = t_master + min(dur, we - src0)
-                if m_end - m_start < 0.05:
-                    continue
-                spk = str(w.get("speaker") or "Unknown")
-                if run2 and (
-                    spk != speaker
-                    or m_start - run2[-1][2] > 1.0
-                    or m_end - run2[0][1] > MAX_S
-                    or len(run2) >= MAX_WORDS
-                ):
-                    _flush_run(run2, speaker)
-                    raw_cues += 1
-                    run2 = []
-                speaker = spk
-                run2.append((text, m_start, m_end))
-            if run2:
-                _flush_run(run2, speaker)
-                raw_cues += 1
-        t_master += dur
-
-    beats.sort(key=lambda b: b.start_ms)
-    return beats, {"narration": narr_cues, "raw": raw_cues, "total": len(beats)}
+    return _build(timeline, transcript, narration_words)
 
 
 def _captions_pass(
@@ -217,49 +127,20 @@ def _captions_pass(
     narration_clips: list[dict],
     report: PostFxReport,
 ) -> Path:
+    from director_os.subtitles.master_cues import (
+        build_master_caption_cues as _build_cues,
+    )
+    from director_os.subtitles.master_cues import narration_word_stamps
     from director_os.subtitles.store import save_cues
 
     # narration word stamps ride the stage_narration manifest entries
-    narration_words: dict[str, list[dict]] = {}
-    for clip in narration_clips or []:
-        sidecar = Path(clip.get("sidecar") or "")
-        script = str(clip.get("script_text") or "")
-        words: list[dict] = []
-        if sidecar.exists():
-            import json as _json
-
-            try:
-                words = list(_json.loads(sidecar.read_text()).get("words") or [])
-            except (ValueError, OSError):
-                words = []
-        if not words and script:
-            # even distribution fallback (TTS speech is near-constant rate):
-            # keeps narration captions present when a sidecar is missing
-            words = _even_word_distribution(script, float(clip.get("duration_s") or 0.0))
-        if words:
-            narration_words[script] = words
-
-    beats, counts = build_master_caption_cues(timeline, transcript, narration_words)
+    narration_words = narration_word_stamps(narration_clips or [])
+    beats, counts = _build_cues(timeline, transcript, narration_words)
     save_cues(work, beats)
     report.n_caption_cues = counts["total"]
     report.narration_cues = counts["narration"]
     report.raw_cues = counts["raw"]
     return work / "subtitles.ass"
-
-
-def _even_word_distribution(script: str, duration_s: float) -> list[dict]:
-    tokens = script.split()
-    if not tokens or duration_s <= 0:
-        return []
-    per = duration_s / len(tokens)
-    return [
-        {
-            "word": tok,
-            "start_s": round(i * per, 3),
-            "end_s": round(min(duration_s, (i + 1) * per), 3),
-        }
-        for i, tok in enumerate(tokens)
-    ]
 
 
 # ----------------------------------------------------------------- blur pass

@@ -115,6 +115,28 @@ def strip_code_fences(text: str) -> str:
     return text
 
 
+def extract_json_payload(text: str, expect: str = "object") -> Any:
+    """Notebook-grade lenient JSON extraction (the Phase A char-0 failure class).
+
+    Reasoning models wrap the payload in <think>...</think>; proxies prepend
+    prose or wrap it in ```json fences. Order of operations (the manual sandbox
+    workflow's `extract_json`): strip think blocks, strip fences, then slice
+    from the first `{`/`[` to the last `}`/`]` and json.loads. Raises ValueError
+    with the body head quoted when nothing parseable remains.
+    """
+    import json
+    import re
+
+    cleaned = re.sub(r"<(?:think|thought)>[\s\S]*?</(?:think|thought)>", "", text or "")
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned.strip())
+    open_ch, close_ch = ("{", "}") if expect == "object" else ("[", "]")
+    a, b = cleaned.find(open_ch), cleaned.rfind(close_ch)
+    if a == -1 or b == -1 or b <= a:
+        head = " ".join(cleaned.split())[:160] or "(empty response)"
+        raise ValueError(f"no JSON {expect} in response — got: {head!r}")
+    return json.loads(cleaned[a : b + 1])
+
+
 def _modal_vlm_fn():
     """Seam for the deployed fleet proxy (lazy `modal` import keeps CI hermetic)."""
     import modal

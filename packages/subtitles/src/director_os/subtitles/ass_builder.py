@@ -1,9 +1,20 @@
-"""2-row speaker-colored `.ass` builder — PLAN guardrail 6 + §4.6.
+"""2-row speaker-colored `.ass` builder — the COMMITTED v4/v6 caption law.
 
-Simultaneous speakers ride two lanes (Row 1 `MarginV=46`, Row 2 `MarginV=96`) so
-both stay legible; we never clamp overlapping lines onto one row with forced
-minimums. Karaoke active-word highlight uses `\\k` centisecond tags from aligned
-word timings (3–5 word beats).
+History: the v5 regression burned Roboto 20pt under a 1920x1080 PlayRes onto
+1280x720 masters (~13px illegible text, commit 0d56deb "caption truth on the
+master clock"). The approved typography recovered from that commit is law:
+
+- DejaVu Sans 40pt @ PlayRes 1280x720 (libass scales proportionally to any
+  render size — 60px on a 1080p master; always far above the QA >=26px gate)
+- role colors: Officer=white / Suspect=gold / Narrator=cyan; UNKNOWN speakers
+  keep a deterministic palette (hash) so multi-party scenes stay distinguishable
+- two lanes for simultaneous speakers (Row 1 `MarginV=46`, Row 2 `MarginV=96`),
+  never clamped onto one row
+- karaoke `\\k` centisecond beats from aligned word timings, `\\fad(40,30)`
+- outline 2.9 / shadow 1.6 / spacing 0.4 / margins L+R 80 / bold
+- cue law: <=5 words / <=27 chars / break on a >1s word gap (caption_v4)
+- flash guard: a cue shorter than 0.22s is a subliminal flash — it is extended
+  to 0.30s (word-preserving variant of the v6 drop rule; nothing is lost)
 """
 
 from __future__ import annotations
@@ -17,8 +28,23 @@ from pysubs2 import Alignment
 
 LANE1_MARGIN_V = 46
 LANE2_MARGIN_V = 96
-FONT_NAME = "Roboto"
-FONT_SIZE = 20
+# committed v4/v6 typography (see module docstring)
+FONT_NAME = "DejaVu Sans"
+FONT_SIZE = 40
+PLAY_RES_X = 1280
+PLAY_RES_Y = 720
+OUTLINE = 2.9
+SHADOW = 1.6
+SPACING = 0.4
+MARGIN_LR = 80
+FLASH_MIN_S = 0.30
+
+# committed v6 role colors (ASS PrimaryColour is &HAABBGGRR; here as RGB hex)
+ROLE_COLORS: dict[str, str] = {
+    "officer": "#FFFFFF",  # white
+    "suspect": "#FFD84D",  # gold (&H004DD8FF in the committed header)
+    "narrator": "#70E4FF",  # cyan (&H00FFE470 in the committed header)
+}
 
 PALETTE = [
     "#FFFFFF",
@@ -28,6 +54,11 @@ PALETTE = [
     "#FF9E7D",
     "#C792EA",
 ]
+
+# cue law (caption_v4): a caption beat is a short readable chunk
+MAX_CUE_WORDS = 5
+MAX_CUE_CHARS = 27
+CUE_GAP_BREAK_S = 1.0
 
 PROFANITY = {
     "fuck",
@@ -62,8 +93,47 @@ class SubtitleBuildError(RuntimeError):
 
 
 def _speaker_color(speaker: str) -> str:
+    """Committed role colors first; unknown speakers keep the hash palette."""
+    role = ROLE_COLORS.get(speaker.strip().lower())
+    if role:
+        return role
     idx = int(hashlib.sha1(speaker.encode()).hexdigest(), 16) % len(PALETTE)
     return PALETTE[idx]
+
+
+def chunk_cue_words(words: Sequence[dict]) -> list[list[dict]]:
+    """The caption_v4 cue law: <=5 words / <=27 chars / break on a >1s gap.
+
+    `words` are dicts with `text`, `start_s`, `end_s` and an optional `speaker`
+    (a speaker change always starts a new cue). Returns the chunk list.
+    """
+    chunks: list[list[dict]] = []
+    run: list[dict] = []
+    run_chars = 0
+    speaker = None
+    for w in words:
+        text = str(w.get("text") or w.get("word") or "").strip()
+        if not text:
+            continue
+        spk = str(w.get("speaker") or "") or None
+        gap = float(w.get("start_s", 0.0)) - float(run[-1].get("end_s", 0.0)) if run else 0.0
+        if run and (
+            (spk is not None and speaker is not None and spk != speaker)
+            or gap > CUE_GAP_BREAK_S
+            or len(run) >= MAX_CUE_WORDS
+            or run_chars + len(text) + 1 > MAX_CUE_CHARS
+        ):
+            chunks.append(run)
+            run, run_chars = [], 0
+        if run:
+            run_chars += len(text) + 1
+        else:
+            run_chars = len(text)
+        run.append({**w, "text": text})
+        speaker = spk if spk is not None else speaker
+    if run:
+        chunks.append(run)
+    return chunks
 
 
 def _mask_profanity(text: str) -> str:
@@ -121,6 +191,17 @@ def _karaoke_text(beat: CaptionBeat) -> str:
     return " ".join(tags)
 
 
+def _apply_flash_guard(beats: list[CaptionBeat]) -> list[CaptionBeat]:
+    """Extend subliminal flashes (< FLASH_MIN_S) — words survive, flashes die."""
+    out: list[CaptionBeat] = []
+    for b in beats:
+        dur_ms = b.end_ms - b.start_ms
+        if 0 < dur_ms < int(FLASH_MIN_S * 1000):
+            b = b.model_copy(update={"end_ms": b.start_ms + int(FLASH_MIN_S * 1000)})
+        out.append(b)
+    return out
+
+
 def build_ass(
     beats: Sequence[CaptionBeat],
     preset: str = "doc_2row_karaoke",
@@ -133,12 +214,16 @@ def build_ass(
         raise SubtitleBuildError(f"unknown profanity_mode: {profanity_mode}")
 
     subs = pysubs2.SSAFile()
-    subs.info["PlayResX"] = "1920"
-    subs.info["PlayResY"] = "1080"
+    # committed v4/v6 PlayRes: 1280x720 — libass scales proportionally, so the
+    # 40pt law holds at any render resolution (60px on a 1080p master)
+    subs.info["PlayResX"] = str(PLAY_RES_X)
+    subs.info["PlayResY"] = str(PLAY_RES_Y)
+    subs.info["WrapStyle"] = "2"
     subs.styles.clear()
 
-    rows = _assign_rows(beats)
-    for beat, lane in zip(beats, rows, strict=False):
+    flash_safe = _apply_flash_guard(list(beats))
+    rows = _assign_rows(flash_safe)
+    for beat, lane in zip(flash_safe, rows, strict=False):
         if profanity_mode == "mask":
             masked_words = []
             for w in beat.words:
@@ -159,14 +244,18 @@ def build_ass(
                 primarycolor=color,
                 bold=True,
                 alignment=Alignment.BOTTOM_CENTER,  # numpad 2
+                # committed v4 look: heavy readable outline + soft shadow
+                outline=OUTLINE,
+                shadow=SHADOW,
+                spacing=SPACING,
                 marginv=LANE1_MARGIN_V if lane == 1 else LANE2_MARGIN_V,
-                marginl=60,
-                marginr=60,
+                marginl=MARGIN_LR,
+                marginr=MARGIN_LR,
             )
         event = pysubs2.SSAEvent(
             start=beat.start_ms,
             end=beat.end_ms,
-            text=_karaoke_text(beat),
+            text=r"{\fad(40,30)}" + _karaoke_text(beat),
         )
         event.style = style_name
         subs.events.append(event)
