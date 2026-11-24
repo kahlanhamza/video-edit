@@ -9,9 +9,14 @@ after QA:
   1. DETERMINISTIC reviewer (always): structural evidence a model cannot
      fake — kept-source chronology across the program body (the notebook's
      hand-fixed arrest-before-witness law) + the kept-span program map.
-  2. MODEL reviewer (when a backend is configured): the sampled master
-     frames + that evidence through ONE strict JSON verdict: issues +
-     bounded repairs.
+  2. MODEL critic (when an eye is configured): a ReAct loop over the
+     rendered master — the critic may REQUEST exact frames anywhere on the
+     timeline ("inspect" rounds, on demand, bounded) before it issues its
+     ONE strict JSON verdict: issues + bounded repairs. The editor applies
+     them; the re-render returns with NEW frames; the critic judges again.
+     researched basis: EditDuet (SIGGRAPH 2025) editor/critic duet, Agentic
+     Video Intelligence (arXiv 2511.14446) retrieve-perceive-review,
+     VideoAgent (ECCV 2024) iterative VLM tool rounds.
   3. REPAIRS go through the SAME typed DirectorToolbox registry the
      Director plans with (no private edit path), each applied or refused
      loudly, capped (MAX_REPAIRS), each seeing the timeline AFTER the
@@ -38,6 +43,8 @@ from pydantic import BaseModel, Field, ValidationError
 MAX_REPAIRS = 12  # a review round is a polish pass, not a re-plan
 CHRONO_TOLERANCE_S = 1.0  # hairline overlaps are not chronology crimes
 REVIEW_FRAME_COUNT = 12
+MAX_INSPECT_ROUNDS = 4  # ReAct ceiling: the critic may LOOK before it judges
+INSPECT_BATCH_CAP = 8  # frames per inspect round (tokens law)
 
 REVIEW_SYSTEM = """You are the dailies reviewer of an autonomous documentary editor.
 You are shown frames sampled evenly across the RENDERED MASTER plus structural
@@ -45,8 +52,15 @@ evidence. Judge the WATCHING experience, not the plan: dead air, frozen or
 ugly holds, burned-in artifacts, missing visual payoff, misordered story
 beats, captions or graphics problems visible in frame.
 
-Allowed repairs (indices are 0-based positions on the master track, each
-repair sees the timeline AFTER the previous one — order them accordingly):
+You work in rounds. Before you judge, you may LOOK CLOSER — request exact
+frames from anywhere on the master (act boundaries, suspect dead air, the
+scene behind a suspicious anchor):
+{"action": "inspect", "times": [<master seconds, max 8>], "why": "<one line>"}
+The frames arrive as new attachments; your conversation grows each round.
+When you have seen enough, produce the verdict:
+
+Repairs (indices are 0-based positions on the master track, each repair
+sees the timeline AFTER the previous one — order them accordingly):
 - {"kind": "trim_raw", "item_index": N, "new_start_s": A, "new_dur_s": D}
     moves a RAW clip's source window to [A, A+D] (source seconds of the
     original footage). Use to cut dead air / skip to the visual payoff.
@@ -56,7 +70,8 @@ repair sees the timeline AFTER the previous one — order them accordingly):
     reorders a clip to master position M (fix story order).
 
 You may NOT rewrite narration (out of scope), add blur/zoom/freezes
-(coordinates law), or add clips. Reply with ONLY a JSON object:
+(coordinates law), or add clips. Reply with ONLY a JSON object — either the
+inspect action above, or:
 {"verdict": "ok"|"needs_repairs",
  "issues": ["<one-line issue, frame_# referenced>", ...],
  "repairs": [<repair objects, max 12>]}
@@ -335,3 +350,172 @@ def text_review_backend(backend: Any) -> ReviewBackend | None:
             return verdict
 
     return _T()
+
+
+# ------------------------------------------------- the critic loop (ReAct)
+class CriticTurnError(RuntimeError):
+    pass
+
+
+def parse_critic_round(text: str) -> tuple[str, dict[str, Any]]:
+    """Classify one critic response: ("inspect", {...}) | ("verdict", {...}) |
+    ("garbage", {})."""
+    from director_os.agent_runtime.chat_v2 import _extract_json
+
+    data = _extract_json(text or "")
+    if isinstance(data, dict) and data.get("action") == "inspect":
+        return "inspect", data
+    if isinstance(data, dict):
+        return "verdict", data
+    return "garbage", {}
+
+
+class CriticTurnAdapter(Protocol):
+    """Port: one agentic conversation turn. Vision adapters attach frames;
+    text adapters iterate evidence-only. `provider` feeds the audit log."""
+
+    provider: str
+
+    def ask(self, prompt: str, frames: list[tuple[float, Any]]) -> str: ...
+
+
+def vision_critic_adapter(client: Any) -> CriticTurnAdapter | None:
+    """A VisionClient as the critic's eyes. A FAKE client (no key) reads as
+    None — a fake's sight would be a silent lie about real footage."""
+    if getattr(client, "provider", "fake") == "fake":
+        return None
+
+    class _V:
+        provider = getattr(client, "provider", "vision")
+
+        def ask(self, prompt: str, frames: list[tuple[float, Any]]) -> str:
+            from director_os.perception.vision import FrameRef, VisionError
+
+            try:
+                refs = [FrameRef(timestamp_s=t, image_path=p) for t, p in frames]
+                insights = client.analyze(prompt, refs)
+                return "\n".join(i.description for i in insights)
+            except VisionError as e:
+                raise CriticTurnError(str(e)) from e
+
+    return _V()
+
+
+def text_critic_adapter(backend: Any) -> CriticTurnAdapter | None:
+    """A complete_json backend iterating on the evidence text — inspection
+    rounds return the DETERMINISTIC read of what it asked for (no pixels)."""
+    if backend is None or not callable(getattr(backend, "complete_json", None)):
+        return None
+
+    class _T:
+        provider = getattr(backend, "provider", "llm")
+
+        def __init__(self) -> None:
+            self._backend = backend
+
+        def ask(self, prompt: str, frames: list[tuple[float, Any]]) -> str:
+            from director_os.agent_runtime.llm import LLMBackendError
+
+            try:
+                return self._backend.complete_json(REVIEW_SYSTEM, prompt, max_tokens=2048)
+            except LLMBackendError as e:
+                raise CriticTurnError(str(e)) from e
+
+    return _T()
+
+
+def run_critic(
+    adapter: CriticTurnAdapter,
+    *,
+    base_prompt: str,
+    initial_frames: list[tuple[float, Any]],
+    grab_frames: Any,
+    duration_s: float,
+    log: Any = None,
+) -> tuple[ReviewVerdict, list[dict[str, Any]]]:
+    """The ReAct critic: LOOK (inspect) -> REASON -> (repeat) -> VERDICT.
+
+    `grab_frames([t, ...]) -> [(t, path), ...]` is the worker's on-demand
+    eye (worker-local cache dirs); `initial_frames` is the even sampling.
+    Garbage rounds and the inspect ceiling fail LOUD (CriticTurnError) —
+    the caller degrades to `unavailable`, never to a silent guess.
+    """
+
+    def _log(msg: str) -> None:
+        if log is not None:
+            log(msg)
+
+    frames = list(initial_frames)
+    prompt = base_prompt
+    trace: list[dict[str, Any]] = []
+    garbage_streak = 0
+    for rnd in range(1, MAX_INSPECT_ROUNDS + 2):
+        try:
+            text = adapter.ask(prompt, frames)
+        except CriticTurnError:
+            raise
+        action, data = parse_critic_round(text)
+        if action == "verdict":
+            verdict = parse_review_verdict(text)
+            if verdict is None:
+                garbage_streak += 1
+                trace.append(
+                    {
+                        "round": rnd,
+                        "action": "garbage",
+                        "detail": f"unparseable verdict: {str(text)[:160]!r}",
+                    }
+                )
+            else:
+                trace.append({"round": rnd, "action": "verdict", "detail": verdict.verdict})
+                _log(f"  [review] critic verdict round {rnd}: {verdict.verdict}")
+                return verdict, trace
+        elif action == "inspect" and rnd <= MAX_INSPECT_ROUNDS:
+            times_raw = data.get("times") or []
+            times = sorted(
+                {
+                    round(min(max(float(t), 0.0), max(duration_s, 0.0)), 2)
+                    for t in times_raw
+                    if isinstance(t, (int, float))
+                }
+            )[:INSPECT_BATCH_CAP]
+            if not times:
+                garbage_streak += 1
+                trace.append({"round": rnd, "action": "garbage", "detail": "empty inspect times"})
+            else:
+                new = grab_frames(times)
+                have = {round(t, 2) for t, _ in frames}
+                frames += [(t, p) for t, p in new if round(t, 2) not in have]
+                why = str(data.get("why", ""))[:200]
+                manifest = ", ".join(f"{t:.2f}s" for t, _ in new) or "none"
+                prompt = (
+                    f"{prompt}\n\n[Round {rnd}] Frames NOW ATTACHED at: {manifest}."
+                    + (
+                        f' Request reason: "{why}".'
+                        if why
+                        else " Respond with your next action or verdict."
+                    )
+                    + f"\nTotal inspected so far: {len(frames)} frame(s)."
+                )
+                garbage_streak = 0
+                trace.append(
+                    {
+                        "round": rnd,
+                        "action": "inspect",
+                        "detail": f"{len(new)} frame(s): {manifest} — {why}",
+                    }
+                )
+                _log(f"  [review] critic inspected {len(new)} frame(s): {manifest}")
+        else:
+            garbage_streak += 1
+            detail = (
+                "inspect beyond the ceiling"
+                if action == "inspect"
+                else f"no JSON object in reply: {str(text)[:160]!r}"
+            )
+            trace.append({"round": rnd, "action": "garbage", "detail": detail})
+        if garbage_streak >= 2:
+            raise CriticTurnError(
+                "critic produced 2 consecutive unusable rounds — refusing to guess"
+            )
+    raise CriticTurnError(f"critic never reached a verdict in {MAX_INSPECT_ROUNDS + 1} rounds")

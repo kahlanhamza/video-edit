@@ -19,10 +19,16 @@ from typing import Any, Literal
 
 from director_os.agent_runtime.review import (
     REVIEW_FRAME_COUNT,
+    REVIEW_SYSTEM,
+    CriticTurnAdapter,
+    CriticTurnError,
     ReviewBackend,
     apply_repairs,
     deterministic_review,
+    run_critic,
+    text_critic_adapter,
     text_review_backend,
+    vision_critic_adapter,
     vision_review_backend,
 )
 from pydantic import BaseModel, Field
@@ -35,6 +41,8 @@ class ReviewOutcome(BaseModel):
     refused: list[str] = Field(default_factory=list)
     summary: str = ""
     frames: list[float] = Field(default_factory=list)  # sampled master timestamps (s)
+    inspect_rounds: int = 0  # ReAct rounds the critic spent LOOKING
+    inspected: list[float] = Field(default_factory=list)  # every frame shown
 
 
 def sample_master_frames(
@@ -58,7 +66,9 @@ def sample_master_frames(
 
 def build_review_backend(deps: Any) -> ReviewBackend | None:
     """Injection first, then vision (it SEES the frames), then the text chain
-    (the no-frames lane: program map + QA + chronology evidence only)."""
+    (the no-frames lane: program map + QA + chronology evidence only). The
+    one-shot ReviewBackend port remains the injection fallback for callers
+    that hand us a pre-built backend."""
     factory = getattr(deps, "review_backend_factory", None)
     if factory is not None:
         backend = factory()
@@ -92,6 +102,42 @@ def build_review_backend(deps: Any) -> ReviewBackend | None:
         except Exception:  # noqa: BLE001 — nothing configured = unavailable, loudly
             chain = None
     return text_review_backend(chain)
+
+
+def build_critic_adapter(deps: Any) -> CriticTurnAdapter | None:
+    """The critic's EYE for the ReAct loop: injected `ask` first, then the
+    vision client, then the text chain (inspection rounds return evidence
+    text, never pixels). None = no eye configured at all."""
+    factory = getattr(deps, "review_backend_factory", None)
+    if factory is not None:
+        backend = factory()
+        if callable(getattr(backend, "ask", None)):
+            return backend
+        return None
+    try:
+        from director_os.perception.vision import build_vision_client
+
+        eye = vision_critic_adapter(build_vision_client())
+        if eye is not None:
+            return eye
+    except Exception:  # noqa: BLE001 — vision misavailability is not a crash
+        pass
+    chain_factory = getattr(deps, "director_backend_factory", None)
+    chain = None
+    if chain_factory is not None:
+        try:
+            chain = chain_factory()
+        except Exception:  # noqa: BLE001 — an LLM outage degrades to unavailable
+            chain = None
+    else:
+        try:
+            from director_os.agent_runtime.llm import build_backend_chain
+            from director_os.agent_runtime.registry import ToolRegistry
+
+            chain = build_backend_chain(ToolRegistry())
+        except Exception:  # noqa: BLE001 — nothing configured = unavailable
+            chain = None
+    return text_critic_adapter(chain)
 
 
 def build_evidence(
@@ -144,35 +190,34 @@ def stage_review(
     project_id: str,
     deps: Any,
 ) -> ReviewOutcome:
-    """Sample + look + (maybe) repair. Returns what happened; never raises."""
+    """The agentic review: LOOK (on demand) -> judge -> repair (maybe).
+
+    The critic works in ReAct rounds — it may request exact frames anywhere
+    on the master before judging; the editor applies its repairs through the
+    typed registry; the re-render comes back with NEW frames and the critic
+    judges again (the pipeline bounds the duet at 2 renders). Never raises.
+    """
     started = time.monotonic()
     outcome = ReviewOutcome()
     if getattr(deps, "review_pass", True) is False:
         outcome.status = "off"
         return outcome
 
-    backend = build_review_backend(deps)
     det_issues = deterministic_review(timeline)
     outcome.issues.extend(det_issues)
-    if backend is None:
-        outcome.status = "unavailable"
-        outcome.summary = (
-            "no review backend configured (set VISION_API_KEY) — deterministic "
-            f"evidence: {len(det_issues)} check(s) recorded"
-        )
-        getattr(deps, "log", lambda _m: None)(f"  [review] {outcome.summary}")
-        return outcome
 
+    _log = getattr(deps, "log", lambda _m: None)
     try:
         frames = sample_master_frames(
             final_for_qa, cache_dir=Path(deps.settings.output_dir) / "review_frames" / project_id
         )
-    except Exception as e:  # noqa: BLE001 — frame!=capabilities failure: report, don't kill
+    except Exception as e:  # noqa: BLE001 — frame/capability failure: report, don't kill
         outcome.status = "unavailable"
         outcome.summary = f"frame sampling failed ({e})"
-        getattr(deps, "log", lambda _m: None)(f"  [review] {outcome.summary}")
+        _log(f"  [review] {outcome.summary}")
         return outcome
     outcome.frames = [t for t, _ in frames]
+    outcome.inspected = list(outcome.frames)
 
     evidence = build_evidence(
         deterministic_issues=det_issues,
@@ -180,12 +225,72 @@ def stage_review(
         timeline=timeline,
         master_path=final_for_qa,
     )
-    try:
-        verdict = backend.review(frames, evidence)
-    except Exception as e:  # noqa: BLE001 — a VLM outage never kills a QA-passed master
+
+    on_demand: list[float] = []
+
+    def _grab(times: list[float]) -> list[tuple[float, Path]]:
+        from director_os.core.frames import grab_frame
+
+        on_demand.extend(times)
+        return [
+            (t, grab_frame(final_for_qa, t, cache_dir=frames_cache_dir, width=640)) for t in times
+        ]
+
+    frames_cache_dir = Path(deps.settings.output_dir) / "review_frames" / project_id
+    verdict = None
+    eye = build_critic_adapter(deps)
+    if eye is not None:
+        from director_os.core.qa_probe import probe
+
+        try:
+            dur = float(probe(str(final_for_qa)).duration_s)
+        except Exception:  # noqa: BLE001 — probe failure degrades honestly
+            dur = 0.0
+        try:
+            if dur <= 0:
+                raise CriticTurnError("master duration is zero — the critic cannot look")
+            manifest = ", ".join(f"{t:.2f}s" for t, _ in frames)
+            base_prompt = (
+                f"{REVIEW_SYSTEM}\n\n## Structural evidence\n{evidence}\n\n"
+                f"## Round 0\n{len(frames)} frame(s) ATTACHED at: {manifest}. "
+                "Inspect more if needed, then give the verdict."
+            )
+            verdict, trace = run_critic(
+                eye,
+                base_prompt=base_prompt,
+                initial_frames=frames,
+                grab_frames=_grab,
+                duration_s=dur,
+                log=getattr(deps, "log", None),
+            )
+            outcome.inspect_rounds = sum(1 for t in trace if t.get("action") == "inspect")
+            outcome.inspected.extend(on_demand)
+        except Exception as e:  # noqa: BLE001 — a critic outage never kills a QA-passed master
+            _log(f"  [review] critic loop failed ({e})")
+            verdict = None
+            outcome.issues.append(f"critic loop failed: {str(e)[:200]}")
+    else:
+        backend = build_review_backend(deps)
+        if backend is None:
+            outcome.status = "unavailable"
+            outcome.summary = (
+                "no review backend configured (set VISION_API_KEY) — deterministic "
+                f"evidence: {len(det_issues)} check(s) recorded"
+            )
+            _log(f"  [review] {outcome.summary}")
+            return outcome
+        try:
+            verdict = backend.review(frames, evidence)
+        except Exception as e:  # noqa: BLE001 — a VLM outage never kills a QA-passed master
+            outcome.status = "unavailable"
+            outcome.summary = f"review backend failed ({e})"
+            _log(f"  [review] {outcome.summary}")
+            return outcome
+
+    if verdict is None:
         outcome.status = "unavailable"
-        outcome.summary = f"review backend failed ({e})"
-        getattr(deps, "log", lambda _m: None)(f"  [review] {outcome.summary}")
+        outcome.summary = "critic produced no verdict — deterministic evidence recorded"
+        _log(f"  [review] {outcome.summary}")
         return outcome
 
     outcome.issues.extend(verdict.issues[:12])
