@@ -11,8 +11,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from director_os.perception.audio_events import (
+    CHUNK_WINDOWS,
     EVENT_GROUPS,
     FRAME_HOP_S,
+    FRAME_WINDOW_S,
+    OVERLAP_WINDOWS,
+    SAMPLE_RATE,
     AudioEventBackend,
     AudioEventsNotAvailable,
     YamnetOnnxBackend,
@@ -238,3 +242,44 @@ def test_real_yamnet_silence_is_quiet(tmp_path):
         w.writeframes((wave * 32767).astype("<i2").tobytes())
     sweep = YamnetOnnxBackend().detect_events(path)
     assert sweep.events == []
+
+
+@pytest.mark.skipif(not _yamnet_present(), reason="yamnet.onnx not fetched")
+def test_full_tape_chunked_inference_keeps_events_and_memory(tmp_path):
+    """A >61s tape rides the CHUNKED yamnet pass: the synthetic siren is found
+    at its placement, and the frame math stays on the 0.48s grid. One giant
+    session.run on 43-min audio OOM-killed the pipeline (4.1 GB) — this pins
+    the chunk contract: same model, whole windows, frame-exact re-emission."""
+    import resource
+    import wave as wavemod
+
+    sr = 16000
+    src = np.zeros(130 * sr, dtype=np.float32)
+    src[20 * sr : 45 * sr] = _siren_wave(25.0)
+    path = tmp_path / "tape.wav"
+    with wavemod.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes((src * 32767).astype("<i2").tobytes())
+
+    sweep = YamnetOnnxBackend().detect_events(path)
+    assert sweep.duration_s == pytest.approx(130.0, rel=0.01)
+    assert sweep.events, "the siren must survive chunking"
+    siren = [s for s in sweep.events if s.kind == "siren"]
+    assert siren, [e.kind for e in sweep.events]
+    assert siren[0].start_s <= 21.0
+    assert siren[0].end_s >= 44.0
+    assert resource.getrusage(resource.RUSAGE_SELF).ru_maxrss < 2 * 1024 * 1024  # <2 GB
+
+
+def test_chunk_math_is_window_and_hop_congruent():
+    """chunk = 64 windows; step = 62 windows; every chunk start lands on a
+    whole hop so dropped leading frames re-align frame-exactly."""
+    window = round(FRAME_WINDOW_S * SAMPLE_RATE)
+    hop = round(FRAME_HOP_S * SAMPLE_RATE)
+    chunk = CHUNK_WINDOWS * window
+    step = (CHUNK_WINDOWS - OVERLAP_WINDOWS) * window
+    assert chunk % window == 0 and chunk % hop == 0
+    assert step % window == 0 and step % hop == 0
+    assert step < chunk, "chunks must overlap"

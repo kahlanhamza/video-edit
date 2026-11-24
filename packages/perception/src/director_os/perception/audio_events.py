@@ -37,6 +37,13 @@ DEFAULT_MIN_FRAMES = 2
 FRAME_HOP_S = 0.48
 FRAME_WINDOW_S = 0.96
 SAMPLE_RATE = 16000
+# Chunked-inference law: one session.run over a FULL-tape waveform (43 min =
+# 42M samples) explodes past ~4 GB inside onnxruntime and the cgroup OOM-kills
+# the whole pipeline. 64-window chunks (61.44 s) with a 2-window overlap keep
+# identical frame math (chunk and step are whole numbers of window and hop) at
+# ~1/45 the peak memory.
+CHUNK_WINDOWS = 64
+OVERLAP_WINDOWS = 2
 
 # AudioSet class indices (from yamnet_class_map.csv, pinned by the fetch script).
 # Groups are OUR canonical event names -> the AudioSet ontology rows that vote
@@ -252,7 +259,7 @@ class YamnetOnnxBackend:
             return AudioEventSweep(
                 backend=self.name, duration_s=round(duration_s, 3), threshold=threshold, events=[]
             )
-        scores, _embed, _mel = self._session.run(None, {self._input_name: wave})
+        scores = self._scores_chunked(wave)
         events = build_event_spans(np.asarray(scores), threshold=threshold)
         return AudioEventSweep(
             backend=self.name,
@@ -260,6 +267,44 @@ class YamnetOnnxBackend:
             threshold=threshold,
             events=events,
         )
+
+    def _scores_chunked(self, wave: np.ndarray) -> np.ndarray:
+        """Full-waveform scores in 64-window steps with a 2-window overlap.
+
+        The graph emits one frame per 0.48 s hop (window j covers
+        [j*hop, j*hop+window]), so a chunk starting on a whole number of
+        windows re-emits exactly `c0/hop` already-seen leading frames — drop
+        them and the concatenated scores equal the single giant run, which
+        the memory cgroup cannot survive on a 43-minute tape.
+        """
+        window_samples = round(FRAME_WINDOW_S * SAMPLE_RATE)
+        hop_samples = round(FRAME_HOP_S * SAMPLE_RATE)
+        chunk_samples = CHUNK_WINDOWS * window_samples
+        if len(wave) <= max(chunk_samples, 4 * window_samples):
+            scores, _e, _m = self._session.run(None, {self._input_name: wave})
+            return np.asarray(scores)
+
+        step = (CHUNK_WINDOWS - OVERLAP_WINDOWS) * window_samples
+        out_frames: list[np.ndarray] = []
+        emitted_end = 0  # global frame index one past the last frame already kept
+        s0 = 0
+        while True:
+            if s0 > 0 and len(wave) - s0 < chunk_samples:
+                # the runt tail sees edge padding — recompute the end as a FULL
+                # chunk aligned to the tape end (real samples to the last frame);
+                # the already-emitted leading frames are dropped below
+                s0 = len(wave) - chunk_samples
+            seg = wave[s0 : s0 + chunk_samples]
+            scores, _e, _m = self._session.run(
+                None, {self._input_name: np.ascontiguousarray(seg)}
+            )
+            first_global = round(s0 / hop_samples)  # this chunk's frame 0 in wave time
+            out_frames.append(scores[max(0, emitted_end - first_global) :])
+            emitted_end = first_global + len(scores)
+            if s0 + chunk_samples >= len(wave):
+                break
+            s0 += step
+        return np.concatenate(out_frames, axis=0)
 
 
 def make_audio_event_backend() -> AudioEventBackend:
