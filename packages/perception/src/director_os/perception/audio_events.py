@@ -295,9 +295,7 @@ class YamnetOnnxBackend:
                 # the already-emitted leading frames are dropped below
                 s0 = len(wave) - chunk_samples
             seg = wave[s0 : s0 + chunk_samples]
-            scores, _e, _m = self._session.run(
-                None, {self._input_name: np.ascontiguousarray(seg)}
-            )
+            scores, _e, _m = self._session.run(None, {self._input_name: np.ascontiguousarray(seg)})
             first_global = round(s0 / hop_samples)  # this chunk's frame 0 in wave time
             out_frames.append(scores[max(0, emitted_end - first_global) :])
             emitted_end = first_global + len(scores)
