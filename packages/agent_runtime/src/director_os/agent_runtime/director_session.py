@@ -950,9 +950,14 @@ class DirectorSession:
                 # transient: empty 200s, gateway 502s, socket resets)
                 time.sleep(min(8.0, 1.5 * (2 ** min(_attempt - 1, 3))))
             try:
+                # the notebook's token law (16k): a 12-15min documentary plan is
+                # a multi-KB JSON payload — the 4096 default made free-tier
+                # reasoning models burn the whole budget on prose and ship an
+                # empty or truncated body (the tape-1 Phase A failure class)
                 text = self.backend.complete_json(
                     system,
                     user + (f"\n\n## Previous attempt failed\n{feedback}" if feedback else ""),
+                    max_tokens=16384,
                 )
             except LLMBackendError as e:
                 # transport/provider failure — retryable, and the operator log

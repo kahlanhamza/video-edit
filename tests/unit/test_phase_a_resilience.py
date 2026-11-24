@@ -5,6 +5,8 @@ sockets) instead of cascading into a pipeline failure with no reason.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from director_os.agent_runtime.director_session import DirectorSession
 from director_os.agent_runtime.editing_tools import DirectorToolbox, build_director_registry
@@ -138,3 +140,41 @@ def test_persistent_provider_error_falls_back_cleanly(tmp_path):
     assert plan is None
     assert "provider error" in err
     assert backend.calls == 4  # phase_a_retries(3) + 1
+
+
+def test_macro_plan_requests_the_notebook_token_budget(tmp_path):
+    """Tape-1 wire fact 2026-11-25: the 4096-token default made free-tier
+    reasoning models burn the whole budget on prose — the response carried no
+    JSON object at all (12058 chars of reasoning, zero braces). The notebook's
+    proven 16384-token budget is the law for macro planning."""
+
+    seen: list[int] = []
+
+    class Spy(FlakyChain):
+        def complete_json(self, system: str, user: str, max_tokens: int = 4096) -> str:
+            seen.append(max_tokens)
+            return super().complete_json(system, user, max_tokens=max_tokens)
+
+    plan = json.dumps(
+        {
+            "title": "t",
+            "case_facts": {"subject": "s", "location": "l", "date": "d"},
+            "acts": [
+                {
+                    "name": "Cold Open",
+                    "blocks": [
+                        {"type": "raw", "source_start_s": 10.0, "dur_s": 4.0},
+                        {
+                            "type": "narration",
+                            "script": "hook words " * 25,
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+    sess = _session(Spy([], plan), tmp_path)
+    sess.transcript = {"words": [], "segments": []}
+    plan_out, err = sess.plan_macro([], None)
+    assert seen and all(m == 16384 for m in seen), seen
+    assert plan_out is not None or err  # parse outcome secondary; budget is the law
