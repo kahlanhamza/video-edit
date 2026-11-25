@@ -252,6 +252,7 @@ def test_audit_technical_passes_on_good_master(fixture_video: Path):
         "streams_present",
         "audio_law_48k_stereo",
         "stream_uniformity",
+        "audio_duration_coverage",
         "clean_out_frames",
         "black_frame_budget",
         "duration_drift",

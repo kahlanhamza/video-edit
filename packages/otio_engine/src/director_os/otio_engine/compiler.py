@@ -212,6 +212,12 @@ def compile_timeline(
                 for clipped in (clip_region_time(r, start_s, dur) for r in blur)
                 if clipped is not None
             ]
+            # The baked clip is CLIP-LOCAL (starts at 0:00): the segment cuts
+            # its video from that file at 0 while the 2-bus master WAV rides
+            # the absolute asset clock — one offset cannot serve both.
+            baked_local = clip_key in (clip_sources or {})
+            spec_start = 0.0 if baked_local else max(0.0, start_s)
+            enhanced_start = start_s if (enhanced_path is not None and baked_local) else None
             freeze = None
             spotlight_png = None
             if meta.freeze_callout is not None:
@@ -224,7 +230,7 @@ def compile_timeline(
             spec = SegmentRenderSpec(
                 kind="raw",
                 asset_id=meta.asset_id,
-                source_start_s=start_s,
+                source_start_s=spec_start,
                 source_dur_s=dur,
                 video=video,
                 audio=audio,
@@ -236,6 +242,7 @@ def compile_timeline(
                 spotlight_png_path=str(spotlight_png) if spotlight_png else None,
                 enhanced_audio_path=enhanced_path,
                 enhanced_audio_digest=enhanced_digest,
+                enhanced_audio_start_s=enhanced_start,
                 source_digest=(clip_source_digests or {}).get(clip_key),
                 codec_profile=f"{video.codec}-{video.pix_fmt}-{video.fps}fps-{audio.sample_rate}hz",
             )

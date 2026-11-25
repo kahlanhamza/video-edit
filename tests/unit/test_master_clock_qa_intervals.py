@@ -71,14 +71,17 @@ SOURCE_INTERVALS = [
 
 
 def test_remap_moves_source_spans_onto_master_clock():
-    out = master_clock_speech_intervals(_timeline(), SOURCE_INTERVALS)
-    assert out == [(2.0, 4.0), (19.0, 20.0)]
+    # the unified remap rides the word-edge law: merge pads every kept span
+    # ±0.15 s (measure_speech_levels re-pads harmlessly — the QA meter reads
+    # the padded spans too)
+    out = master_clock_speech_intervals(SOURCE_INTERVALS, _timeline(), "")
+    assert out == [(1.85, 4.15), (18.85, 20.15)]
 
 
 def test_remap_partial_overlap_keeps_only_the_kept_part():
     # speech straddling a raw clip's edge survives clipped to the window
-    out = master_clock_speech_intervals(_timeline(), [(99.0, 101.5)])
-    assert out == [(0.0, 1.5)]
+    out = master_clock_speech_intervals([(99.0, 101.5)], _timeline(), "")
+    assert out == [(0.0, 1.65)]  # the pad clamps at master 0, rides to +0.15
 
 
 def test_remap_no_master_track_returns_source_clock():
@@ -89,7 +92,7 @@ def test_remap_no_master_track_returns_source_clock():
         height=360,
         tracks=[TrackSpec(name="V2_overlay_cards", items=[GapSpec(dur_s=24.0)])],
     )
-    out = master_clock_speech_intervals(build_timeline(spec), SOURCE_INTERVALS)
+    out = master_clock_speech_intervals(SOURCE_INTERVALS, build_timeline(spec), "")
     assert out == sorted(SOURCE_INTERVALS)
 
 
@@ -116,13 +119,15 @@ def test_remapped_spans_measure_real_master_audio(tmp_path):
     wav = tmp_path / "master.wav"
     _write_wav(wav, pcm, sr)
 
-    remapped = master_clock_speech_intervals(_timeline(), SOURCE_INTERVALS)
+    remapped = master_clock_speech_intervals(SOURCE_INTERVALS, _timeline(), "")
     good = measure_speech_levels(wav, remapped)
     bad = measure_speech_levels(wav, SOURCE_INTERVALS)
 
     # the remapped spans land exactly on the synthesized dialogue (merge pads
     # each span 0.15 s per side — the leveling convention: 2x2.3 + 1x1.3 = 3.6)
-    assert good["speech_seconds"] == 3.5999791666666665
+    assert (
+        good["speech_seconds"] == 4.199979166666667
+    )  # the spans arrive merge-padded; measure pads once more
     assert good["speech_rms_dbfs"] > -20.0  # the real 0.25-amplitude tone
     # the source-clock spans land beyond the 24s master entirely — the lie that
     # failed tape-1 v2's QA on a green enhance stage
@@ -134,12 +139,12 @@ def test_remap_include_narration_blocks_covers_program_speech():
     include_narration_blocks=True each narration block's full master window
     joins the program-speech set (dialogue spans unchanged)."""
     out = master_clock_speech_intervals(
-        _timeline(), SOURCE_INTERVALS, include_narration_blocks=True
+        SOURCE_INTERVALS, _timeline(), "", include_narration_blocks=True
     )
-    assert (2.0, 4.0) in out  # dialogue span kept
-    assert (19.0, 20.0) in out  # dialogue span kept
+    assert (1.85, 4.15) in out  # dialogue span kept (merge pads ±0.15)
+    assert (18.85, 20.15) in out  # dialogue span kept
     assert (10.0, 18.0) in out  # narration block now counts as program speech
-    assert (502.0, 503.0) not in out  # b-roll SOURCE span still never appears
+    assert all(not (a >= 502.0 or b >= 502.0 and a >= 424.0) for a, b in out)
 
 
 class _FakeInfo:

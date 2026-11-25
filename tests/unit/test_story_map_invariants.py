@@ -233,3 +233,14 @@ def test_fallback_act_markers_ride_metadata(fallback_timeline):
     comp = timeline_composition(fallback_timeline)
     assert comp.acts and comp.acts[0] == "Cold Open"
     assert any("Act 6" in a for a in comp.acts)
+
+
+def test_fallback_lands_inside_the_keep_band_for_a_full_tape(fallback_timeline):
+    """The keep-band law: a 2627s tape keeps 28-35% (736-920s). The old
+    floor top-up aimed at the 600s hard floor (+margin) — the shipped
+    fallback master was 615s: a 10-minute cut of a law that says 12-15
+    minutes (owner bug report, full-tape run)."""
+    from director_os.otio_engine.compiler import master_track
+
+    total = sum(i.source_range.duration.to_seconds() for i in master_track(fallback_timeline))
+    assert 736.0 <= total <= 940.0, total

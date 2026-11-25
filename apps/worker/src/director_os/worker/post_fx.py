@@ -369,7 +369,7 @@ def _speech_regions(wav: Path) -> list[tuple[float, float]]:
         return []
 
 
-def _extract_master_audio(master: Path, work: Path) -> Path:
+def _extract_master_audio(master: Path, work: Path, channels: int = 1) -> Path:
     wav = work / "master_audio.wav"
     _run(
         [
@@ -381,7 +381,7 @@ def _extract_master_audio(master: Path, work: Path) -> Path:
             str(master),
             "-vn",
             "-ac",
-            "1",
+            str(channels),
             "-ar",
             "48000",
             "-c:a",
@@ -490,9 +490,30 @@ def stage_post_fx(
 
     # ---- 3. audio enhancement on the master mix
     if marks["audio"].exists():
-        enhanced = work / "master_audio.enhanced.wav"
         report.enhance_engine = marks["audio"].read_text()
+        enhanced = (
+            _extract_master_audio(master, work, channels=2)
+            if report.enhance_engine == "master_mix_2bus"
+            else work / "master_audio.enhanced.wav"
+        )
         deps.log(f"  [post-fx] audio enhance cached ({report.enhance_engine})")
+    elif getattr(deps, "audio_mode", None) == "isolate_2bus":
+        # THE 2-BUS MIX LAW (full-tape runway 2026-11-25): on isolate_2bus the
+        # render already carries the neural-extracted Bus-1 (kept-window
+        # receipts: refinement loop to −11 dBFS dialogue RMS, timbre
+        # restoration EQ, −14 dB duck architecture, −1.5 dBTP limiter). A
+        # SECOND deep-filter pass over the MIX has no loudness target and no
+        # bus law — it re-flattens the calibrated dialogue level (measured
+        # −17.4 dBFS RMS / SNR 12.0 on a legal mix) and re-bakes whatever it
+        # hallucinates over the narrator. The mix IS the enhanced audio.
+        enhanced = _extract_master_audio(master, work, channels=2)
+        report.enhance_engine = "master_mix_2bus"
+        report.snr_after_db = _measure_snr(enhanced)
+        marks["audio"].write_text(report.enhance_engine)
+        deps.log(
+            "  [post-fx] audio: isolate_2bus master ships its calibrated 2-bus "
+            f"mix — no re-enhance (SNR on mix: {report.snr_after_db} dB)"
+        )
     else:
         raw_wav = _extract_master_audio(master, work)
         already_neural = enhance_info is not None and bool(enhance_info.neural)
@@ -581,24 +602,27 @@ def stage_post_fx(
         )
 
     # ---- 3.5 speech-gated leveling on the ENHANCED mix (laws #15 + f55d7ae)
-    # dialogue RMS on MASTER-clock spoken spans -> one clamped gain to the
-    # -11 dBFS target -> deterministic numpy ceiling brickwall. Without this
-    # the deep-filter + mux chain shipped dialogue at -18.1 dBFS (found live
-    # on tape-1 v2) with every upstream law green.
+    # dialogue RMS on MASTER-clock spoken spans -> refined bounded gain loop.
+    # Without this the deep-filter + mux chain shipped dialogue at -18.1 dBFS
+    # (found live on tape-1 v2) with every upstream law green.
+    shaped = enhanced  # the certify input when the leveling stage skips
     if marks["level"].exists():
         engine_mark, gain_mark = marks["level"].read_text().split("|")
         report.level_engine = engine_mark
         report.level_gain_db = float(gain_mark)
         deps.log(f"  [post-fx] leveling cached ({engine_mark} gain {report.level_gain_db:+.1f} dB)")
+        shaped = work / "master_audio.leveled.wav"
+        if report.level_engine == "skipped_no_spans":
+            shaped = enhanced
     else:
-        _leveling_pass(enhanced, timeline, enhance_info, work, report, deps)
+        shaped = _leveling_pass(enhanced, timeline, enhance_info, work, report, deps)
         marks["level"].write_text(f"{report.level_engine}|{report.level_gain_db}")
 
-    # the CERTIFIED audio: encoded once, its true peak measured in its own
-    # bitstream; the mux copies it so the shipped audio IS the certified one
-    certified = work / "master_audio.certified.m4a"
-    if not certified.exists():
-        raise PostFxError("certified audio missing — the level pass must certify before mux")
+    # the CERTIFIED audio: encoded ONCE standalone, its true peak measured in
+    # its own bitstream; the mux STREAM-COPIES it — a re-encode is a chaotic
+    # bitstream whose rare frames cannot be certified (measured, tape-1 v2)
+    certified = _certify_audio(shaped, work, deps)
+    report.certified_audio = True
 
     # ---- 4. mux (blurred video + certified audio + burned captions)
     if marks["final"].exists():
@@ -648,13 +672,13 @@ def _leveling_pass(enhanced: Path, timeline, enhance_info, work: Path, report, d
         rms_dbfs,
         speech_gated_gain,
     )
-    from director_os.worker.master_clock_map import master_clock_speech_intervals
+    from director_os.worker.pipeline import master_clock_speech_intervals
 
     spans: list[tuple[float, float]] = []
     if enhance_info is not None and timeline is not None:
         src_spans = [tuple(x) for x in (enhance_info.speech_intervals or [])]
         if src_spans:
-            spans = master_clock_speech_intervals(timeline, src_spans)
+            spans = master_clock_speech_intervals(src_spans, timeline)
     if not spans:
         report.level_engine = "skipped_no_spans"
         report.level_gain_db = 0.0

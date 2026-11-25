@@ -256,6 +256,7 @@ def test_non_meta_gateway_unchanged(monkeypatch):
     monkeypatch.setenv("LLM_API_KEY", "LLM_k")
     monkeypatch.setenv("LLM_MODEL", "glm-4.6")
     monkeypatch.setenv("LLM_BASE_URL", "https://gw.example/v1")
+    monkeypatch.setenv("AGENT_BRAIN", "legacy")
     get_settings.cache_clear()
     try:
         be = build_backend(mini_registry())

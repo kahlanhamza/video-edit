@@ -98,6 +98,132 @@ def narr_est_s(script: str) -> float:
     return max(NARR_DUR_MIN_S, min(NARR_DUR_MAX_S, words / PLAN_WPS + NARR_TAIL_PAD_S))
 
 
+def salvage_director_timeline(timeline, source_duration_s: float) -> tuple[Any, list[str]]:
+    """Deterministic truth-pass on the DIRECTOR's timeline — salvage, never scrap.
+
+    The stock fallback discards the model's whole program when the audit
+    complains (live E2E: the owner watched the canned narration despite a
+    real 21-tool-call director run). This pass repairs the two purely
+    MECHANICAL violations before the final audit:
+
+    1. narration durations follow the WORD LAW (narr_est_s of the actual
+       script), never the model's undersize dur_s habit — the words decide
+       how long the block rides; a too-short b-roll window is WIDENED to fit
+       (the window is mute footage, the voice is the law);
+    2. the HOOK: the first narration block opens the master (a cold-open raw
+       sting may precede it — moving the narration before the first raw item
+       satisfies the 8s law).
+
+    Returns (timeline, notes); what is still broken is the caller's audit
+    problem (agent-quality narration cannot be manufactured here without
+    pasting stock lines — the thing this pass exists to prevent)."""
+    import opentimelineio.opentime as ot_time
+    from director_os.otio_engine.compiler import master_track
+
+    notes: list[str] = []
+    try:
+        track = master_track(timeline)
+    except Exception:
+        return timeline, notes
+    items = list(track)
+    rate = 30.0
+
+    def _kind(item: Any) -> str:
+        if item.source_range is None:
+            return "gap"
+        meta = (item.metadata.get("director_os") or {}) if item.metadata else {}
+        return str(meta.get("kind", "?"))
+
+    # 1) narration truth-retime (the word law)
+    retimed = 0
+    for item in items:
+        meta = (item.metadata.get("director_os") or {}) if item.metadata else {}
+        if meta.get("kind") != "narration" or item.source_range is None:
+            continue
+        script = str(meta.get("script_text", ""))
+        if not script.strip():
+            continue
+        sr = item.source_range
+        s = sr.start_time.to_seconds()
+        est = narr_est_s(script)
+        b0, b1 = meta.get("broll_range") or (None, None)
+        if b0 is not None and b1 is not None and b1 > b0 and float(b1) - float(b0) < est:
+            # WIDEN the muted b-roll window to fit the words. The window is
+            # just mute footage — capping the voice at a stale window re-codes
+            # the undersize dur_s bug the word law exists to kill (the window
+            # was built from that same undersize dur_s),
+            est = min(est, max(1.0, source_duration_s - float(b0)))
+        est = max(1.0, min(est, max(1.0, source_duration_s - s)))
+        cur = item.source_range.duration.to_seconds()
+        if abs(cur - est) >= 0.5:
+            r = sr.start_time.rate or rate
+            item.source_range = ot_time.TimeRange(
+                start_time=ot_time.RationalTime(s * r, r),
+                duration=ot_time.RationalTime(est * r, r),
+            )
+            meta["broll_range"] = [s, s + est]
+            retimed += 1
+    if retimed:
+        notes.append(f"narration retimed to word-law duration on {retimed} block(s)")
+
+    # 2) hook ordering — first narration opens the master
+    narr_idx = next((i for i, it in enumerate(items) if _kind(it) == "narration"), None)
+    if narr_idx is not None and any(_kind(it) == "raw" for it in items[:narr_idx]):
+        first_narr = items[narr_idx]
+        track.remove(first_narr)
+        track.insert(0, first_narr)
+        notes.append("cold-open narration moved to open the master (hook law)")
+
+    # 3) length top-up — the audit floor is law. Extend the director's OWN raw
+    #    clips ( keeping its speech anchors, its audio, its structure) toward
+    #    the keep-band floor instead of scrapping the program. Two caps keep
+    #    this from trading one audit failure for another: the RATIO LAW (raw
+    #    growth cannot dilute narration below 0.32) and the source clock (a
+    #    raw clip cannot run past EOF). A plan too thin in words to reach the
+    #    floor ratio-cleanly is left short and the caller's audit decides.
+    added = 0.0
+    try:
+        scale = doc_scale(source_duration_s)
+        band_lo = max(scale.target_lo, scale.min_final_s)
+        raws = [
+            it
+            for it in track
+            if _kind(it) == "raw"
+            and it.source_range is not None
+            and it.source_range.duration.to_seconds() < source_duration_s
+        ]  # exclude the untouched full-length scaffold clip (execute drops it)
+        narr_sum = sum(
+            it.source_range.duration.to_seconds()
+            for it in track
+            if _kind(it) == "narration" and it.source_range is not None
+        )
+        raw_sum = sum(
+            it.source_range.duration.to_seconds() for it in raws if it.source_range is not None
+        )
+        need_ratio = narr_sum * (1.0 - 0.32) / 0.32
+        target_raw = min(need_ratio, band_lo - narr_sum)
+        if raws and raw_sum > 0.0 and narr_sum + raw_sum < band_lo and target_raw > raw_sum:
+            factor = min(1.25, target_raw / raw_sum)
+            for it in raws:
+                sr = it.source_range
+                start = sr.start_time.to_seconds()
+                cur = sr.duration.to_seconds()
+                ceiling = max(1.0, source_duration_s - 0.5 - start)
+                new = min(cur * factor, ceiling)
+                if new - cur >= 0.5:
+                    r = sr.start_time.rate or rate
+                    it.source_range = ot_time.TimeRange(
+                        start_time=ot_time.RationalTime(start * r, r),
+                        duration=ot_time.RationalTime(new * r, r),
+                    )
+                    added += new - cur
+        if added:
+            notes.append(f"raw top-up +{added:.0f}s toward the length floor (source intact)")
+    except Exception:
+        return timeline, notes
+    return timeline, notes
+
+
 class PlanRawClip(BaseModel):
     type: Literal["raw"] = "raw"
     source_start_s: float = Field(ge=0.0)
@@ -256,11 +382,39 @@ HOOK_PROMPT_LAW = """## HOOK-FIRST LAW (non-negotiable — think like a real pro
   execution."""
 
 
+# Niche arcs — the body arc is the ONE bodycam-flavored structure; every
+# other niche (audits, retail, trespassing, anything escalated) plans the
+# GENERAL escalation arc. The owner directive 2026-11-24: this is the
+# narration/commentary editor for escalated incidents, not an arrest-only tool.
+ARC_BODYCAM = (
+    "2+. Body acts: arrival/contact -> investigation/friction -> escalation/turning\n"
+    "   point -> arrest/detention -> aftermath/booking -> verified outcome — include\n"
+    "   the beats this footage ACTUALLY has, in order, and drop what it doesn't.\n"
+    "   Miranda readings, policy violations, and sobriety/field tests are HIGHLIGHTS\n"
+    "   to surface whenever present — never force them into a beat they don't belong\n"
+    "   to. Trim boilerplate (a Miranda reading = intro + waiver, never the full recital)."
+)
+ARC_GENERIC = (
+    "2+. Body acts: arrival/contact -> friction/questions -> escalation/turning\n"
+    "   point -> the peak (detention/citation/confrontation/endgame) -> aftermath ->\n"
+    "   verified outcome — include the beats this footage ACTUALLY has, in order,\n"
+    "   and drop what it doesn't. The footage's OWN peak beats (demands, refusals,\n"
+    "   admissions, contradictions, unexpected turns) are HIGHLIGHTS to surface\n"
+    "   whenever present — never force a template beat into footage without it."
+)
+NICHE_ARCS = {"bodycam_documentary": ARC_BODYCAM}
+NICHE_ENDING_LAW = {
+    "bodycam_documentary": "(never drop the arrest/booking ending)",
+}
+GENERIC_ENDING_LAW = "(never drop the resolution/outcome ending)"
+
+
 def macro_plan_user_prompt(
     buckets: list[StoryBucket],
     source_duration_s: float,
     dossier_json: dict[str, Any] | None = None,
     transcript: dict | None = None,
+    niche: str = "bodycam_documentary",
 ) -> str:
     """Phase A prompt: story index + FULL dialogue + dossier + editorial laws.
 
@@ -271,6 +425,8 @@ def macro_plan_user_prompt(
     from director_os.agent_runtime.story_map import render_full_transcript
 
     scale = doc_scale(source_duration_s)
+    arc = NICHE_ARCS.get(niche, ARC_GENERIC)
+    ending_law = NICHE_ENDING_LAW.get(niche, GENERIC_ENDING_LAW)
     dossier_block = ""
     if dossier_json:
         dossier_block = (
@@ -297,18 +453,24 @@ Plan a COMPLETE {scale.target_lo:.0f}-{scale.target_hi:.0f}s documentary
 length — a shorter tape gets fewer, tighter acts; a long tape gets the full
 arc. Never plan longer than the source.
 
-Structure (acts[0] is the Cold Open) — the GENERAL arrest/incident arc, not a
+## Hard numbers for THIS tape (the plan is MECHANICALLY audited against
+exactly these — violating one rejects the whole plan before execution)
+- TOTAL master length (sum of EVERY clip's duration): {scale.target_lo:.0f}-
+  {scale.target_hi:.0f}s. Count your own durations and make the sum land
+  inside the band; a plan that sums under {scale.min_final_s:.0f}s is
+  auto-rejected — size the raw stretches up, not the narration.
+- Narration blocks: {scale.narr_lo}–{scale.narr_hi} in total (Cold Open hook +
+  act commentary + outro all count). Fewer blocks = auto-rejection, no matter
+  how good the writing is.
+- Raw clips: {scale.raw_min}–{scale.raw_max} (see Hard rules below).
+
+Structure (acts[0] is the Cold Open) — the GENERAL arc for this niche, not a
 template:
 1. Cold Open Hook ({STING_MAX_S:.0f}s sting + the hook narration, context lands
    ≤30s): a ≤{STING_MAX_S:.0f}s climax raw sting (PULLED FROM LATER IN THE
    VIDEO, raw audio on) + the {WORDS_COLD[0]}-{WORDS_COLD[1]} word narration hook
    setting date/location/mystery from the dossier only, over muted climax b-roll.
-2+. Body acts: arrival/contact -> investigation/friction -> escalation/turning
-   point -> arrest/detention -> aftermath/booking -> verified outcome — include
-   the beats this footage ACTUALLY has, in order, and drop what it doesn't.
-   Miranda readings, policy violations, and sobriety/field tests are HIGHLIGHTS
-   to surface whenever present — never force them into a beat they don't belong
-   to. Trim boilerplate (a Miranda reading = intro + waiver, never the full recital).
+{arc}
 
 {
             NARRATION_PROMPT_LAW.format(
@@ -331,7 +493,7 @@ Hard rules:
   dialogue or decisive action (dead air is cut automatically, so pick windows
   by what is SAID, not by the clock).
 - Clip starts must span the WHOLE file: earliest within the first 15%, latest
-  ending inside the final 25% (never drop the arrest/booking ending).
+  ending inside the final 25% {ending_law}.
 - Cut dead air and logistics (keys, phone details, radio spelling); KEEP
   ironic, emotional, and incriminating exchanges — and keep them COMPLETE
   (a clip may extend past its window to finish the punchline; say so in `note`).
@@ -564,6 +726,7 @@ def refine_plan_quotes(
     backend: Any,
     source_duration_s: float,
     problems_fn=None,
+    niche: str = "bodycam_documentary",
 ) -> tuple[MacroPlan, str]:
     """The Quote-Grounded Refinement pass (one extra completion, soft-fail).
 
@@ -585,9 +748,7 @@ def refine_plan_quotes(
     ]
     if not windows:
         return plan, ""
-    system = compose_agent_prompt(
-        agent="director_agent", role="director", niche="bodycam_documentary"
-    )
+    system = compose_agent_prompt(agent="director_agent", role="director", niche=niche)
     user = (
         "## Quote-grounded refinement of an accepted documentary plan\n"
         "Here is the ACCEPTED plan JSON. Improve it using the transcript quotes: "
@@ -626,6 +787,7 @@ def critic_refine_plan(
     backend: Any,
     source_duration_s: float,
     problems_fn=None,
+    niche: str = "bodycam_documentary",
 ) -> tuple[MacroPlan, str]:
     """The Legal & Documentary QA Critic pass (the notebook's second LLM stage).
 
@@ -643,9 +805,7 @@ def critic_refine_plan(
     full_dialogue = render_full_transcript(transcript or {})
     if not full_dialogue:
         return plan, ""
-    system = compose_agent_prompt(
-        agent="director_agent", role="critic", niche="bodycam_documentary"
-    )
+    system = compose_agent_prompt(agent="director_agent", role="critic", niche=niche)
     user = f"""You are a strict Legal & Documentary QA Critic reviewing an AI-generated Edit Plan.
 Compare the draft plan against the FULL DIALOGUE TRANSCRIPT below.
 
@@ -927,11 +1087,13 @@ class DirectorSession:
         phase_a_retries: int = 3,  # the notebook law: 3 generation attempts
         transcript: dict | None = None,  # enables ASR snap + quote refinement
         quote_refine: bool = True,
+        niche: str = "bodycam_documentary",  # selects the skill playbook + arc
     ):
         self.registry = registry
         self.store = store
         self.project_id = project_id
         self.backend = backend
+        self.niche = niche
         self.source_duration_s = source_duration_s
         self.scale = doc_scale(source_duration_s)
         self.max_turns = max_turns
@@ -959,11 +1121,13 @@ class DirectorSession:
         """
         from director_os.agent_runtime.llm import LLMBackendError
 
-        system = compose_agent_prompt(
-            agent="director_agent", role="director", niche="bodycam_documentary"
-        )
+        system = compose_agent_prompt(agent="director_agent", role="director", niche=self.niche)
         user = macro_plan_user_prompt(
-            buckets, self.source_duration_s, dossier_json, transcript=self.transcript
+            buckets,
+            self.source_duration_s,
+            dossier_json,
+            transcript=self.transcript,
+            niche=self.niche,
         )
         feedback = ""
         last_err = ""
@@ -1009,6 +1173,7 @@ class DirectorSession:
                         self.backend,
                         self.source_duration_s,
                         problems_fn=self._plan_problems,
+                        niche=self.niche,
                     )
                     if critic_note:
                         last_err = critic_note
@@ -1018,9 +1183,22 @@ class DirectorSession:
                         self.backend,
                         self.source_duration_s,
                         problems_fn=self._plan_problems,
+                        niche=self.niche,
                     )
                     if refine_note:
                         last_err = refine_note
+                    # re-flight AFTER the refiners: critic/quote refinement can
+                    # reorder/raw-ify the cold open or change block counts, and
+                    # the pre-flight above last ran BEFORE it (live E2E: the
+                    # refined plan shipped a 35s raw hook that failed the
+                    # timeline audit AFTER a full 2-minute execute)
+                    post = self._plan_problems(plan)
+                    if post:
+                        feedback = "; ".join(post)
+                        last_err = feedback
+                        if best is None or self._honest_total(plan) > self._honest_total(best):
+                            best = plan
+                        continue
                 return plan, ""
             except (ValueError, ValidationError, json.JSONDecodeError) as e:
                 # quote the raw head so the log says WHY it did not parse —
@@ -1032,6 +1210,29 @@ class DirectorSession:
         if best is not None:
             return best, last_err  # structurally valid but truncated: Phase B repairs
         return None, last_err
+
+    # -------------------------------------------------- authored-plan path
+    def plan_from_saved_json(self, saved: str) -> tuple[MacroPlan | None, str]:
+        """Director-authored plan injection — the model writes the script, the
+        SAME gates judge it (speech snap + hard-number pre-flight). Returns
+        (plan, "") when the plan would pass Phase A's own laws; a parseable
+        but non-compliant plan returns (plan, problems) so the caller can log
+        and fall through; unparseable returns (None, err).
+
+        Used when the routing chain cannot produce a compliant plan (capacity
+        downgrades, quota) but a compliant authored plan exists: the audit LAW
+        still runs — authoring bypasses no gate, it only replaces the wire
+        call.
+        """
+        try:
+            plan = parse_macro_plan(saved)
+            plan, _ = snap_plan_to_speech(plan, self.transcript, self.source_duration_s)
+        except (ValueError, ValidationError, json.JSONDecodeError) as e:
+            return None, f"authored plan unparseable ({e})"
+        problems = self._plan_problems(plan)
+        if problems:
+            return plan, "; ".join(problems)
+        return plan, ""
 
     def _honest_total(self, plan: MacroPlan) -> float:
         total = 0.0
@@ -1102,6 +1303,16 @@ class DirectorSession:
                     f"narration ratio {ratio:.2f} outside 0.30..0.52 "
                     "(rich commentary, not a sprinkle, not a podcast)"
                 )
+        honest = self._honest_total(plan)
+        if honest > scale.target_hi:
+            # keep-band CAP: the doc law keeps 28-35% of the tape — a master
+            # above target_hi failed the live run's audit AFTER a full execute
+            problems.append(
+                f"total plan duration {honest:.0f}s > target {scale.target_hi:.0f}s "
+                f"(keep band for {self.source_duration_s:.0f}s source: "
+                f"{scale.target_lo:.0f}-{scale.target_hi:.0f}s) — tighten: shorter "
+                "raw stretches and fuller narration, not more raw"
+            )
         if plan.raw_count < scale.raw_min:
             problems.append(f"only {plan.raw_count} raw clips (< {scale.raw_min})")
         if plan.raw_count > scale.raw_max:

@@ -24,6 +24,7 @@ from director_os.agent_runtime.llm import (
     OpenAICompatBackend,
     build_backend,
 )
+from director_os.agent_runtime.pydantic_brain import PydanticAIBackend
 from director_os.agent_runtime.registry import ToolRegistry
 from pydantic import BaseModel, ConfigDict
 
@@ -382,19 +383,26 @@ def test_build_backend_env_routing(tmp_path, monkeypatch):
     reg = mini_registry()
     monkeypatch.setenv("LLM_API_KEY", "abc")
     monkeypatch.setenv("LLM_MODEL", "gemini-3.8-flash")
+    monkeypatch.delenv("AGENT_BRAIN", raising=False)
     from director_os.core.config import get_settings
 
     get_settings.cache_clear()
     try:
         monkeypatch.setenv("LLM_BASE_URL", "")
         be = build_backend(reg)
-        assert isinstance(be, GeminiRestBackend)
+        assert isinstance(be, PydanticAIBackend)
 
         monkeypatch.setenv("LLM_BASE_URL", "https://gw.example/v1")
         get_settings.cache_clear()
         be2 = build_backend(reg, llm_model="glm-4.6")
-        assert isinstance(be2, OpenAICompatBackend)
+        assert isinstance(be2, PydanticAIBackend)
         assert be2.base_url == "https://gw.example/v1"
+
+        monkeypatch.setenv("AGENT_BRAIN", "legacy")
+        monkeypatch.setenv("LLM_BASE_URL", "")
+        get_settings.cache_clear()
+        be3 = build_backend(reg)
+        assert isinstance(be3, GeminiRestBackend)
 
         monkeypatch.delenv("LLM_API_KEY")
         get_settings.cache_clear()

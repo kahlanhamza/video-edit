@@ -160,9 +160,14 @@ def build_segment_cmd(
         not src_has_audio and not two_bus and spec.kind == "raw"
     )
     if two_bus:
-        # video+overlay inputs, then the enhanced audio input (same window)
+        # video+overlay inputs, then the enhanced audio input (same window);
+        # the WAV rides the ASSET clock while the video may cut from a clip
+        # local baked file that starts at 0:00 (enhanced_audio_start_s)
         enhanced_idx = n_inputs
-        cmd += exact_slice_args(spec.source_start_s, spec.source_start_s + dur)
+        wav_start = spec.enhanced_audio_start_s
+        if wav_start is None:
+            wav_start = spec.source_start_s
+        cmd += exact_slice_args(wav_start, wav_start + dur)
         cmd += ["-i", str(spec.enhanced_audio_path)]
         audio_input_idx = enhanced_idx
     elif narration_audio:

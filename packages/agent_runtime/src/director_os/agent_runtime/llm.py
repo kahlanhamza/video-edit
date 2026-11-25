@@ -138,7 +138,35 @@ def extract_json_payload(text: str, expect: str = "object") -> Any:
     if a == -1 or b == -1 or b <= a:
         head = " ".join(cleaned.split())[:160] or "(empty response)"
         raise ValueError(f"no JSON {expect} in response — got: {head!r}")
-    return json.loads(cleaned[a : b + 1])
+    payload = cleaned[a : b + 1]
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError as first:
+        # Last-chance repair for the LLM syntax slips the strict parse hates
+        # (live E2E: `Expecting ',' delimiter` on EVERY Phase A retry — the
+        # model stacked object keys without a comma). The surgery is
+        # conservative and only accepted when json.loads validates it.
+        repaired = repair_common_llm_json(payload)
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            raise first from first
+
+
+def repair_common_llm_json(text: str) -> str:
+    """The two LLM JSON crimes json.loads cannot forgive: smart quotes and
+    stacked values with the comma forgotten between them (objects AND arrays).
+    Only patterns that are ALWAYS invalid in JSON are touched."""
+    import re as _re
+
+    smart = {"\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019": "'"}
+    fixed = text
+    for bad, good in smart.items():
+        fixed = fixed.replace(bad, good)
+    fixed = _re.sub(r",\s*([}\]])", r"\1", fixed)
+    # bare newline between value-end token and value-start token → comma
+    fixed = _re.sub(r'(["\}\]\w])\s*\n(\s*["\{\[])', r"\1,\n\2", fixed)
+    return fixed
 
 
 def _modal_vlm_fn():
@@ -442,7 +470,10 @@ class GeminiRestBackend:
                 "tokens_out": int(usage.get("candidatesTokenCount", 0)),
             }
             parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-            return "".join(str(p.get("text", "")) for p in parts)
+            # `thought` parts are reasoning summaries, NOT the completion —
+            # joining them prepends prose to the JSON payload and Phase A's
+            # strict parse died on every retry (live E2E evidence)
+            return "".join(str(p.get("text", "")) for p in parts if not p.get("thought"))
         raise LLMBackendError(f"gemini complete_json exhausted fallbacks: {last_err[:200]}")
 
 
@@ -770,9 +801,24 @@ def build_backend(
         )
     if not model:
         raise LLMBackendError("LLM_MODEL is required when LLM_API_KEY is set")
+    from director_os.agent_runtime.pydantic_brain import PydanticAIBackend, brain_name
+
+    brain = brain_name(s)
     if base_url:
         if provider == "meta" or "api.meta.ai" in base_url:
+            # legacy only: the spend ledger + training gate are safety devices,
+            # not transport details — the brain must not route around them
             return _meta_backend(api_key, model, registry, niche, base_url)
+        if brain == "pydantic_ai":
+            return PydanticAIBackend(
+                api_key,
+                model,
+                registry,
+                niche,
+                base_url=base_url,
+                fallback_models=_env_model_list(s.llm_fallback_models) or None,
+                prompt_char_budget=_groq_prompt_budget(base_url),
+            )
         return OpenAICompatBackend(
             api_key,
             model,
@@ -784,6 +830,21 @@ def build_backend(
         )
     if provider == "meta":
         return _meta_backend(api_key, model, registry, niche, META_DEFAULT_BASE)
+    if brain == "pydantic_ai":
+        return PydanticAIBackend(
+            api_key,
+            model,
+            registry,
+            niche,
+            fallback_models=[
+                m
+                for m in _env_model_list(
+                    os.getenv("GEMINI_FALLBACK_MODELS", DEFAULT_FALLBACK_MODELS)
+                )
+                if m != model
+            ]
+            or None,
+        )
     return GeminiRestBackend(api_key, model, registry, niche)
 
 
@@ -898,9 +959,11 @@ def build_backend_chain(
     Single configured tier -> that backend bare (zero overhead); several ->
     ``FailoverBackend``. Raises only when NOTHING is configured.
     """
+    from director_os.agent_runtime.pydantic_brain import PydanticAIBackend, brain_name
     from director_os.core.config import get_settings
 
     s = get_settings()
+    brain = brain_name(s)
     tiers: list[Any] = []
     if s.llm_api_key or overrides.get("llm_api_key"):
         tiers.append(build_backend(registry, niche, **overrides))
@@ -911,34 +974,63 @@ def build_backend_chain(
             for t in tiers
         )
         if not already:
-            tiers.append(
-                OpenAICompatBackend(
-                    s.openrouter_api_key,
-                    s.openrouter_model or "nvidia/nemotron-3-ultra:free",
-                    registry,
-                    niche,
-                    base_url=s.openrouter_base_url,
-                    # the tier IS the fallback: its own chain rides
-                    # OPENROUTER_FALLBACK_MODELS (catalog-rotation proof)
-                    fallback_models=_env_model_list(s.openrouter_fallback_models) or None,
+            if brain == "pydantic_ai":
+                tiers.append(
+                    PydanticAIBackend(
+                        s.openrouter_api_key,
+                        s.openrouter_model or "nvidia/nemotron-3-ultra:free",
+                        registry,
+                        niche,
+                        base_url=s.openrouter_base_url,
+                        # the tier IS the fallback: its own chain rides
+                        # OPENROUTER_FALLBACK_MODELS (catalog-rotation proof)
+                        fallback_models=_env_model_list(s.openrouter_fallback_models) or None,
+                    )
                 )
-            )
+            else:
+                tiers.append(
+                    OpenAICompatBackend(
+                        s.openrouter_api_key,
+                        s.openrouter_model or "nvidia/nemotron-3-ultra:free",
+                        registry,
+                        niche,
+                        base_url=s.openrouter_base_url,
+                        # the tier IS the fallback: its own chain rides
+                        # OPENROUTER_FALLBACK_MODELS (catalog-rotation proof)
+                        fallback_models=_env_model_list(s.openrouter_fallback_models) or None,
+                    )
+                )
     # The last-resort Gemini tier only makes sense on a REAL AI Studio key —
     # a Groq `gsk_`/OpenRouter `sk-or-` key would just 401 there.
     gemini_key = s.vision_api_key or (
         s.llm_api_key if s.llm_api_key.startswith(("AQ.", "AIza")) else ""
     )
-    if gemini_key and not any(isinstance(t, GeminiRestBackend) for t in tiers):
+    if gemini_key and not any(
+        isinstance(t, GeminiRestBackend) or (isinstance(t, PydanticAIBackend) and not t.base_url)
+        for t in tiers
+    ):
         model = s.vision_model or "gemini-3.5-flash-lite"
-        tiers.append(
-            GeminiRestBackend(
-                gemini_key,
-                model,
-                registry,
-                niche,
-                fallback_models=_env_model_list(s.gemini_fallback_models) or None,
+        gemini_fallbacks = _env_model_list(s.gemini_fallback_models) or None
+        if brain == "pydantic_ai":
+            tiers.append(
+                PydanticAIBackend(
+                    gemini_key,
+                    model,
+                    registry,
+                    niche,
+                    fallback_models=[m for m in (gemini_fallbacks or []) if m != model] or None,
+                )
             )
-        )
+        else:
+            tiers.append(
+                GeminiRestBackend(
+                    gemini_key,
+                    model,
+                    registry,
+                    niche,
+                    fallback_models=_env_model_list(s.gemini_fallback_models) or None,
+                )
+            )
     if not tiers:
         raise LLMBackendError(
             "LLM not configured: set LLM_API_KEY (optionally OPENROUTER_API_KEY / "

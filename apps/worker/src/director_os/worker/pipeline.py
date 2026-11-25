@@ -65,7 +65,6 @@ from director_os.otio_engine.timeline import (
     to_json_dict,
 )
 from director_os.vision_fx.trajectory import PerFrameRedaction
-from director_os.worker.master_clock_map import master_clock_speech_intervals
 from director_os.worker.progress import RunTracker
 from sqlalchemy import select
 
@@ -113,6 +112,11 @@ class PipelineDeps:
     # --- POST-FX (owner rule 2026-11-19): tracked blur + audio enhancement +
     # caption burn run ONLY on the assembled deliverable, never the raw source
     post_fx: bool = False
+    # --- DAILIES REVIEW (the closed agentic loop): after QA the rendered
+    # master is sampled + looked at; bounded repairs may mutate the timeline
+    # and force one re-render. Off when no viewer is available (honest skip).
+    review_pass: bool = True
+    review_backend_factory: Callable[[], Any] | None = None
     log: Callable[[str], None] = lambda _msg: None
     # --- live observability (Studio full-visibility mandate): one RunTracker
     # per run streams steps/logs/timeline revisions into job_* rows for SSE
@@ -825,7 +829,10 @@ def stage_redaction(
                         asset_id=asset_id,
                         keep_ranges=keep_ranges,
                     )
-                    regions = tracked_payload["regions"]
+                    # the tracked payload is already JSON-dumped (it carries the
+                    # per-frame plan contract) — re-hydrate the region dicts so
+                    # the shared model_dump below sees BlurRegion models again
+                    regions = _hydrate_blur_regions(tracked_payload["regions"])
                     source_tag = tracked_payload["source"]
                     stats = tracked_payload["stats"]
                     tracked_extra = {
@@ -997,6 +1004,18 @@ def _sweep_kept_ranges(
             (plate_tracks if tr.track_id.startswith("plate_") else face_tracks).append(tr)
         max_end = max(max_end, end)
     return face_tracks, plate_tracks, int(round(max_end * 30))
+
+
+def _hydrate_blur_regions(payload_regions: list[dict] | list[Any]) -> list[Any]:
+    """JSON-dumped payload regions -> BlurRegion models (dicts re-validated,
+    models ride through). The tracked payload is persisted as raw dicts (it
+    carries the per-frame plan contract), but the shared payload build below
+    calls model_dump on every region — the dicts must become models again."""
+    from director_os.core.models import BlurRegion
+
+    return [
+        r if isinstance(r, BlurRegion) else BlurRegion.model_validate(r) for r in payload_regions
+    ]
 
 
 def _tracked_redaction_payload(
@@ -1303,20 +1322,27 @@ def _clip_plan(plan, start_s: float, dur_s: float):
     f1 = int(round((start_s + dur_s) * fps))
     trajectories: list[RedactionTrajectory] = []
     for tr in plan.trajectories:
-        boxes = [
-            TrackedBox(
-                frame_idx=b.frame_idx - f0,
-                t_s=round(b.frame_idx / fps - start_s, 3),
-                x=b.x,
-                y=b.y,
-                w=b.w,
-                h=b.h,
-                bridged=b.bridged,
-                lead=b.lead,
+        boxes = []
+        for b in tr.boxes:
+            if not f0 <= b.frame_idx < f1:
+                continue
+            local_idx = b.frame_idx - f0
+            # clip-local EXACT frame time: frame_idx/fps - start_s drifts
+            # negative for fractional start_s (203.07s) and ONE bad t_s
+            # threw the whole TrackedBox validation away — baking the clip
+            # RAW, unblurred
+            boxes.append(
+                TrackedBox(
+                    frame_idx=local_idx,
+                    t_s=round(local_idx / fps, 3),
+                    x=b.x,
+                    y=b.y,
+                    w=b.w,
+                    h=b.h,
+                    bridged=b.bridged,
+                    lead=b.lead,
+                )
             )
-            for b in tr.boxes
-            if f0 <= b.frame_idx < f1
-        ]
         if boxes:
             trajectories.append(RedactionTrajectory(track_id=tr.track_id, boxes=boxes))
     return PerFrameRedaction(
@@ -1913,8 +1939,9 @@ def _plan_documentary(
     dur: float,
     fps: int,
     card_fields: dict,
+    niche: str = "bodycam_documentary",
 ) -> tuple[Any, int]:
-    """LLM 6-act story-map path with deterministic fallback (>= 15 min sources)."""
+    """LLM 6-act story-map path with deterministic fallback (>= 15 min sources)."""  # noqa: E501
     from director_os.agent_runtime.checkpoint import CheckpointStore
     from director_os.agent_runtime.director_session import DirectorSession
     from director_os.agent_runtime.editing_tools import DirectorToolbox, build_director_registry
@@ -1943,19 +1970,55 @@ def _plan_documentary(
         toolbox = DirectorToolbox(scaffold, project_id, (deps.video.w, deps.video.h))
         registry = build_director_registry(toolbox)
         session = DirectorSession(
-            registry, store, project_id, backend, source_duration_s=dur, transcript=transcript
+            registry,
+            store,
+            project_id,
+            backend,
+            source_duration_s=dur,
+            transcript=transcript,
+            niche=niche,
         )
-        plan, plan_err = session.plan_macro(buckets, dossier)
+        # AUTHORED-PLAN PATH (DIRECTOR_PLAN_FILE, direct egress): a saved,
+        # human/agent-authored MacroPlan JSON; same snap + hard-number
+        # pre-flight + audit gates — authoring replaces the wire call, never
+        # the law. On rejection the normal LLM chain still runs.
+        saved_plan: tuple[Any, str] | None = None
+        plan_file = os.environ.get("DIRECTOR_PLAN_FILE", "")
+        if plan_file and Path(plan_file).is_file():
+            deps.log(f"  [planning] authored plan: {plan_file}")
+            saved = Path(plan_file).read_text(encoding="utf-8")
+            saved_plan = session.plan_from_saved_json(saved)
+            if saved_plan[0] is None:
+                deps.log(f"  [planning] authored plan unusable ({saved_plan[1]})")
+                saved_plan = None
+            elif saved_plan[1]:
+                deps.log(f"  [planning] authored plan FAILED pre-flight ({saved_plan[1][:300]})")
+                saved_plan = None
+        if saved_plan is not None:
+            plan, plan_err = saved_plan
+            label = "authored_plan"
+        else:
+            plan, plan_err = session.plan_macro(buckets, dossier)
+            label = ""
         if plan is None:
             deps.log(f"  [planning] Phase A failed ({plan_err}) — deterministic fallback")
         else:
-            label = getattr(backend, "model", getattr(backend, "provider", "llm"))
+            label = label or str(getattr(backend, "model", getattr(backend, "provider", "llm")))
             deps.log(
                 f"  [planning] Phase A ok via {label}: {len(plan.acts)} acts, "
                 f"{plan.raw_count} raw, {plan.narration_count} narration, "
                 f"{plan.total_dur_s:.0f}s"
             )
             timeline, report = session.execute(plan, scaffold)
+            # SALVAGE BEFORE SCRAP: the word-law narration retime + hook order
+            # fix are mechanical; throwing the director's program away and
+            # shipping the stock fallback for them is how the owner ended up
+            # hearing canned lines on a real 21-tool-call run (live evidence)
+            from director_os.agent_runtime.director_session import salvage_director_timeline
+
+            timeline, salvage_notes = salvage_director_timeline(timeline, dur)
+            if salvage_notes:
+                deps.log(f"  [planning] director salvage: {'; '.join(salvage_notes)}")
             retention = audit_retention(timeline, dur)
             if retention.ok and report.steps_failed == 0:
                 _apply_audio_mode(timeline, deps)
@@ -1980,7 +2043,9 @@ def _plan_documentary(
                 return timeline, version
             deps.log(
                 f"  [planning] LLM plan rejected (steps_failed={report.steps_failed}, "
-                f"retention_ok={retention.ok}) — deterministic fallback"
+                f"retention_ok={retention.ok}: "
+                f"{' ; '.join(c.detail for c in retention.failures)[:400]}) "
+                "— deterministic fallback"
             )
 
     spec = build_fallback_documentary(
@@ -1991,6 +2056,7 @@ def _plan_documentary(
         width=deps.video.w,
         height=deps.video.h,
         project_id=project_id,
+        niche=niche,
     )
     timeline = build_timeline(spec)
     _apply_audio_mode(timeline, deps)
@@ -2026,9 +2092,20 @@ def stage_planning(
     `force_replan=True` invalidates the active-version shortcut (a refreshed
     CaseDossier re-runs Stage 6 without touching ingest or ASR).
     """
+    niche = "bodycam_documentary"
+    # an authored plan (DIRECTOR_PLAN_FILE) IS a replan request — the reuse
+    # shortcut must never shadow it
+    plan_file = os.environ.get("DIRECTOR_PLAN_FILE", "")
     with deps.sessions() as s:
         project = s.get(ProjectRow, project_id)
-        if project.active_otio_version_id is not None and not force_replan:
+        if project is not None:
+            niche = project.niche_skill or "bodycam_documentary"
+        if (
+            project is not None
+            and project.active_otio_version_id is not None
+            and not force_replan
+            and not (plan_file and Path(plan_file).is_file())
+        ):
             version = project.active_otio_version_id
             row = s.execute(
                 select(TimelineVersionRow).where(
@@ -2064,7 +2141,14 @@ def stage_planning(
     # 1-minute slice (Eustis postmortem), never an 8s-grained full dump
     if dur >= DOCUMENTARY_MIN_SOURCE_S:
         return _plan_documentary(
-            asset_id, transcript, project_id, deps, dur=dur, fps=fps, card_fields=card_fields
+            asset_id,
+            transcript,
+            project_id,
+            deps,
+            dur=dur,
+            fps=fps,
+            card_fields=card_fields,
+            niche=niche,
         )
 
     n_segments = max(1, math.ceil(dur / AUTO_CUT_MAX_SEGMENT_S))
@@ -2305,6 +2389,8 @@ def stage_qa(
     *,
     timeline=None,
     source_duration_s: float = 0.0,
+    asset_id: str = "",
+    narration_clips: list[dict] | None = None,
 ) -> AuditReport:
     """Deterministic QA + the 2-bus acoustic verification (SNR/clipping/engine).
 
@@ -2315,51 +2401,62 @@ def stage_qa(
     """
     audio_verification = None
     speech_intervals = None
-    master_speech_intervals = None
-    program_speech_intervals = None
     if enhance_info is not None:
         from director_os.core.qa_probe import AudioVerification
 
         # the -12..-6 speech window + SNR/clipping gates are the 2-BUS law —
-        # legacy loudnorm_48k renders keep their integrated-loudness law
-        speech_intervals = list(enhance_info.speech_intervals)
-        if timeline is not None and speech_intervals:
-            # The shipped master is a REORDERED cut: source-clock spans measured
-            # on it land on narration b-roll beds and wrong moments (found live
-            # on tape-1 v2 — a false speech RMS -22 dBFS and a false clean_snr
-            # 9.0 dB on a green enhance stage). Remap onto the MASTER clock
-            # through the kept raw-clip windows — the same source->master law
-            # the v6 captions ride (master_cues.py). QA still evaluates the
-            # OUTPUT FILE itself (M5-R1 law); only the spans change clocks.
-            # - loudness + timbre ride the DIALOGUE spans (the leveled law's
-            #   meter)
-            # - the SNR noise floor rides PROGRAM speech (dialogue + narration
-            #   blocks): the TTS voice is speech, not noise — the floor must
-            #   never sample it
-            master_speech_intervals = master_clock_speech_intervals(timeline, speech_intervals)
-            program_speech_intervals = master_clock_speech_intervals(
-                timeline, speech_intervals, include_narration_blocks=True
+        # legacy loudnorm_48k renders keep their integrated-loudness law.
+        # CLOCK LAW (full-tape runway): the enhance receipt's speech windows
+        # ride the RAW asset clock; the audits probe the SHIPPED master — a
+        # kept-band cut (2627s raw -> 782s master) must remap them or read
+        # silence/sirens at wrong positions. The raw reference keeps the raw
+        # clock, so the raw-vs-clean comparison stays region-quantized.
+        source_clock_speech = list(enhance_info.speech_intervals)
+        speech_intervals = master_clock_speech_intervals(source_clock_speech, timeline, asset_id)
+        # the SNR noise floor rides PROGRAM speech (dialogue + narration
+        # blocks): the TTS voice is speech, not noise — the floor must never
+        # sample it. Loudness + timbre stay on the DIALOGUE spans (the
+        # leveled law's meter). Measured live on tape-1 v2: source-clock
+        # spans on the shipped file produced a false speech RMS -22 dBFS and
+        # a false clean_snr 9.0 dB on a green enhance stage.
+        program_speech_intervals = master_clock_speech_intervals(
+            source_clock_speech, timeline, asset_id
+        )
+        try:
+            from director_os.subtitles.master_cues import (
+                build_master_caption_cues,
+                narration_word_stamps,
             )
-            audio_verification = AudioVerification(
-                raw_audio_path=str(enhance_info.raw_reference_wav),
-                enhancer_engine=enhance_info.engine,
-                enhancer_neural=bool(enhance_info.neural),
-                atten_lim_db=enhance_info.atten_lim_db,
-                raw_speech_intervals=list(speech_intervals),
+
+            beats, _counts = build_master_caption_cues(
+                timeline, transcript or {}, narration_word_stamps(narration_clips or [])
             )
-        else:
-            master_speech_intervals = speech_intervals
-            program_speech_intervals = speech_intervals
-            audio_verification = AudioVerification(
-                raw_audio_path=str(enhance_info.raw_reference_wav),
-                enhancer_engine=enhance_info.engine,
-                enhancer_neural=bool(enhance_info.neural),
-                atten_lim_db=enhance_info.atten_lim_db,
+            narrator_spans = [
+                (b.start_ms / 1000.0, b.end_ms / 1000.0)
+                for b in beats
+                if b.speaker == "Narrator" and b.end_ms > b.start_ms
+            ]
+            program_speech_intervals = sorted(program_speech_intervals + narrator_spans)
+        except Exception as e:  # noqa: BLE001 — no cues -> the floor rides on dialogue
+            deps.log(f"  [qa] narrator program-speech spans unavailable ({e})")
+        if speech_intervals != source_clock_speech:
+            deps.log(
+                f"  [qa] speech windows remapped raw->{speech_intervals[-1][1]:.1f}s "
+                f"master clock ({len(source_clock_speech)} -> {len(speech_intervals)} spans)"
             )
+        audio_verification = AudioVerification(
+            raw_audio_path=str(enhance_info.raw_reference_wav),
+            enhancer_engine=enhance_info.engine,
+            enhancer_neural=bool(enhance_info.neural),
+            atten_lim_db=enhance_info.atten_lim_db,
+            raw_clock_speech_intervals=source_clock_speech,
+        )
+    else:
+        program_speech_intervals = speech_intervals
     audit = audit_technical(
         final_path,
         expected_dur_s=expected_dur_s,
-        speech_intervals=master_speech_intervals,
+        speech_intervals=speech_intervals,
         snr_speech_intervals=program_speech_intervals,
         audio_verification=audio_verification,
     )
@@ -2426,6 +2523,92 @@ def kept_windows_from_timeline(timeline, asset_id: str) -> list[tuple[float, flo
         start_s = item.source_range.start_time.to_seconds() if item.source_range else 0.0
         windows.append((start_s, start_s + dur))
     return windows
+
+
+def master_clock_speech_intervals(
+    source_intervals: list[tuple[float, float]],
+    timeline: TimelineSpec | None,
+    asset_id: str = "",
+    *,
+    include_narration_blocks: bool = False,
+) -> list[tuple[float, float]]:
+    """Raw-clock speech windows -> MASTER clock (raw clips only, gaps dropped).
+
+    The QA acoustic law measures the SHIPPED master; a kept-band cut of a long
+    tape (2627s raw -> 782s master) must not be probed with source-clock
+    windows — beyond the master's duration they read silence/limiter noise
+    and fail SNR/RMS on perfectly-enhanced speech (full-tape runway 2026-11-25).
+    Narration windows are skipped — bus-1 dialogue is what the -12..-6 dBFS
+    law meters.
+    """
+    from director_os.otio_engine.contract import NarratorClipMeta, RawClipMeta, parse_clip_meta
+    from director_os.otio_engine.timeline import (
+        MASTER_TRACK,
+        is_gap,
+        item_duration_s,
+        track_by_name,
+    )
+
+    if timeline is None or not source_intervals:
+        return list(source_intervals)
+    master = track_by_name(timeline, MASTER_TRACK)
+    if master is None:
+        return list(source_intervals)
+    maps: list[tuple[float, float, float]] = []
+    t_master = 0.0
+    for item in master:
+        dur = item_duration_s(item)
+        if dur <= 0:
+            continue
+        if is_gap(item):
+            t_master += dur
+            continue
+        meta = parse_clip_meta(item)
+        sr = getattr(item, "source_range", None)
+        src0 = sr.start_time.to_seconds() if sr is not None else 0.0
+        if isinstance(meta, RawClipMeta) and (not asset_id or meta.asset_id == asset_id):
+            maps.append((t_master, src0, dur))
+        elif include_narration_blocks and isinstance(meta, NarratorClipMeta):
+            # program-speech mode (the SNR floor): a narration block's whole
+            # master window counts as speech — the TTS voice is speech, not
+            # noise, and the floor must never sample it
+            maps.append((t_master, t_master, dur))
+        t_master += dur
+    if not maps:
+        return list(source_intervals)
+    remapped: list[tuple[float, float]] = []
+    narration_master_windows: list[tuple[float, float]] = []
+    for a, b in source_intervals:
+        for m0, src0, dur in maps:
+            if src0 == m0 and dur and m0 in {w[0] for w in narration_master_windows}:
+                pass
+            lo, hi = max(a, src0), min(b, src0 + dur)
+            if hi - lo >= 0.05:
+                remapped.append((m0 + lo - src0, m0 + hi - src0))
+    # narration blocks count as program speech in their OWN right (the floor
+    # must never sample the TTS voice) — they join directly, no source-window
+    # intersection: their windows live on the MASTER clock already
+    if include_narration_blocks:
+        seen = set()
+        for m0, src0, dur in maps:
+            if src0 == m0 and (m0, dur) not in seen:
+                seen.add((m0, dur))
+                narration_master_windows.append((m0, m0 + dur))
+        remapped.extend(narration_master_windows)
+    from director_os.audio_engine.leveling import merge_intervals
+
+    if not remapped:
+        return []
+    merged = merge_intervals(remapped)
+    # the merge pads ±0.15s (word-edge law) — clamp every piece back inside
+    # its master window so a window edge never meter the gap/narration beside it
+    pieces: list[tuple[float, float]] = []
+    for a, b in merged:
+        for m0, _src0, wdur in maps:
+            lo, hi = max(a, m0), min(b, m0 + wdur)
+            if hi - lo > 0:
+                pieces.append((lo, hi))
+    return sorted(pieces)
 
 
 # --------------------------------------------------------------------- runner
@@ -2700,76 +2883,101 @@ def run_pipeline(
                     )
                     _downgrade_2bus_audio_mode(timeline)
 
-        tracker.stage(JobStage.render.value, 60.0)
-        _check_stop(deps, project_id)
-        with tracker.step("render", "Render master — segment cache, misses only") as st:
-            report, otio_path = stage_render(
+        # Range(2): render pass 1, dailies review may repair, render pass 2.
+        # The closed agentic loop — the master is LOOKED at before the gate.
+        for _review_round in range(2):
+            tracker.stage(JobStage.render.value, 60.0)
+            _check_stop(deps, project_id)
+            with tracker.step("render", "Render master — segment cache, misses only") as st:
+                report, otio_path = stage_render(
+                    timeline,
+                    project_id,
+                    source,
+                    asset_id,
+                    deps,
+                    enhanced_audio=enhance_info.enhanced_audio_map() if enhance_info else None,
+                    narration_audio=narration_audio if narration_clips else None,
+                )
+                st.pct(96, f"{report.rendered} rendered / {report.cached} cached")
+            # the disk now carries THIS program (ops@max_rev + active version) —
+            # stamp the gate in EVERY redact mode, not only the tracked path,
+            # or the Export button lies "dirty" forever on default projects
+            _stamp_export_gate(deps, project_id, asset_id)
+
+            tracker.stage(JobStage.subtitles.value, 85.0)
+            _check_stop(deps, project_id)
+            with tracker.step("subtitles", "Caption build — 2-row karaoke .ass + .srt"):
+                stage_subtitles(timeline, transcript, project_id, deps)
+
+            # POST-FX (owner rule): blur + enhance + captions run ONLY now, on the
+            # assembled deliverable — never on the 43-min source. QA audits
+            # THIS file.
+            post_fx_report = None
+            final_for_qa = report.final_path
+            if deps.post_fx:
+                tracker.stage(JobStage.qa.value, 88.0)
+                with tracker.step(
+                    "post_fx", "Post-FX on the deliverable — tracked blur + burn-in"
+                ) as st:
+                    try:
+                        from director_os.worker.post_fx import stage_post_fx
+
+                        post_fx_report = stage_post_fx(
+                            report.final_path,
+                            timeline,
+                            transcript,
+                            project_id,
+                            deps,
+                            narration_clips=narration_clips,
+                            enhance_info=enhance_info,
+                        )
+                        final_for_qa = post_fx_report.final_path or report.final_path
+                    except Exception as e:  # noqa: BLE001
+                        st.skip(f"FAILED ({e}) — QA audits the un-post-fx'd master")
+                        deps.log(f"  [post-fx] FAILED ({e}) — QA audits the un-post-fx'd master")
+
+            tracker.stage(JobStage.qa.value, 90.0)
+            _check_stop(deps, project_id)
+            # expected duration = the DAG's frame-quantized total (what ffmpeg truly
+            # renders), NOT the raw OTIO sum — unquantized sums accumulate per-segment
+            # frame rounding and fail QA on long cuts (live: 4.92 s over 329 segments)
+            with tracker.step("qa", "Technical QA audit — loudness, duration, retention"):
+                audit = stage_qa(
+                    final_for_qa,
+                    report.total_dur_s,
+                    job_id,
+                    project_id,
+                    deps,
+                    transcript=transcript,
+                    enhance_info=enhance_info,
+                    raw_source=source,
+                    timeline=timeline,
+                    source_duration_s=_source_duration(deps, asset_id),
+                    asset_id=asset_id,
+                    narration_clips=narration_clips,
+                )
+                if not audit.ok:
+                    raise PipelineError(f"QA failed: {[c.detail for c in audit.failures]}")
+
+            # DAILIES REVIEW — the render is evidenced, not trusted. Applied
+            # repairs mutate the timeline, persist a version, and the loop
+            # re-renders (segment cache: misses only) + re-audits. Round 1 is
+            # the post-repair pass; the review never re-enters (bounded).
+            if _review_round == 1 or not deps.review_pass:
+                break
+            from director_os.worker.review_pass import stage_review
+
+            review = stage_review(final_for_qa, timeline, [], project_id, deps)
+            if review.status != "applied":
+                break
+            _persist_timeline_version(
                 timeline,
                 project_id,
-                source,
-                asset_id,
                 deps,
-                enhanced_audio=enhance_info.enhanced_audio_map() if enhance_info else None,
-                narration_audio=narration_audio if narration_clips else None,
+                created_by="review_agent",
+                note=f"dailies review round {_review_round}: {len(review.applied)} repair(s)",
             )
-            st.pct(96, f"{report.rendered} rendered / {report.cached} cached")
-        # the disk now carries THIS program (ops@max_rev + active version) —
-        # stamp the gate in EVERY redact mode, not only the tracked path,
-        # or the Export button lies "dirty" forever on default projects
-        _stamp_export_gate(deps, project_id, asset_id)
-
-        tracker.stage(JobStage.subtitles.value, 85.0)
-        _check_stop(deps, project_id)
-        with tracker.step("subtitles", "Caption build — 2-row karaoke .ass + .srt"):
-            stage_subtitles(timeline, transcript, project_id, deps)
-
-        # POST-FX (owner rule): blur + enhance + captions run ONLY now, on the
-        # assembled deliverable — never on the 43-min source. QA audits
-        # THIS file.
-        post_fx_report = None
-        final_for_qa = report.final_path
-        if deps.post_fx:
-            tracker.stage(JobStage.qa.value, 88.0)
-            with tracker.step(
-                "post_fx", "Post-FX on the deliverable — tracked blur + burn-in"
-            ) as st:
-                try:
-                    from director_os.worker.post_fx import stage_post_fx
-
-                    post_fx_report = stage_post_fx(
-                        report.final_path,
-                        timeline,
-                        transcript,
-                        project_id,
-                        deps,
-                        narration_clips=narration_clips,
-                        enhance_info=enhance_info,
-                    )
-                    final_for_qa = post_fx_report.final_path or report.final_path
-                except Exception as e:  # noqa: BLE001
-                    st.skip(f"FAILED ({e}) — QA audits the un-post-fx'd master")
-                    deps.log(f"  [post-fx] FAILED ({e}) — QA audits the un-post-fx'd master")
-
-        tracker.stage(JobStage.qa.value, 90.0)
-        _check_stop(deps, project_id)
-        # expected duration = the DAG's frame-quantized total (what ffmpeg truly
-        # renders), NOT the raw OTIO sum — unquantized sums accumulate per-segment
-        # frame rounding and fail QA on long cuts (live: 4.92 s over 329 segments)
-        with tracker.step("qa", "Technical QA audit — loudness, duration, retention"):
-            audit = stage_qa(
-                final_for_qa,
-                report.total_dur_s,
-                job_id,
-                project_id,
-                deps,
-                transcript=transcript,
-                enhance_info=enhance_info,
-                raw_source=source,
-                timeline=timeline,
-                source_duration_s=_source_duration(deps, asset_id),
-            )
-            if not audit.ok:
-                raise PipelineError(f"QA failed: {[c.detail for c in audit.failures]}")
+            deps.log("[review] repairs applied — re-render (cache hits elsewhere)")
 
         # Stage 10 — Creator Ship Pack (YouTube upload is disabled; this folder
         # is what the human ships). Soft-fail: a pack glitch never unpublishes
@@ -2904,6 +3112,13 @@ def make_deps(
     # documentary runs; explicit overrides always win; tests stay hermetic
     overrides.setdefault(
         "post_fx", os.getenv("POST_FX", "").strip().lower() in {"1", "true", "yes"}
+    )
+    # REVIEW_PASS env default — ON: a QA-passed master still earns an actual
+    # look when a vision/LLM viewer is configured (the pass self-skips, loudly,
+    # when none is). Explicit overrides always win; tests stay hermetic.
+    overrides.setdefault(
+        "review_pass",
+        os.getenv("REVIEW_PASS", "on").strip().lower() not in {"0", "false", "off", "no"},
     )
     return PipelineDeps(
         sessions=make_session_factory(engine),

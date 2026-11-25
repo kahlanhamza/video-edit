@@ -65,9 +65,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-face-regions", type=int, default=6)
     p.add_argument(
         "--redaction-backend",
-        choices=("yunet", "modal", "none"),
+        choices=("tracked", "yunet", "modal", "none"),
         default="yunet",
-        help="yuNet CPU sweep (offline) | Modal GPU YOLO-face+plate+ByteTrack | skip",
+        help="3-pass YOLO+GMC tracked (default when models present) | yuNet CPU | Modal GPU | skip",
     )
     p.add_argument(
         "--vision",
@@ -87,6 +87,11 @@ def parse_args() -> argparse.Namespace:
         "--stub-asr",
         action="store_true",
         help="keyless smoke: empty transcript, real pixels/sweep/render (no Gladia)",
+    )
+    p.add_argument(
+        "--force-replan",
+        action="store_true",
+        help="invalidate the active-timeline shortcut and re-run planning",
     )
     p.add_argument(
         "--project-id",
@@ -285,7 +290,7 @@ def main() -> int:
                 f"ocr={ocr.get('iso', 'not found')}"
             )
 
-    result = run_pipeline(segment, pid, deps)
+    result = run_pipeline(segment, pid, deps, force_replan=args.force_replan)
 
     print("\n================ REAL-FOOTAGE E2E RESULT ================")
     print(f"project:   {result.project_id}")

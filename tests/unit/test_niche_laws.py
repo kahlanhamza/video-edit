@@ -1,9 +1,12 @@
-"""Niche laws — this is NOT a general AI video editor.
+"""Niche laws — a narration/commentary editor for ANY escalated-incident
+footage (owner directive 2026-11-24: this is the only generality we sell).
 
-The product edits narration/commentary footage (bodycam documentary,
-courtroom breakdown, shoplifting commentary — anything we can narrate over).
-Every editing surface must stay narration-centric; these tests pin the
-invariants so a general-purpose drift fails CI instead of shipping.
+The product edits narration/commentary footage across niches: bodycam
+documentary (the default), first amendment audit, retail theft, trespassing,
+and anything escalated enough to narrate over — NOT general-purpose video
+editing (no weddings, no vlogs, no gaming). Every editing surface must stay
+narration-centric; these tests pin the invariants so a general-purpose drift
+fails CI instead of shipping.
 """
 
 from __future__ import annotations

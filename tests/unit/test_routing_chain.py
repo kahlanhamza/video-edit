@@ -304,6 +304,7 @@ def test_build_backend_chain_full_stack_order(monkeypatch, tmp_path):
     monkeypatch.setenv("LLM_BASE_URL", "https://api.groq.com/openai/v1")
     monkeypatch.setenv("LLM_MODEL", "openai/gpt-oss-120b")
     monkeypatch.setenv("LLM_FALLBACK_MODELS", "qwen/qwen3.8-27b,openai/gpt-oss-20b")
+    monkeypatch.setenv("AGENT_BRAIN", "legacy")  # pins the legacy tier internals
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or_k")
     monkeypatch.setenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
     monkeypatch.setenv("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra:free")
@@ -334,6 +335,7 @@ def test_build_backend_chain_native_gemini_primary_no_duplicate(monkeypatch, tmp
     monkeypatch.setenv("LLM_API_KEY", "AQ.k")
     monkeypatch.setenv("LLM_BASE_URL", "")
     monkeypatch.setenv("LLM_MODEL", "gemini-3.8-flash")
+    monkeypatch.setenv("AGENT_BRAIN", "legacy")  # pins the legacy tier internals
     monkeypatch.delenv("VISION_API_KEY", raising=False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or_k")
     monkeypatch.setenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
@@ -353,6 +355,7 @@ def test_build_backend_chain_single_tier_is_bare(monkeypatch, tmp_path):
     monkeypatch.setenv("LLM_API_KEY", "gsk_k")
     monkeypatch.setenv("LLM_BASE_URL", "https://api.groq.com/openai/v1")
     monkeypatch.setenv("LLM_MODEL", "openai/gpt-oss-120b")
+    monkeypatch.setenv("AGENT_BRAIN", "legacy")  # pins the legacy tier internals
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("VISION_API_KEY", raising=False)
     monkeypatch.setenv("OUTPUT_DIR", str(tmp_path))

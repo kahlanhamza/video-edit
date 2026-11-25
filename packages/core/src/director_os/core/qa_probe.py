@@ -221,13 +221,18 @@ class AudioVerification(BaseModel):
     # comparison. The shipped master is a reordered cut: its spans live on the
     # MASTER clock (snr_speech_intervals), but the raw reference is a
     # source-clock file — each side is measured on its own clock's spans.
-    raw_speech_intervals: list[tuple[float, float]] | None = None
+    raw_clock_speech_intervals: list[tuple[float, float]] | None = None
     # None -> hermetic-env check (afftdn allowed only inside tests)
     allow_afftdn: bool | None = None
     min_clean_snr_db: float = 14.0
     max_delta_noise_db: float = -8.0
     min_snr_improvement_db: float = 6.0
     max_peak_dbtp: float = -1.0
+    # RAW-CLOCK speech windows for the raw reference (full-tape runway):
+    # the final master is a kept-band cut on the MASTER clock — its windows
+    # point at different tape regions. None -> speech_intervals serve both
+    # (source == master clock, the legacy 1:1 render).
+    raw_clock_speech_intervals: list[tuple[float, float]] | None = None
 
 
 def audit_technical(
@@ -419,7 +424,7 @@ def _audio_verification_checks(
     dialogue + narration blocks) drives the SNR noise-floor comparison —
     the TTS voice is speech, not noise, and the floor must never sample it.
     The RAW reference is measured on its own source-clock spans
-    (`raw_speech_intervals`) — each side of the comparison rides its own
+    (`raw_clock_speech_intervals`) — each side of the comparison rides its own
     file's clock.
 
     Soft-imports audio_engine exactly like the speech-gated loudness check —
@@ -458,15 +463,16 @@ def _audio_verification_checks(
         )
     )
 
-    if snr_speech_intervals:
+    clean_spans = snr_speech_intervals if snr_speech_intervals is not None else speech_intervals
+    if clean_spans:
         try:
             raw_spans = (
-                verification.raw_speech_intervals
-                if verification.raw_speech_intervals
-                else snr_speech_intervals
+                verification.raw_clock_speech_intervals
+                if verification.raw_clock_speech_intervals
+                else clean_spans
             )
             raw = measure_snr(verification.raw_audio_path, raw_spans)
-            clean = measure_snr(str(path), snr_speech_intervals)
+            clean = measure_snr(str(path), clean_spans)
             delta_noise = clean["noise_floor_db"] - raw["noise_floor_db"]
             ok, gate_detail = snr_gate(
                 raw["snr_db"],
