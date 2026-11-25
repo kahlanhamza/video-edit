@@ -237,3 +237,30 @@ def test_ceiling_limit_pcm_passthrough_below_ceiling():
     out = ceiling_limit_pcm(pcm.copy(), sr, ceiling, channels=2)
     assert np.max(np.abs(out)) <= ceiling + 1e-6
     assert np.allclose(out, pcm, atol=1e-7)  # untouched, sample for sample
+
+
+def test_ceiling_limit_pcm_onset_no_leak():
+    """Regression (v6 run): an onset after quiet leaked to 0.959 vs cap 0.7499.
+
+    The release smoothing `min.accumulate(h - i*a) + i*a` rebuilt h from the
+    QUIET history — at the first loud sample h_smooth -> 0, gain -> 1, and
+    the loud burst sailed past the ceiling. Shipped master measured sample
+    peak +5.10 dBFS. The limiter must hold |out| <= ceiling on EVERY sample,
+    including the onset transient.
+    """
+    import numpy as np
+    from director_os.audio_engine.leveling import ceiling_limit_pcm
+
+    sr = 48000
+    t_burst = np.arange(int(0.5 * sr)) / sr
+    burst = (0.98 * np.sin(2 * np.pi * 220.0 * t_burst)).astype(np.float32)
+    quiet = np.zeros(int(0.25 * sr), dtype=np.float32)  # limiter idle in h-domain
+    tone = np.concatenate([quiet, burst])
+    pcm = np.repeat(tone[:, None], 2, axis=1).reshape(-1)  # interleaved stereo
+
+    ceiling = 10 ** (-2.5 / 20.0)
+    out = ceiling_limit_pcm(pcm.copy(), sr, ceiling, channels=2)
+    assert np.max(np.abs(out)) <= ceiling + 1e-6
+    # the burst itself survived limiting (content preserved, not squashed away)
+    tail = out[len(quiet) * 2 :]
+    assert np.max(np.abs(tail)) > 0.5

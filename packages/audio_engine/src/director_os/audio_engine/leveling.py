@@ -83,12 +83,18 @@ def ceiling_limit_pcm(
         cap = np.lib.stride_tricks.sliding_window_view(
             np.concatenate([cap, np.full(la - 1, cap[-1])]), la
         ).min(axis=1)
-    # log-gain domain: h >= 0; attack = instant rise of h, release = h may
-    # decay at most `a` per sample. h_smooth[i] = min_{j<=i}(h[j] + (i-j)*a).
+    # log-gain domain: h >= 0; attack = the look-ahead min above (the cap is
+    # pre-lowered `attack_ms` BEFORE a peak arrives), release = h may recover
+    # at most `a` per sample — but h must NEVER fall below its own current
+    # requirement (otherwise the gain EXCEEDS cap[i] and the output breaches
+    # the ceiling at every onset: measured 0.959 vs the 0.7499 requirement on
+    # the full-tape master — shipped true peak +5.4 dBFS). maximum-accumulate
+    # in the (h - i*a) domain gives exactly that: suppression present since
+    # the look-ahead lowered it early, recovery rate-limited afterwards.
     h = -np.log(np.maximum(cap, 1e-9))
     a = 1000.0 / (release_ms * sr)
     idx = np.arange(h.size, dtype=np.float64)
-    h_smooth = np.minimum.accumulate(h - idx * a) + idx * a
+    h_smooth = np.maximum.accumulate(h + idx * a) - idx * a
     gain = np.exp(-h_smooth)
     return (frames * gain[:, None]).reshape(pcm.shape)
 
