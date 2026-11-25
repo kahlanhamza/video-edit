@@ -217,6 +217,11 @@ class AudioVerification(BaseModel):
     enhancer_engine: str
     enhancer_neural: bool = True
     atten_lim_db: float | None = None
+    # Source-clock speech spans for the RAW reference side of the SNR
+    # comparison. The shipped master is a reordered cut: its spans live on the
+    # MASTER clock (snr_speech_intervals), but the raw reference is a
+    # source-clock file — each side is measured on its own clock's spans.
+    raw_speech_intervals: list[tuple[float, float]] | None = None
     # None -> hermetic-env check (afftdn allowed only inside tests)
     allow_afftdn: bool | None = None
     min_clean_snr_db: float = 14.0
@@ -234,6 +239,7 @@ def audit_technical(
     speech_lo_dbfs: float = -12.0,
     speech_hi_dbfs: float = -6.0,
     audio_verification: AudioVerification | None = None,
+    snr_speech_intervals: list[tuple[float, float]] | None = None,
 ) -> AuditReport:
     """Deterministic technical QA of a rendered master (the `qa` pipeline stage).
 
@@ -274,6 +280,7 @@ def audit_technical(
     checks.append(AuditCheck(name="audio_law_48k_stereo", ok=law_ok, detail=law_detail))
 
     checks.append(_stream_uniformity_check(path))
+    checks.append(_audio_duration_coverage_check(path))
 
     checks.append(clean_out_frames_check(path))
 
@@ -320,7 +327,14 @@ def audit_technical(
             checks.append(AuditCheck(name="speech_gated_loudness", ok=False, detail=str(e)))
 
     if audio_verification is not None:
-        checks.extend(_audio_verification_checks(path, audio_verification, speech_intervals))
+        checks.extend(
+            _audio_verification_checks(
+                path,
+                audio_verification,
+                speech_intervals,
+                snr_speech_intervals if snr_speech_intervals is not None else speech_intervals,
+            )
+        )
 
     return AuditReport(path=str(path), ok=all(c.ok for c in checks), checks=checks)
 
@@ -328,6 +342,45 @@ def audit_technical(
 def _audio_stream_infos(path: Path) -> list[dict]:
     data = _ffprobe(path, "-show_streams")
     return [s for s in data.get("streams", []) if s.get("codec_type") == "audio"]
+
+
+def _audio_duration_coverage_check(path: Path, tolerance_s: float = 1.0) -> AuditCheck:
+    """The audio stream must cover the video stream (no silent tail).
+
+    Found live on tape-1 v2: the rendered master's audio ended 3.85 s before
+    its video (the per-clip render under-covers) and NO gate noticed — the
+    shipped file had a silent tail no one asked for. The audio stream must
+    cover the video stream within `tolerance_s`.
+    """
+    try:
+        data = _ffprobe(path, "-show_streams")
+        video = [s for s in data.get("streams", []) if s.get("codec_type") == "video"]
+        audio = [s for s in data.get("streams", []) if s.get("codec_type") == "audio"]
+        if not video or not audio:
+            return AuditCheck(name="audio_duration_coverage", ok=False, detail="missing stream")
+
+        def _dur(s: dict) -> float:
+            d = s.get("duration")
+            if d is None:
+                # count packets instead of trusting the container tag
+                n = int(s.get("nb_frames") or 0)
+                rate = float(s.get("avg_frame_rate") or 0) or float(s.get("r_frame_rate") or 0)
+                if s.get("codec_type") == "audio":
+                    rate = float(s.get("sample_rate") or 0)
+                    return n / rate if rate else 0.0
+                return n / rate if rate else 0.0
+            return float(d)
+
+        vd, ad = _dur(video[0]), _dur(audio[0])
+        gap = vd - ad
+        ok = gap <= tolerance_s
+        return AuditCheck(
+            name="audio_duration_coverage",
+            ok=ok,
+            detail=(f"video {vd:.2f}s / audio {ad:.2f}s (gap {gap:+.2f}s, tol {tolerance_s:g}s)"),
+        )
+    except Exception as e:  # noqa: BLE001
+        return AuditCheck(name="audio_duration_coverage", ok=False, detail=str(e))
 
 
 def _stream_uniformity_check(path: Path) -> AuditCheck:
@@ -357,8 +410,17 @@ def _audio_verification_checks(
     path: Path,
     verification: AudioVerification,
     speech_intervals: list[tuple[float, float]] | None,
+    snr_speech_intervals: list[tuple[float, float]] | None = None,
 ) -> list[AuditCheck]:
     """The acoustic law for 2-bus renders: engine, SNR, clipping.
+
+    `speech_intervals` (master-clock DIALOGUE spans) drive the timbre and
+    crest audits. `snr_speech_intervals` (master-clock PROGRAM speech:
+    dialogue + narration blocks) drives the SNR noise-floor comparison —
+    the TTS voice is speech, not noise, and the floor must never sample it.
+    The RAW reference is measured on its own source-clock spans
+    (`raw_speech_intervals`) — each side of the comparison rides its own
+    file's clock.
 
     Soft-imports audio_engine exactly like the speech-gated loudness check —
     core stays standalone-installable without the audio extras.
@@ -396,10 +458,15 @@ def _audio_verification_checks(
         )
     )
 
-    if speech_intervals:
+    if snr_speech_intervals:
         try:
-            raw = measure_snr(verification.raw_audio_path, speech_intervals)
-            clean = measure_snr(str(path), speech_intervals)
+            raw_spans = (
+                verification.raw_speech_intervals
+                if verification.raw_speech_intervals
+                else snr_speech_intervals
+            )
+            raw = measure_snr(verification.raw_audio_path, raw_spans)
+            clean = measure_snr(str(path), snr_speech_intervals)
             delta_noise = clean["noise_floor_db"] - raw["noise_floor_db"]
             ok, gate_detail = snr_gate(
                 raw["snr_db"],

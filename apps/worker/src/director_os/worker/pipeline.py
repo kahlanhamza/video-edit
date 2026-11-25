@@ -65,6 +65,7 @@ from director_os.otio_engine.timeline import (
     to_json_dict,
 )
 from director_os.vision_fx.trajectory import PerFrameRedaction
+from director_os.worker.master_clock_map import master_clock_speech_intervals
 from director_os.worker.progress import RunTracker
 from sqlalchemy import select
 
@@ -2314,22 +2315,52 @@ def stage_qa(
     """
     audio_verification = None
     speech_intervals = None
+    master_speech_intervals = None
+    program_speech_intervals = None
     if enhance_info is not None:
         from director_os.core.qa_probe import AudioVerification
 
         # the -12..-6 speech window + SNR/clipping gates are the 2-BUS law —
         # legacy loudnorm_48k renders keep their integrated-loudness law
         speech_intervals = list(enhance_info.speech_intervals)
-        audio_verification = AudioVerification(
-            raw_audio_path=str(enhance_info.raw_reference_wav),
-            enhancer_engine=enhance_info.engine,
-            enhancer_neural=bool(enhance_info.neural),
-            atten_lim_db=enhance_info.atten_lim_db,
-        )
+        if timeline is not None and speech_intervals:
+            # The shipped master is a REORDERED cut: source-clock spans measured
+            # on it land on narration b-roll beds and wrong moments (found live
+            # on tape-1 v2 — a false speech RMS -22 dBFS and a false clean_snr
+            # 9.0 dB on a green enhance stage). Remap onto the MASTER clock
+            # through the kept raw-clip windows — the same source->master law
+            # the v6 captions ride (master_cues.py). QA still evaluates the
+            # OUTPUT FILE itself (M5-R1 law); only the spans change clocks.
+            # - loudness + timbre ride the DIALOGUE spans (the leveled law's
+            #   meter)
+            # - the SNR noise floor rides PROGRAM speech (dialogue + narration
+            #   blocks): the TTS voice is speech, not noise — the floor must
+            #   never sample it
+            master_speech_intervals = master_clock_speech_intervals(timeline, speech_intervals)
+            program_speech_intervals = master_clock_speech_intervals(
+                timeline, speech_intervals, include_narration_blocks=True
+            )
+            audio_verification = AudioVerification(
+                raw_audio_path=str(enhance_info.raw_reference_wav),
+                enhancer_engine=enhance_info.engine,
+                enhancer_neural=bool(enhance_info.neural),
+                atten_lim_db=enhance_info.atten_lim_db,
+                raw_speech_intervals=list(speech_intervals),
+            )
+        else:
+            master_speech_intervals = speech_intervals
+            program_speech_intervals = speech_intervals
+            audio_verification = AudioVerification(
+                raw_audio_path=str(enhance_info.raw_reference_wav),
+                enhancer_engine=enhance_info.engine,
+                enhancer_neural=bool(enhance_info.neural),
+                atten_lim_db=enhance_info.atten_lim_db,
+            )
     audit = audit_technical(
         final_path,
         expected_dur_s=expected_dur_s,
-        speech_intervals=speech_intervals,
+        speech_intervals=master_speech_intervals,
+        snr_speech_intervals=program_speech_intervals,
         audio_verification=audio_verification,
     )
     retention_failed = False
@@ -2712,6 +2743,7 @@ def run_pipeline(
                         project_id,
                         deps,
                         narration_clips=narration_clips,
+                        enhance_info=enhance_info,
                     )
                     final_for_qa = post_fx_report.final_path or report.final_path
                 except Exception as e:  # noqa: BLE001

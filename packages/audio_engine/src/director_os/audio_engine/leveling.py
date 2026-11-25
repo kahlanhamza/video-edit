@@ -66,7 +66,11 @@ def ceiling_limit_pcm(
       rides both channels and the stereo image never wobbles.
     - Release smoothing: the gain falls instantly to any requirement but
       recovers at most exponentially (`release_ms`), vectorized as a running
-      minimum in log-gain domain — crest reduction rides instead of pumping.
+      maximum in log-gain domain — crest reduction rides instead of pumping.
+      (The original running-minimum envelope was INVERTED — attack became
+      rate-limited and release instant, so valley-structured speech rode
+      through the ceiling; found live on tape-1 v2 and pinned by the valley
+      regression test.)
     """
     if pcm.size == 0:
         return pcm
@@ -83,13 +87,21 @@ def ceiling_limit_pcm(
         cap = np.lib.stride_tricks.sliding_window_view(
             np.concatenate([cap, np.full(la - 1, cap[-1])]), la
         ).min(axis=1)
-    # log-gain domain: h >= 0; attack = instant rise of h, release = h may
-    # decay at most `a` per sample. h_smooth[i] = min_{j<=i}(h[j] + (i-j)*a).
+    # log-gain domain: h >= 0. ATTACK IS INSTANT and release is bounded:
+    # h_env[i] = max_{j<=i}(h[j] - (i-j)*a) — a peak's requirement engages at
+    # once (the LOOKAHEAD above delivered it `attack_ms` early) and h then
+    # decays at most `a` per sample. The previous envelope was inverted
+    # (minimum-accumulate: attack rate-limited, release instant), so every
+    # inter-syllable valley RESET the gain and hot peaks rode through up to
+    # +3.9 dB above the ceiling — found live on tape-1 v2, where the shipped
+    # master decoded at +3.37 dBFS against a -1.5 dBTP ceiling. With the max
+    # envelope, gain[i] <= cap_la[i] <= ceiling/|x[i]| holds for EVERY sample:
+    # the sample-exact contract is finally provable, not aspirational.
     h = -np.log(np.maximum(cap, 1e-9))
     a = 1000.0 / (release_ms * sr)
     idx = np.arange(h.size, dtype=np.float64)
-    h_smooth = np.minimum.accumulate(h - idx * a) + idx * a
-    gain = np.exp(-h_smooth)
+    h_env = np.maximum.accumulate(h + idx * a) - idx * a
+    gain = np.exp(-h_env)
     return (frames * gain[:, None]).reshape(pcm.shape)
 
 

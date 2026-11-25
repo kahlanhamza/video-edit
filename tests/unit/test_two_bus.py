@@ -237,3 +237,28 @@ def test_ceiling_limit_pcm_passthrough_below_ceiling():
     out = ceiling_limit_pcm(pcm.copy(), sr, ceiling, channels=2)
     assert np.max(np.abs(out)) <= ceiling + 1e-6
     assert np.allclose(out, pcm, atol=1e-7)  # untouched, sample for sample
+
+
+def test_ceiling_limit_pcm_valley_structured_speech():
+    """Regression (tape-1 v2, found live 2026-11-25): valley-structured speech
+    (hot syllables separated by quiet valleys) RESET the old envelope's
+    release smoothing, so every syllable peak rode through the ceiling — the
+    shipped master decoded at +3.37 dBFS against a -1.5 dBTP ceiling. Attack
+    must be instant; only the release may be slow."""
+    import numpy as np
+    from director_os.audio_engine.leveling import ceiling_limit_pcm
+
+    sr = 48000
+    t = np.arange(int(1.0 * sr)) / sr
+    # 8 Hz square syllable envelope: ~62 ms hot / ~62 ms valley
+    syllabic = 0.5 + 0.5 * np.sign(np.sin(2 * np.pi * 8.0 * t))
+    tone = (0.95 * syllabic * np.sin(2 * np.pi * 220.0 * t)).astype(np.float32)
+    pcm = np.repeat(tone[:, None], 2, axis=1).reshape(-1)
+
+    ceiling = 10 ** (-2.5 / 20.0)
+    out = ceiling_limit_pcm(pcm.copy(), sr, ceiling, channels=2)
+
+    assert np.max(np.abs(out)) <= ceiling + 1e-6  # sample-exact, valleys and all
+    # the program survives: correlation stays high (this is not a mangle)
+    c = float(np.dot(out, pcm) / (np.linalg.norm(out) * np.linalg.norm(pcm) + 1e-12))
+    assert c > 0.9
