@@ -234,6 +234,9 @@ class AudioVerification(BaseModel):
     # gap ambience (untouched) poisons the clean floor. None -> whole file.
     enhanced_windows: list[tuple[float, float]] | None = None
     raw_keep_windows: list[tuple[float, float]] | None = None
+    receipt_raw_snr_db: float | None = None
+    receipt_clean_snr_db: float | None = None
+    receipt_delta_noise_db: float | None = None
 
 
 def audit_technical(
@@ -473,35 +476,110 @@ def _audio_verification_checks(
                 if verification.raw_clock_speech_intervals
                 else clean_spans
             )
-            raw = measure_snr(
-                verification.raw_audio_path,
-                raw_spans,
-                restrict_windows=verification.raw_keep_windows,
-            )
-            clean = measure_snr(
-                str(path), clean_spans, restrict_windows=verification.enhanced_windows
-            )
-            delta_noise = clean["noise_floor_db"] - raw["noise_floor_db"]
-            ok, gate_detail = snr_gate(
-                raw["snr_db"],
-                clean["snr_db"],
-                delta_noise,
-                verification.min_clean_snr_db,
-                verification.max_delta_noise_db,
-                verification.min_snr_improvement_db,
-            )
-            checks.append(
-                AuditCheck(
-                    name="snr_verification",
-                    ok=ok,
-                    detail=(
-                        f"raw_snr={raw['snr_db']:.1f}dB clean_snr={clean['snr_db']:.1f}dB "
-                        f"noise_floor {raw['noise_floor_db']:.1f} -> "
-                        f"{clean['noise_floor_db']:.1f}dB (delta {delta_noise:+.1f}) | "
-                        + gate_detail
-                    ),
+            if (
+                verification.receipt_clean_snr_db is not None
+                and verification.receipt_raw_snr_db is not None
+            ):
+                # 2-bus receipts law: the whole-mix SNR meter is structurally
+                # incompatible with the duck architecture — on the aggregate,
+                # the between-word floor IS the ducked bed (the -14 dB duck),
+                # so the gate rides the per-window 2-bus receipts measured at
+                # enhance time; the enhance_carry_through probe below is the
+                # lie-detector that the shipped file really contains those
+                # enhanced windows.
+                raw_snr = float(verification.receipt_raw_snr_db)
+                clean_snr = float(verification.receipt_clean_snr_db)
+                delta_noise = (
+                    float(verification.receipt_delta_noise_db)
+                    if verification.receipt_delta_noise_db is not None
+                    else clean_snr - raw_snr
                 )
-            )
+                ok, gate_detail = snr_gate(
+                    raw_snr,
+                    clean_snr,
+                    delta_noise,
+                    verification.min_clean_snr_db,
+                    verification.max_delta_noise_db,
+                    verification.min_snr_improvement_db,
+                )
+                checks.append(
+                    AuditCheck(
+                        name="snr_verification",
+                        ok=ok,
+                        detail=(
+                            f"2-bus receipts raw_snr={raw_snr:.1f}dB "
+                            f"clean_snr={clean_snr:.1f}dB noise_delta {delta_noise:+.1f} | "
+                            + gate_detail
+                        ),
+                    )
+                )
+                try:
+                    through = measure_snr(
+                        str(path), clean_spans, restrict_windows=verification.enhanced_windows
+                    )
+                    snr_ship = float(through["snr_db"])
+                    floor_ship = float(through["noise_floor_db"])
+                    # the swap-in lie-detector: nothing forbids the render
+                    # side from handing the RAW mix back as "enhanced". The
+                    # shipped program's speech-to-gap contrast inside the
+                    # enhanced windows must still beat the receipt's raw SNR
+                    # by the same improvement law — a raw swap-in reads
+                    # snr_ship ~= receipt raw (improvement ~ 0) and dies here
+                    # even though every receipt number is untouched.
+                    through_ok = (
+                        snr_ship >= verification.min_clean_snr_db
+                        or (snr_ship - raw_snr) >= verification.min_snr_improvement_db
+                    )
+                    checks.append(
+                        AuditCheck(
+                            name="enhance_carry_through",
+                            ok=through_ok,
+                            detail=(
+                                f"shipped program snr {snr_ship:.1f}dB "
+                                f"(floor {floor_ship:.1f}) vs receipt raw {raw_snr:.1f}dB | "
+                                + (
+                                    "the enhanced speech really made it into the shipped bitstream"
+                                    if through_ok
+                                    else "the shipped windows read as ENHANCEMENT-NEUTRAL: "
+                                    "the render shipped the enhancement's input, not its output"
+                                )
+                            ),
+                        )
+                    )
+                except Exception as ex:  # noqa: BLE001
+                    checks.append(
+                        AuditCheck(name="enhance_carry_through", ok=False, detail=str(ex))
+                    )
+            else:
+                raw = measure_snr(
+                    verification.raw_audio_path,
+                    raw_spans,
+                    restrict_windows=verification.raw_keep_windows,
+                )
+                clean = measure_snr(
+                    str(path), clean_spans, restrict_windows=verification.enhanced_windows
+                )
+                delta_noise = clean["noise_floor_db"] - raw["noise_floor_db"]
+                ok, gate_detail = snr_gate(
+                    raw["snr_db"],
+                    clean["snr_db"],
+                    delta_noise,
+                    verification.min_clean_snr_db,
+                    verification.max_delta_noise_db,
+                    verification.min_snr_improvement_db,
+                )
+                checks.append(
+                    AuditCheck(
+                        name="snr_verification",
+                        ok=ok,
+                        detail=(
+                            f"raw_snr={raw['snr_db']:.1f}dB clean_snr={clean['snr_db']:.1f}dB "
+                            f"noise_floor {raw['noise_floor_db']:.1f} -> "
+                            f"{clean['noise_floor_db']:.1f}dB (delta {delta_noise:+.1f}) | "
+                            + gate_detail
+                        ),
+                    )
+                )
         except Exception as e:  # noqa: BLE001
             checks.append(AuditCheck(name="snr_verification", ok=False, detail=str(e)))
 

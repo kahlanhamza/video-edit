@@ -2463,6 +2463,9 @@ def stage_qa(
             raw_clock_speech_intervals=source_clock_speech,
             enhanced_windows=list(master_windows) or None,
             raw_keep_windows=list(raw_windows) or None,
+            receipt_raw_snr_db=float(enhance_info.raw_snr_db),
+            receipt_clean_snr_db=float(enhance_info.clean_snr_db),
+            receipt_delta_noise_db=float(enhance_info.delta_noise_db),
         )
     else:
         program_speech_intervals = speech_intervals

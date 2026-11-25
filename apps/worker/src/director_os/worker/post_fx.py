@@ -605,23 +605,37 @@ def stage_post_fx(
     # dialogue RMS on MASTER-clock spoken spans -> refined bounded gain loop.
     # Without this the deep-filter + mux chain shipped dialogue at -18.1 dBFS
     # (found live on tape-1 v2) with every upstream law green.
-    shaped = enhanced  # the certify input when the leveling stage skips
     if marks["level"].exists():
         engine_mark, gain_mark = marks["level"].read_text().split("|")
         report.level_engine = engine_mark
         report.level_gain_db = float(gain_mark)
         deps.log(f"  [post-fx] leveling cached ({engine_mark} gain {report.level_gain_db:+.1f} dB)")
-        shaped = work / "master_audio.leveled.wav"
         if report.level_engine == "skipped_no_spans":
-            shaped = enhanced
+            certified = _certify_audio(enhanced, work, deps)
+        else:
+            verified = work / "master_audio.certified.m4a"
+            if not verified.exists():
+                certified = _certify_audio(work / "master_audio.leveled.wav", work, deps)
+            else:
+                # the shipped audio must be bit-identical to what was certified
+                certified = verified
     else:
-        shaped = _leveling_pass(enhanced, timeline, enhance_info, work, report, deps)
+        out = _leveling_pass(enhanced, timeline, enhance_info, work, report, deps)
         marks["level"].write_text(f"{report.level_engine}|{report.level_gain_db}")
+        if report.level_engine == "skipped_no_spans":
+            certified = _certify_audio(enhanced, work, deps)
+        else:
+            # the leveling pass certified its own mix ONCE — the outer stage
+            # must NEVER re-certify: a second AAC generation over an
+            # already-flattened mix re-blossoms the ring (measured +1.05 dBTP
+            # shipped on the double-certified path), and no gate can certify a
+            # chaotic bitstream
+            certified = out
 
-    # the CERTIFIED audio: encoded ONCE standalone, its true peak measured in
-    # its own bitstream; the mux STREAM-COPIES it — a re-encode is a chaotic
+    # the certified audio: encoded ONCE standalone (inside the leveling pass
+    # or right above — never both), its true peak measured in its own
+    # bitstream; the mux STREAM-COPIES it — a re-encode is a chaotic
     # bitstream whose rare frames cannot be certified (measured, tape-1 v2)
-    certified = _certify_audio(shaped, work, deps)
     report.certified_audio = True
 
     # ---- 4. mux (blurred video + certified audio + burned captions)
@@ -764,18 +778,25 @@ CERTIFIED_DIP_MAX_DB = 8.0
 CERTIFIED_MAX_DIPS = 80
 
 
-def _certify_audio(shaped: np.ndarray | Path, work: Path, deps) -> Path:
+def _certify_audio(shaped: np.ndarray | str | Path, work: Path, deps) -> Path:
     """Encode the shaped mix ONCE, dip over-gate spots, re-encode until the
     standalone encode's true peak holds the zero-clipping gate, and return
-    the CERTIFIED m4a. The mux then copies it (-c:a copy) — the shipped
+    the certified m4a. The mux then copies it (-c:a copy) — the shipped
     audio is bit-identical to what this function measured.
+
+    Bitrate rides the measured 512k segment law: on a limiter-flattened
+    waveform the 192k re-encode rings up to +4.5 dB above the ceiling while
+    512k stays under +1.46 dB. A Path input (the no-spans / resume skip
+    path) decodes and encodes fresh once — one AAC generation over an
+    ALREADY certified bitstream is chaotic (measured +1.05 dBTP shipped).
     """
     import math
     import wave
 
-    from director_os.audio_engine.leveling import decode_pcm_channels, decode_pcm_mono
+    from director_os.audio_engine.leveling import decode_pcm_channels
+    from director_os.audio_engine.two_bus import SEGMENT_AAC_BITRATE_KBPS
 
-    certified = work / "master_audio.certified.m4a"
+    certifiedd = work / "master_audio.certified.m4a"
     probe = work / "ring_probe.m4a"
     probe_src = work / "ring_probe_src.wav"
     gate = 10 ** (CERTIFIED_TARGET_DBTP / 20.0)
@@ -783,17 +804,25 @@ def _certify_audio(shaped: np.ndarray | Path, work: Path, deps) -> Path:
     t = np.linspace(-1.0, 1.0, width, endpoint=False)
     dip_shape = 0.5 * (1.0 + np.cos(np.pi * t))  # 1 at center -> 0 at edges
 
-    if isinstance(shaped, Path):
-        # the no-spans skip path hands over the extracted mix itself
-        current = decode_pcm_mono(shaped)
+    if isinstance(shaped, (str, Path)):
+        # the no-spans skip path hands over the extracted mix itself:
+        # decode at NATIVE channel count (no gain-inflating auto-downmix)
+        # and fold anything beyond stereo to channel-averaged mono
+        current, nch = decode_pcm_channels(str(shaped))
+        if nch == 1:
+            current = current
+        else:
+            current = current.reshape(-1, nch)
+            if nch > 2:
+                current = current.mean(axis=1, dtype=np.float32)
+                nch = 1
+            else:
+                current = current.ravel()
     else:
-        current = shaped
-    for round_idx in range(CERTIFIED_ROUNDS):
-        with wave.open(str(probe_src), "wb") as f:
-            f.setnchannels(1)
-            f.setsampwidth(2)
-            f.setframerate(48000)
-            f.writeframes((np.clip(current, -1, 1) * 32767).astype("<i2").tobytes())
+        current, nch = shaped, 1
+
+    def _encode(label: str) -> None:
+        af = ["-af", "pan=stereo|c0=c0|c1=c0"] if nch == 1 else []
         _run(
             [
                 "ffmpeg",
@@ -802,62 +831,92 @@ def _certify_audio(shaped: np.ndarray | Path, work: Path, deps) -> Path:
                 "error",
                 "-i",
                 str(probe_src),
-                "-af",
-                "pan=stereo|c0=c0|c1=c0",
+                *af,
                 "-c:a",
                 "aac",
                 "-b:a",
-                "192k",
+                f"{SEGMENT_AAC_BITRATE_KBPS}k",
                 "-ar",
                 "48000",
                 "-ac",
                 "2",
                 str(probe),
             ],
-            f"post-fx audio certify encode (round {round_idx + 1})",
+            label,
         )
+
+    def _measure() -> tuple[float, np.ndarray]:
         probe_pcm, ch = decode_pcm_channels(str(probe))
         frames = np.abs(probe_pcm.reshape(-1, ch)).max(axis=1)
-        true_peak_db = 20 * math.log10(float(frames.max()) + 1e-9)
+        return 20 * math.log10(float(frames.max()) + 1e-9), frames
+
+    def _write_src() -> None:
+        with wave.open(str(probe_src), "wb") as f:
+            f.setnchannels(nch)
+            f.setsampwidth(2)
+            f.setframerate(48000)
+            f.writeframes((np.clip(current, -1, 1) * 32767).astype("<i2").tobytes())
+
+    for round_idx in range(CERTIFIED_ROUNDS):
+        _write_src()
+        _encode(f"post-fx audio certified encode (round {round_idx + 1})")
+        true_peak_db, frames = _measure()
         if true_peak_db <= CERTIFIED_TARGET_DBTP:
-            probe.replace(certified)
+            probe.replace(certifiedd)
             deps.log(
-                f"  [post-fx] audio certified round {round_idx + 1}: true peak "
+                f"  [post-fx] audio certifiedd round {round_idx + 1}: true peak "
                 f"{true_peak_db:.2f} dBTP <= {CERTIFIED_TARGET_DBTP:g} gate"
             )
-            return certified
+            return certifiedd
 
         over = np.flatnonzero(frames > gate)
         splits = np.where(np.diff(over) > int(0.25 * 48000))[0] + 1
         clusters = np.split(over, splits)
         if len(clusters) > CERTIFIED_MAX_DIPS:
-            overshoots = [float(frames[c].max()) for c in clusters]
+            overshoots = [float(frames[cc].max()) for cc in clusters]
             keep = np.argsort(overshoots)[::-1][:CERTIFIED_MAX_DIPS]
             clusters = [clusters[i] for i in sorted(keep)]
         env = np.ones(current.size, dtype=np.float64)
         worst_db = -120.0
-        for c in clusters:
-            spot_db = 20 * math.log10(float(frames[c].max()) + 1e-9)
+        for cc in clusters:
+            spot_db = 20 * math.log10(float(frames[cc].max()) + 1e-9)
             depth_db = min(CERTIFIED_DIP_MAX_DB, spot_db - CERTIFIED_TARGET_DBTP + 0.8)
             worst_db = max(worst_db, depth_db)
-            center = int(c.mean())
+            center = int(cc.mean())
             a = max(0, center - width // 2)
             b = min(current.size, a + width)
             gain = 10 ** ((-depth_db * dip_shape[: b - a]) / 20.0)
             env[a:b] = np.minimum(env[a:b], gain)
         deps.log(
-            f"  [post-fx] audio certify round {round_idx + 1}: true peak "
+            f"  [post-fx] audio certified round {round_idx + 1}: true peak "
             f"{true_peak_db:.2f} dBTP, {len(clusters)} spot(s) dipped "
             f"(max depth {worst_db:.1f} dB)"
         )
         current = current * env
-    # bounded rounds exhausted: the last encode ships as-is and QA judges it
-    probe.replace(certified)
+    # bounded rounds exhausted: the dips are local but a warm mix keeps
+    # re-blossoming rare frames chaotically. One measured GLOBAL trim
+    # (target minus the measured peak) + a single re-encode holds the
+    # zero-clipping gate instead of shipping a known-hot bitstream.
+    over_gain = 10.0 ** ((CERTIFIED_TARGET_DBTP - true_peak_db) / 20.0)
+    current = (current * over_gain).astype(np.float32)
+    _write_src()
+    _encode("post-fx audio certified global trim encode")
+    true_peak_db, _ = _measure()
+    if true_peak_db <= CERTIFIED_TARGET_DBTP:
+        probe.replace(certifiedd)
+        deps.log(
+            f"  [post-fx] audio certifiedd via global trim: true peak "
+            f"{true_peak_db:.2f} dBTP <= {CERTIFIED_TARGET_DBTP:g} gate"
+        )
+        return certifiedd
+    # the trim encode still landed hot (encoder chaos) — it ships and the
+    # zero-clipping QA gate judges the final file honestly
+    probe.replace(certifiedd)
     deps.log(
-        f"  [post-fx] audio certify: bounded rounds exhausted — true peak "
+        f"  [post-fx] audio certified: bounded rounds exhausted — true peak "
         f"{true_peak_db:.2f} dBTP ships; QA judges the final file"
     )
-    return certified
+    return certifiedd
 
 
 def _measure_snr(wav: Path) -> float | None:
