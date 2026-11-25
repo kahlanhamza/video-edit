@@ -437,3 +437,48 @@ def test_macro_plan_model_bounds():
     first, last = plan.clip_span(SOURCE_DUR)
     assert first is not None and first < SOURCE_DUR * 0.15
     assert last is not None and last > SOURCE_DUR * 0.75
+
+
+def test_execute_refine_false_never_proposes(store):
+    """An authored plan (preflight-clean) must not make a single LLM call.
+
+    Measured live: the refine loop proposed on turn 0 even with every
+    invariant green, and the model call (no transport timeout) pinned an
+    authored-plan tape in epoll_wait across three render windows.
+    """
+    scaffold = _scaffold()
+    toolbox = DirectorToolbox(scaffold, "proj_authored")  # noqa: F841
+    registry = build_director_registry(toolbox)
+    backend = ScriptedChain(_good_plan_json())
+    backend._proposals = []
+    session = DirectorSession(
+        registry, store, "proj_authored", backend, source_duration_s=SOURCE_DUR
+    )
+    plan = parse_macro_plan(_good_plan_json())
+    assert plan is not None
+
+    timeline, report = session.execute(plan, scaffold, refine=False)
+    assert backend.propose_calls == 0
+    assert report.turns == 0
+    ok, failures = invariants_ok(timeline, SOURCE_DUR)
+    assert ok, [f.detail for f in failures]
+    assert report.ok, report.failures
+    comp = report.composition
+    assert comp.raw_segment_count >= 8
+    assert comp.narrator_segment_count >= 9
+
+
+def test_execute_refine_default_still_proposes(store):
+    """The default path keeps the refinement loop (regression guard)."""
+    scaffold = _scaffold()
+    registry = build_director_registry(DirectorToolbox(scaffold, "proj_default"))
+    backend = ScriptedChain(_good_plan_json())
+    backend._proposals = []
+    session = DirectorSession(
+        registry, store, "proj_default", backend, source_duration_s=SOURCE_DUR, max_turns=3
+    )
+    plan = parse_macro_plan(_good_plan_json())
+    assert plan is not None
+    _timeline, report = session.execute(plan, scaffold)
+    assert backend.propose_calls >= 1, "default refine must run the loop"
+    assert report.phase in {"refine", "macro"}

@@ -29,6 +29,7 @@ import warnings
 from collections.abc import Callable
 from typing import Any
 
+import httpx
 from director_os.agent_runtime.agents import AgentRole, ToolStep
 from director_os.agent_runtime.llm import (
     MAX_STEPS_PER_PROPOSAL,
@@ -46,6 +47,17 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import Model
 from pydantic_ai.models.fallback import FallbackModel
+
+
+def _llm_http_client() -> httpx.AsyncClient:
+    """Every model call carries a transport timeout (LLM_TIMEOUT_S, default 90s).
+
+    A provider that accepts the connection but never answers (measured: a dead
+    Gemini key pinned the tape in epoll_wait for 3 windows) must surface as a
+    request failure the refine loop can catch, not an infinite wait.
+    """
+    total = float(os.getenv("LLM_TIMEOUT_S", "90") or 90)
+    return httpx.AsyncClient(timeout=httpx.Timeout(total, connect=15.0))
 
 
 #: structured proposal contract returned by the agent's single output turn
@@ -111,12 +123,16 @@ class PydanticAIBackend:
 
             return OpenAIChatModel(
                 model,  # type: ignore[arg-type]
-                provider=OpenAIProvider(base_url=base_url, api_key=api_key),
+                provider=OpenAIProvider(
+                    base_url=base_url, api_key=api_key, http_client=_llm_http_client()
+                ),
             )
         from pydantic_ai.models.google import GoogleModel
         from pydantic_ai.providers.google import GoogleProvider
 
-        return GoogleModel(model, provider=GoogleProvider(api_key=api_key))
+        return GoogleModel(
+            model, provider=GoogleProvider(api_key=api_key, http_client=_llm_http_client())
+        )
 
     def propose(self, state_summary: str, role: AgentRole) -> list[ToolStep]:
         if self.prompt_char_budget and len(state_summary) > self.prompt_char_budget:

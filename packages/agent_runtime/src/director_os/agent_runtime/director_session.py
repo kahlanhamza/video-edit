@@ -1390,8 +1390,15 @@ class DirectorSession:
         return problems
 
     # ---------------------------------------------------------------- phase B
-    def execute(self, plan: MacroPlan, timeline) -> tuple[Any, DirectorSessionReport]:
-        """Expand the plan act-by-act, then run the refinement loop to target."""
+    def execute(
+        self, plan: MacroPlan, timeline, refine: bool = True
+    ) -> tuple[Any, DirectorSessionReport]:
+        """Expand the plan act-by-act, then run the refinement loop to target.
+
+        `refine=False` (authored plans) applies the plan mechanically and
+        skips the LLM refinement loop entirely — a plan that already passed
+        the pre-flight gases must never make a network call to prove it.
+        """
         report = DirectorSessionReport(ok=False, phase="macro", plan=plan)
         steps = expand_macro_plan(plan, self.source_duration_s)
         run = self.executor.execute_plan(steps, timeline)
@@ -1407,6 +1414,14 @@ class DirectorSession:
 
         report.phase = "refine"
         turns = 0
+        if not refine:
+            report.composition = timeline_composition(timeline)
+            report.failures.extend(
+                f"{f.code}: {f.detail}"
+                for f in audit_invariants(report.composition, self.source_duration_s)
+            )
+            report.ok = not report.failures
+            return timeline, report
         while turns < self.max_turns:
             comp = timeline_composition(timeline)
             failures = audit_invariants(comp, self.source_duration_s)

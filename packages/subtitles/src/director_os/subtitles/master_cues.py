@@ -87,9 +87,13 @@ def build_master_caption_cues(
     from director_os.otio_engine.contract import NarratorClipMeta, RawClipMeta, parse_clip_meta
     from director_os.otio_engine.timeline import is_gap, item_duration_s
 
-    # proofread words carry documentary roles + clean text; fall back to raw ASR
+    # proofread words carry documentary roles + clean text; fall back to raw ASR.
+    # Proofread-masked words (text="", the supervisor's garble decision) STAY in
+    # the stream — they are the caption-truth tag signal and must render as
+    # *inaudible* instead of vanishing (runbook §2.1: tagged, never dropped).
     proof = (transcript or {}).get("proofread") or {}
-    words_src = [w for w in proof.get("words", []) if w.get("text")] or [
+    proof_masked = bool(proof.get("words"))
+    words_src = list(proof.get("words", [])) or [
         w for w in (transcript or {}).get("words", []) if w.get("text")
     ]
     transcript_words: list[dict] = []
@@ -178,7 +182,9 @@ def build_master_caption_cues(
             for w in transcript_words:
                 text = str(w.get("text") or w.get("word") or "").strip()
                 if not text:
-                    continue
+                    if not proof_masked:
+                        continue
+                    text = "*inaudible*"
                 ws, we = float(w.get("start_s", 0.0)), float(w.get("end_s", 0.0))
                 if we <= src0 or ws >= src0 + dur:
                     continue

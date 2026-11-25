@@ -2009,7 +2009,7 @@ def _plan_documentary(
                 f"{plan.raw_count} raw, {plan.narration_count} narration, "
                 f"{plan.total_dur_s:.0f}s"
             )
-            timeline, report = session.execute(plan, scaffold)
+            timeline, report = session.execute(plan, scaffold, refine=(label != "authored_plan"))
             # SALVAGE BEFORE SCRAP: the word-law narration retime + hook order
             # fix are mechanical; throwing the director's program away and
             # shipping the stock fallback for them is how the owner ended up
@@ -3019,7 +3019,14 @@ def run_pipeline(
                 break
             from director_os.worker.review_pass import stage_review
 
-            review = stage_review(final_for_qa, timeline, [], project_id, deps)
+            review = stage_review(
+                final_for_qa,
+                timeline,
+                [],
+                project_id,
+                deps,
+                source_duration_s=_source_duration(deps, asset_id),
+            )
             if review.status != "applied":
                 break
             _persist_timeline_version(
@@ -3172,6 +3179,11 @@ def make_deps(
         "review_pass",
         os.getenv("REVIEW_PASS", "on").strip().lower() not in {"0", "false", "off", "no"},
     )
+    # RENDER_WORKERS env default — one thread pools one ffmpeg encode; 4
+    # parallel lanczos/split graphs breach a 4 GiB memory ceiling and the
+    # OOM killer reaps a worker mid-encode (rc=-9, empty stderr — measured
+    # on the Eustis t2 card segments). 0 = fleet auto-size.
+    overrides.setdefault("max_workers", int(os.getenv("RENDER_WORKERS", "0") or 0) or None)
     return PipelineDeps(
         sessions=make_session_factory(engine),
         settings=resolved,
