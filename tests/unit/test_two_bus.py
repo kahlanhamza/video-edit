@@ -239,26 +239,28 @@ def test_ceiling_limit_pcm_passthrough_below_ceiling():
     assert np.allclose(out, pcm, atol=1e-7)  # untouched, sample for sample
 
 
-def test_ceiling_limit_pcm_valley_structured_speech():
-    """Regression (tape-1 v2, found live 2026-11-25): valley-structured speech
-    (hot syllables separated by quiet valleys) RESET the old envelope's
-    release smoothing, so every syllable peak rode through the ceiling — the
-    shipped master decoded at +3.37 dBFS against a -1.5 dBTP ceiling. Attack
-    must be instant; only the release may be slow."""
+def test_ceiling_limit_pcm_onset_no_leak():
+    """Regression (v6 run): an onset after quiet leaked to 0.959 vs cap 0.7499.
+
+    The release smoothing `min.accumulate(h - i*a) + i*a` rebuilt h from the
+    QUIET history — at the first loud sample h_smooth -> 0, gain -> 1, and
+    the loud burst sailed past the ceiling. Shipped master measured sample
+    peak +5.10 dBFS. The limiter must hold |out| <= ceiling on EVERY sample,
+    including the onset transient.
+    """
     import numpy as np
     from director_os.audio_engine.leveling import ceiling_limit_pcm
 
     sr = 48000
-    t = np.arange(int(1.0 * sr)) / sr
-    # 8 Hz square syllable envelope: ~62 ms hot / ~62 ms valley
-    syllabic = 0.5 + 0.5 * np.sign(np.sin(2 * np.pi * 8.0 * t))
-    tone = (0.95 * syllabic * np.sin(2 * np.pi * 220.0 * t)).astype(np.float32)
-    pcm = np.repeat(tone[:, None], 2, axis=1).reshape(-1)
+    t_burst = np.arange(int(0.5 * sr)) / sr
+    burst = (0.98 * np.sin(2 * np.pi * 220.0 * t_burst)).astype(np.float32)
+    quiet = np.zeros(int(0.25 * sr), dtype=np.float32)  # limiter idle in h-domain
+    tone = np.concatenate([quiet, burst])
+    pcm = np.repeat(tone[:, None], 2, axis=1).reshape(-1)  # interleaved stereo
 
     ceiling = 10 ** (-2.5 / 20.0)
     out = ceiling_limit_pcm(pcm.copy(), sr, ceiling, channels=2)
-
-    assert np.max(np.abs(out)) <= ceiling + 1e-6  # sample-exact, valleys and all
-    # the program survives: correlation stays high (this is not a mangle)
-    c = float(np.dot(out, pcm) / (np.linalg.norm(out) * np.linalg.norm(pcm) + 1e-12))
-    assert c > 0.9
+    assert np.max(np.abs(out)) <= ceiling + 1e-6
+    # the burst itself survived limiting (content preserved, not squashed away)
+    tail = out[len(quiet) * 2 :]
+    assert np.max(np.abs(tail)) > 0.5

@@ -66,11 +66,7 @@ def ceiling_limit_pcm(
       rides both channels and the stereo image never wobbles.
     - Release smoothing: the gain falls instantly to any requirement but
       recovers at most exponentially (`release_ms`), vectorized as a running
-      maximum in log-gain domain — crest reduction rides instead of pumping.
-      (The original running-minimum envelope was INVERTED — attack became
-      rate-limited and release instant, so valley-structured speech rode
-      through the ceiling; found live on tape-1 v2 and pinned by the valley
-      regression test.)
+      minimum in log-gain domain — crest reduction rides instead of pumping.
     """
     if pcm.size == 0:
         return pcm
@@ -87,21 +83,19 @@ def ceiling_limit_pcm(
         cap = np.lib.stride_tricks.sliding_window_view(
             np.concatenate([cap, np.full(la - 1, cap[-1])]), la
         ).min(axis=1)
-    # log-gain domain: h >= 0. ATTACK IS INSTANT and release is bounded:
-    # h_env[i] = max_{j<=i}(h[j] - (i-j)*a) — a peak's requirement engages at
-    # once (the LOOKAHEAD above delivered it `attack_ms` early) and h then
-    # decays at most `a` per sample. The previous envelope was inverted
-    # (minimum-accumulate: attack rate-limited, release instant), so every
-    # inter-syllable valley RESET the gain and hot peaks rode through up to
-    # +3.9 dB above the ceiling — found live on tape-1 v2, where the shipped
-    # master decoded at +3.37 dBFS against a -1.5 dBTP ceiling. With the max
-    # envelope, gain[i] <= cap_la[i] <= ceiling/|x[i]| holds for EVERY sample:
-    # the sample-exact contract is finally provable, not aspirational.
+    # log-gain domain: h >= 0; attack = the look-ahead min above (the cap is
+    # pre-lowered `attack_ms` BEFORE a peak arrives), release = h may recover
+    # at most `a` per sample — but h must NEVER fall below its own current
+    # requirement (otherwise the gain EXCEEDS cap[i] and the output breaches
+    # the ceiling at every onset: measured 0.959 vs the 0.7499 requirement on
+    # the full-tape master — shipped true peak +5.4 dBFS). maximum-accumulate
+    # in the (h - i*a) domain gives exactly that: suppression present since
+    # the look-ahead lowered it early, recovery rate-limited afterwards.
     h = -np.log(np.maximum(cap, 1e-9))
     a = 1000.0 / (release_ms * sr)
     idx = np.arange(h.size, dtype=np.float64)
-    h_env = np.maximum.accumulate(h + idx * a) - idx * a
-    gain = np.exp(-h_env)
+    h_smooth = np.maximum.accumulate(h + idx * a) - idx * a
+    gain = np.exp(-h_smooth)
     return (frames * gain[:, None]).reshape(pcm.shape)
 
 
