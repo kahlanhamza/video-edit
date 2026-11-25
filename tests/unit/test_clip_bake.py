@@ -219,3 +219,62 @@ def test_card_items_do_not_break_clip_sources(tmp_path):
         clip_sources={"a1@0.000+2.000": str(raw)},
     )
     assert len(dag.segments) == 1
+
+
+def test_baked_clip_slices_clip_local_not_absolute(tmp_path):
+    """A baked clip starts at 0:00 — the segment must cut it at 0, not at the
+    clip's absolute source offset. The absolute offset sliced into a clip-local
+    file reads past EOF: ffmpeg RC=0 with an AUDIO-ONLY chunk (no video packets)
+    -> SegmentCacheError 'chunk has no video stream' (Eustis full-tape render)."""
+    timeline = _timeline("a1", [(192.0, 33.67)])
+    raw = tmp_path / "raw.mp4"
+    raw.write_bytes(b"not-a-real-video")
+    baked = tmp_path / "baked.mp4"
+    baked.write_bytes(b"baked")
+    cache = SegmentCache(tmp_path / "cache")
+    dag = compile_timeline(
+        timeline,
+        assets={"a1": str(raw)},
+        cache=cache,
+        out_dir=tmp_path / "render",
+        clip_sources={"a1@192.000+33.670": str(baked)},
+        clip_source_digests={"a1@192.000+33.670": "d1@192.000+33.670"},
+    )
+    seg = dag.segments[0]
+    assert seg.src_path == str(baked)
+    assert seg.spec.source_start_s == 0.0
+
+
+def test_raw_fallback_keeps_absolute_offset(tmp_path):
+    """A clip whose bake failed degrades to the RAW asset — absolute offset."""
+    timeline = _timeline("a1", [(192.0, 33.67)])
+    raw = tmp_path / "raw.mp4"
+    raw.write_bytes(b"not-a-real-video")
+    cache = SegmentCache(tmp_path / "cache")
+    dag = compile_timeline(
+        timeline, assets={"a1": str(raw)}, cache=cache, out_dir=tmp_path / "render"
+    )
+    assert dag.segments[0].src_path == str(raw)
+    assert dag.segments[0].spec.source_start_s == 192.0
+
+
+def test_two_bus_wav_slices_asset_clock_while_video_is_clip_local():
+    """enhanced_audio_start_s keeps the 2-bus WAV on the ASSET clock while the
+    video cuts from clip-local baked footage at 0:00."""
+    spec = SegmentRenderSpec(
+        kind="raw",
+        source_start_s=0.0,
+        source_dur_s=10.0,
+        enhanced_audio_path="/tmp/master_2bus.wav",
+        enhanced_audio_start_s=192.0,
+    )
+    from director_os.otio_engine.renderer import build_segment_cmd
+
+    cmd = build_segment_cmd(spec, "/tmp/raw.webm", "/tmp/out.mp4")
+    # exact slicing follows (-ss a -t b) -i <file>: the slice before the WAV
+    # input must be the ASSET-clock start while the video input cuts at 0:00
+    wav_idx = cmd.index("/tmp/master_2bus.wav")
+    assert cmd[wav_idx - 5] == "-ss"
+    assert float(cmd[wav_idx - 4]) == 192.0
+    assert cmd[wav_idx - 11] == "-ss"
+    assert float(cmd[wav_idx - 10]) == 0.0
