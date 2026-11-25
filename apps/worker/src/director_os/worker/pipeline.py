@@ -3179,6 +3179,11 @@ def make_deps(
         "review_pass",
         os.getenv("REVIEW_PASS", "on").strip().lower() not in {"0", "false", "off", "no"},
     )
+    # RENDER_WORKERS env default — one thread pools one ffmpeg encode; 4
+    # parallel lanczos/split graphs breach a 4 GiB memory ceiling and the
+    # OOM killer reaps a worker mid-encode (rc=-9, empty stderr — measured
+    # on the Eustis t2 card segments). 0 = fleet auto-size.
+    overrides.setdefault("max_workers", int(os.getenv("RENDER_WORKERS", "0") or 0) or None)
     return PipelineDeps(
         sessions=make_session_factory(engine),
         settings=resolved,
