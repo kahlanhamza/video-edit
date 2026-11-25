@@ -174,9 +174,13 @@ def finalize(master: Path, ass: Path | None, out: Path, corner: str) -> Path:
         "20",
         "-c:a",
         "copy",
-        str(out),
+        str(out.with_name(out.stem + ".tmp" + out.suffix)),
     ]
+    # the burn must land atomically: a SIGKILL (560s window edge) on a
+    # tmp-named file leaves the real candidate absent, never a truncated
+    # "already burned" final (measured trap)
     subprocess.run(argv, check=True, capture_output=True)
+    os.replace(out.with_name(out.stem + ".tmp" + out.suffix), out)
     return out
 
 
