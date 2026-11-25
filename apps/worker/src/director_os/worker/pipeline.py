@@ -2950,10 +2950,10 @@ def make_deps(
     **overrides: Any,
 ) -> PipelineDeps:
     engine = make_engine(database_url)
-    # import BEFORE create_all: credentials.py maps its tables onto the SAME
-    # Base — a fresh DB crashes `no such table: settings_meta` if create_all
-    # runs before the mapped classes exist (the first-call bug seen live)
-    from director_os.core.credentials import apply_credentials_to_settings
+    # import credentials BEFORE create_all — SettingsMetaRow registers itself
+    # on the shared Base at import time; importing it after init_models left
+    # fresh production databases without the settings_meta table
+    from director_os.core.credentials import apply_credentials_to_settings  # noqa: F401
 
     init_models(engine)
     if settings is None:

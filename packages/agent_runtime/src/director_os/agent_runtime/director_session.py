@@ -608,6 +608,30 @@ def _clip_pieces(
     return [(a, b - a) for a, b in runs if b > a]
 
 
+def enforce_raw_budget(plan: MacroPlan, source_duration_s: float) -> tuple[MacroPlan, float]:
+    """The word-count law for raw windows: an inflated LLM raw total buys nothing.
+
+    The doc_scale raw budget (target_hi * 0.7) is the planning law. Free-tier
+    models routinely ignore it — tape-1's best Phase A attempt authored 1336s
+    of raw for a 933s tape (narration ratio 0.18, a physically impossible
+    master). The model's SELECTION (which windows, in what order) is
+    respected; only the lengths rescale proportionally to fit the budget.
+    Returns (plan', raw_total_after_scaling).
+    """
+    scale = doc_scale(source_duration_s)
+    budget = scale.target_hi * 0.7
+    raws = [b for a in plan.acts for b in a.blocks if isinstance(b, PlanRawClip)]
+    raw_total = sum(b.dur_s for b in raws)
+    if raw_total <= budget or raw_total <= 0:
+        return plan, raw_total
+    factor = budget / raw_total
+    for act in plan.acts:
+        for blk in act.blocks:
+            if isinstance(blk, PlanRawClip):
+                blk.dur_s = round(max(4.0, blk.dur_s * factor), 2)
+    return plan, sum(b.dur_s for a in plan.acts for b in a.blocks if isinstance(b, PlanRawClip))
+
+
 def snap_plan_to_speech(
     plan: MacroPlan, transcript: dict | None, source_duration_s: float
 ) -> tuple[MacroPlan, int]:
@@ -1114,9 +1138,14 @@ class DirectorSession:
                 # transient: empty 200s, gateway 502s, socket resets)
                 time.sleep(min(8.0, 1.5 * (2 ** min(_attempt - 1, 3))))
             try:
+                # the notebook's token law (16k): a 12-15min documentary plan is
+                # a multi-KB JSON payload — the 4096 default made free-tier
+                # reasoning models burn the whole budget on prose and ship an
+                # empty or truncated body (the tape-1 Phase A failure class)
                 text = self.backend.complete_json(
                     system,
                     user + (f"\n\n## Previous attempt failed\n{feedback}" if feedback else ""),
+                    max_tokens=16384,
                 )
             except LLMBackendError as e:
                 # transport/provider failure — retryable, and the operator log
@@ -1126,6 +1155,7 @@ class DirectorSession:
             try:
                 plan = parse_macro_plan(text)
                 plan, _pieces = snap_plan_to_speech(plan, self.transcript, self.source_duration_s)
+                plan, _raw_total = enforce_raw_budget(plan, self.source_duration_s)
                 problems = self._plan_problems(plan)
                 if problems:
                     feedback = "; ".join(problems)

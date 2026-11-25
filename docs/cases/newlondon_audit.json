@@ -1,0 +1,87 @@
+{
+  "subject_name": "Lt. Joshua Bergeson",
+  "age": null,
+  "role_or_agency": "New London Police Department, Connecticut",
+  "incident_datetime": "August 20, 2022",
+  "location": "New London police station parking lot, New London, Connecticut",
+  "inciting_reason": "Self-described first amendment auditor Daniel Kokoszka (YouTube channel 'Constitution State') filmed at the police station parking lot; three separate officer encounters were recorded",
+  "key_facts": [
+    {
+      "fact": "The city released the body camera footage from multiple officers together with its internal investigation in response to a Freedom of Information request from The Day, New London's daily newspaper.",
+      "date": "2023-04-08",
+      "source_id": "theday_512768",
+      "citation": "The Day, 'First Amendment audit leads to suspension of New London cop' (Apr 8, 2023)"
+    },
+    {
+      "fact": "The body camera footage shows Lt. Joshua Bergeson blocking and pushing auditor Daniel Kokoszka in an attempt to force him to leave the parking lot.",
+      "date": "2022-08-20",
+      "source_id": "theday_512768",
+      "citation": "The Day (Apr 8, 2023)"
+    },
+    {
+      "fact": "The internal investigation concluded with an eight-day suspension and mandated retraining for Lt. Bergeson.",
+      "date": "2023-04-08",
+      "source_id": "theday_512768",
+      "citation": "The Day (Apr 8, 2023)"
+    },
+    {
+      "fact": "Bergeson was cited for violating department policy on 'respect and courtesy,' 'conduct unbecoming an officer,' and 'use of force reporting.'",
+      "date": "2023-04-08",
+      "source_id": "police1_audit",
+      "citation": "Police1, 'First Amendment audit leads to suspension of Conn. officer'"
+    },
+    {
+      "fact": "State's Attorney Paul Narducci determined there were no violations of criminal statutes in the encounter.",
+      "date": "2023-04-08",
+      "source_id": "police1_audit",
+      "citation": "Police1 (Apr 2023)"
+    },
+    {
+      "fact": "Complaints against Sgt. Ryan Linderson, Ofc. Michael Lewis, Ofc. Eric Sadowski, and Lt. Lawrence Keating were found unfounded.",
+      "date": "2023-04-08",
+      "source_id": "police1_audit",
+      "citation": "Police1 (Apr 2023)"
+    },
+    {
+      "fact": "The local police union filed a grievance seeking to overturn Bergeson's suspension.",
+      "date": "2023-04-08",
+      "source_id": "theday_512768",
+      "citation": "The Day (Apr 8, 2023)"
+    },
+    {
+      "fact": "On July 6, 2021, Police Chief Brian Wright sent a memo to officers about First Amendment rights.",
+      "date": "2021-07-06",
+      "source_id": "theday_512768",
+      "citation": "The Day (Apr 8, 2023)"
+    },
+    {
+      "fact": "Bergeson had previously been fired in 2011 for absenteeism and was rehired a year later.",
+      "date": null,
+      "source_id": "police1_audit",
+      "citation": "Police1 (Apr 2023)"
+    }
+  ],
+  "charges": [],
+  "test_results": [],
+  "verdict_outcome": "Administrative discipline, verified: eight-day suspension and mandated retraining for Lt. Joshua Bergeson following the city's internal investigation; the State's Attorney found no criminal violations; the police union filed a grievance seeking to overturn the suspension. No criminal charges were filed.",
+  "sources": [
+    {
+      "source_id": "theday_512768",
+      "kind": "url",
+      "label": "The Day — First Amendment audit leads to suspension of New London cop",
+      "citation": "theday.com/news/512768 (Apr 8, 2023)"
+    },
+    {
+      "source_id": "police1_audit",
+      "kind": "url",
+      "label": "Police1 — First Amendment audit leads to suspension of Conn. officer",
+      "citation": "police1.com (Apr 2023)"
+    },
+    {
+      "source_id": "raw_tape",
+      "kind": "video",
+      "label": "The Day official release — 'New London Police Department confront self-described First Amendment auditor' (933s, YouTube @thedayct, n1nyMucJRwI)",
+      "citation": "YouTube oEmbed metadata + The Day article"
+    }
+  ]
+}

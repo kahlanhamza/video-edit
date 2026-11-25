@@ -688,3 +688,32 @@ def test_groq_dead_key_403_fails_over_to_openrouter():
     steps = chain.propose("state", "director")
     assert [s.tool for s in steps] == ["timeline.split_clip"]
     assert chain.active.model == "nvidia/nemotron-3-ultra-550b-a55b:free"
+
+
+def test_gemini_geo_block_fails_over_to_openrouter():
+    """Tape-1 wire fact 2026-11-25: the Gemini tier raises 'geo-blocked from
+    this region' (a 403 egress condition, no status code in the message) —
+    the chain must treat it as capacity and walk to the OpenRouter tier,
+    never kill the Director (the 251s fallback-narration root cause)."""
+
+    class GeoBlockedGemini:
+        provider = "gemini"
+        model = "gemini-3.5-flash-lite"
+
+        def complete_json(self, system, user, max_tokens=4096):
+            raise LLMBackendError(
+                "gemini complete_json exhausted fallbacks: Gemini geo-blocked "
+                "from this region and MODAL_TOKEN_ID/SECRET not configured for fleet egress"
+            )
+
+    class Ok:
+        provider = "openai_compat"
+        model = "nvidia/nemotron-3-ultra-550b-a55b:free"
+
+        def complete_json(self, system, user, max_tokens=4096):
+            return '{"ok":true}'
+
+    chain = FailoverBackend([GeoBlockedGemini(), Ok()])
+    out = chain.complete_json("system", "user")
+    assert out == '{"ok":true}'
+    assert chain.active.model == "nvidia/nemotron-3-ultra-550b-a55b:free"

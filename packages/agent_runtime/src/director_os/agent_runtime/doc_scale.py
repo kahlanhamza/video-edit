@@ -108,14 +108,25 @@ def doc_scale(source_duration_s: float) -> DocScale:
             min_coverage_span=0.0,
             hook_law=False,
         )
-    # --- keep-ratio law: 28-40% of the raw tape, clamped to sane absolutes
-    target_lo = _clamp(src * 0.28, MASTER_MIN_S, MASTER_MAX_S)
-    target_hi = _clamp(src * 0.35, MASTER_MIN_S + 15.0, MASTER_MAX_S)
+    # --- keep-ratio law (the niche skill's editorial contract, owner-ratified
+    # 2026-11-25 after the 251s tape-1 rejection): sub-25-min sources keep
+    # 50-65% of the raw tape (a 15.5-min audit release is a ~8-10 min
+    # documentary, never a 4-min clip reel); sources >= 25 min plan in the
+    # 720-900s long-form band (the Eustis acceptance numbers, preserved
+    # exactly: 2627s -> [735.6, 900]).
+    if src >= 1500.0:
+        target_lo = _clamp(max(src * 0.28, 720.0), MASTER_MIN_S, MASTER_MAX_S)
+        target_hi = _clamp(max(src * 0.35, target_lo + 15.0), MASTER_MIN_S + 15.0, MASTER_MAX_S)
+    else:
+        target_lo = _clamp(max(src * 0.28, src * 0.50), MASTER_MIN_S, MASTER_MAX_S)
+        target_hi = _clamp(
+            max(src * 0.35, src * 0.65, target_lo + 15.0), MASTER_MIN_S + 15.0, MASTER_MAX_S
+        )
     min_final = _clamp(src * 0.25, 60.0, 600.0)
     act_max = 6
     act_min = _clamp_i(round(target_lo / 100), 3, act_max)
-    narr_lo = _clamp_i(round(target_lo / 70), 4, 10)
-    narr_hi = _clamp_i(round(target_hi / 60), narr_lo + 2, 14)
+    narr_lo = _clamp_i(round(target_lo / 50), 4, 10)
+    narr_hi = _clamp_i(round(target_hi / 45), narr_lo + 2, 14)
     raw_min = _clamp_i(round(target_lo / 75), 3, 8)
     raw_max = _clamp_i(raw_min + 10, 10, 18)
     clip_max_s = _clamp(round(target_lo / 12), 25.0, 55.0)

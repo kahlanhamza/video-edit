@@ -97,6 +97,10 @@ _CAPACITY_ERROR_MARKERS = (
     "403",
     "unauthorized",
     "forbidden",
+    # regional egress block (Google AI Studio 403 "geo-blocked from this
+    # region") — an availability condition, not a contract bug: the tier
+    # must hand over to the next one (owner directive 2026-11-25, tape 1)
+    "geo-block",
 )
 
 

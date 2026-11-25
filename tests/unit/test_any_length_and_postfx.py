@@ -54,11 +54,19 @@ def test_doc_scale_preserves_the_eustis_law_exactly():
 
 
 def test_doc_scale_adapts_to_any_length():
-    short = doc_scale(900.0)  # 15-min tape: ~4-5 min doc, NOT the 10-min law
-    assert 240 <= short.target_lo <= 270
+    # owner-ratified 2026-11-25 (the 251s tape-1 rejection): sub-25-min
+    # sources keep 50-65% of the raw tape — a 15-min tape is a ~8-10 min doc
+    short = doc_scale(900.0)
+    assert 450 <= short.target_lo <= 470
+    assert 570 <= short.target_hi <= 600
     assert short.min_final_s == 225.0
-    assert short.narr_lo == 4 and short.raw_min == 3
+    assert short.narr_lo == 9 and short.raw_min == 6
     assert short.hook_law  # the hook is not a long-video rule
+
+    tape1 = doc_scale(932.88)  # New London release: ~8-10 min documentary
+    assert 460 <= tape1.target_lo <= 475
+    assert 595 <= tape1.target_hi <= 615
+    assert tape1.narr_lo == 9 and tape1.narr_hi == 13
 
     tiny = doc_scale(480.0)  # 8-min tape still gets the documentary treatment
     assert tiny.is_documentary and tiny.target_lo >= 120
@@ -76,15 +84,16 @@ def test_doc_scale_adapts_to_any_length():
 
 
 def test_invariants_scale_down_for_a_15_minute_tape():
-    # sting + hook + 5 narration blocks + 5 raws spread across a 15-min tape
+    # sting + hook + 9 narration blocks + 6 raws spread across a 15-min tape
+    # (the 50-65% keep law, owner-ratified 2026-11-25)
     raws = [
         ClipSpec(
             name=f"raw{i}",
             source_start_s=60.0 + i * 140.0,
-            dur_s=25.0,
+            dur_s=40.0,
             meta=RawClipMeta(asset_id="a"),
         )
-        for i in range(5)
+        for i in range(6)
     ]
     narrs = [
         ClipSpec(
@@ -93,7 +102,7 @@ def test_invariants_scale_down_for_a_15_minute_tape():
             dur_s=22.0,
             meta=NarratorClipMeta(script_text="y" * 200),
         )
-        for i in range(5)
+        for i in range(9)
     ]
     master = [
         ClipSpec(name="sting", source_start_s=0.0, dur_s=3.5, meta=RawClipMeta(asset_id="a")),
@@ -104,8 +113,10 @@ def test_invariants_scale_down_for_a_15_minute_tape():
             meta=NarratorClipMeta(script_text="x" * 200),
         ),
     ]
-    for n, r in zip(narrs, raws, strict=True):
-        master.extend([n, r])
+    for i, n in enumerate(narrs):
+        master.append(n)
+        if i < len(raws):
+            master.append(raws[i])
     spec = TimelineSpec(
         name="short-doc",
         fps=30,
@@ -118,8 +129,9 @@ def test_invariants_scale_down_for_a_15_minute_tape():
     )
     timeline = build_timeline(spec)
     ok, failures = invariants_ok(timeline, 900.0)
-    # a ~4.4-min doc from a 15-min tape with 6 narration blocks + 5 raws is a
-    # VALID short documentary — the 43-min floors must not apply
+    # a ~3.9-min doc (above the 225s floor) from a 15-min tape with 10
+    # narration blocks + 6 raws is a VALID short doc — the 43-min floors
+    # must not apply
     assert ok, [f.detail for f in failures]
     # ... and the SAME shape against a 43-min tape MUST fail (floors scale up)
     ok2, failures2 = invariants_ok(timeline, 2627.0)
