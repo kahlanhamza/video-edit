@@ -2619,7 +2619,7 @@ def master_clock_speech_intervals(
     if include_narration_blocks:
         seen = set()
         for m0, src0, dur in maps:
-            if (m0, dur) not in seen:
+            if src0 == m0 and (m0, dur) not in seen:
                 seen.add((m0, dur))
                 narration_master_windows.append((m0, m0 + dur))
         remapped.extend(narration_master_windows)
