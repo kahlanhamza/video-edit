@@ -703,7 +703,7 @@ def _leveling_pass(enhanced: Path, timeline, enhance_info, work: Path, report, d
         duck_w[a:b] = 1.0
     k = np.hanning(int(0.05 * sr) * 2 + 1)
     k /= k.sum()
-    duck_w = np.convolve(duck_w, k, mode="same")
+    duck_w = np.convolve(duck_w.astype(np.float64), k, mode="same").astype(np.float32)
     duck_gain = (10 ** (-14.0 / 20.0)) + (1.0 - 10 ** (-14.0 / 20.0)) * duck_w
 
     gain_total = 0.0
@@ -764,7 +764,7 @@ CERTIFIED_DIP_MAX_DB = 8.0
 CERTIFIED_MAX_DIPS = 80
 
 
-def _certify_audio(shaped: np.ndarray, work: Path, deps) -> Path:
+def _certify_audio(shaped: np.ndarray | Path, work: Path, deps) -> Path:
     """Encode the shaped mix ONCE, dip over-gate spots, re-encode until the
     standalone encode's true peak holds the zero-clipping gate, and return
     the CERTIFIED m4a. The mux then copies it (-c:a copy) — the shipped
@@ -773,7 +773,7 @@ def _certify_audio(shaped: np.ndarray, work: Path, deps) -> Path:
     import math
     import wave
 
-    from director_os.audio_engine.leveling import decode_pcm_channels
+    from director_os.audio_engine.leveling import decode_pcm_channels, decode_pcm_mono
 
     certified = work / "master_audio.certified.m4a"
     probe = work / "ring_probe.m4a"
@@ -783,7 +783,11 @@ def _certify_audio(shaped: np.ndarray, work: Path, deps) -> Path:
     t = np.linspace(-1.0, 1.0, width, endpoint=False)
     dip_shape = 0.5 * (1.0 + np.cos(np.pi * t))  # 1 at center -> 0 at edges
 
-    current = shaped
+    if isinstance(shaped, Path):
+        # the no-spans skip path hands over the extracted mix itself
+        current = decode_pcm_mono(shaped)
+    else:
+        current = shaped
     for round_idx in range(CERTIFIED_ROUNDS):
         with wave.open(str(probe_src), "wb") as f:
             f.setnchannels(1)
@@ -830,7 +834,7 @@ def _certify_audio(shaped: np.ndarray, work: Path, deps) -> Path:
             overshoots = [float(frames[c].max()) for c in clusters]
             keep = np.argsort(overshoots)[::-1][:CERTIFIED_MAX_DIPS]
             clusters = [clusters[i] for i in sorted(keep)]
-        env = np.ones(current.size, dtype=np.float32)
+        env = np.ones(current.size, dtype=np.float64)
         worst_db = -120.0
         for c in clusters:
             spot_db = 20 * math.log10(float(frames[c].max()) + 1e-9)

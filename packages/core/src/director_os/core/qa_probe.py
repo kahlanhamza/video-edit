@@ -228,11 +228,6 @@ class AudioVerification(BaseModel):
     max_delta_noise_db: float = -8.0
     min_snr_improvement_db: float = 6.0
     max_peak_dbtp: float = -1.0
-    # RAW-CLOCK speech windows for the raw reference (full-tape runway):
-    # the final master is a kept-band cut on the MASTER clock — its windows
-    # point at different tape regions. None -> speech_intervals serve both
-    # (source == master clock, the legacy 1:1 render).
-    raw_clock_speech_intervals: list[tuple[float, float]] | None = None
 
 
 def audit_technical(
@@ -464,6 +459,7 @@ def _audio_verification_checks(
     )
 
     clean_spans = snr_speech_intervals if snr_speech_intervals is not None else speech_intervals
+    dialogue_spans = speech_intervals if speech_intervals is not None else []
     if clean_spans:
         try:
             raw_spans = (
@@ -498,7 +494,7 @@ def _audio_verification_checks(
             checks.append(AuditCheck(name="snr_verification", ok=False, detail=str(e)))
 
         try:
-            tilts = speech_band_tilts(str(path), speech_intervals)
+            tilts = speech_band_tilts(str(path), dialogue_spans)
             ok, tdetail = timbre_gate(tilts)
             checks.append(
                 AuditCheck(
@@ -516,7 +512,7 @@ def _audio_verification_checks(
             checks.append(AuditCheck(name="timbre_not_muffled", ok=False, detail=str(e)))
 
         try:
-            crest = speech_crest_db(str(path), speech_intervals)
+            crest = speech_crest_db(str(path), dialogue_spans)
             ok, ddetail = natural_dynamics_gate(crest)
             checks.append(
                 AuditCheck(

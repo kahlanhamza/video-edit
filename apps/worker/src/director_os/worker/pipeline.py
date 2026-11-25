@@ -2400,7 +2400,8 @@ def stage_qa(
     truncated `eustis_llm_directed_master.mp4` can never ship.
     """
     audio_verification = None
-    speech_intervals = None
+    speech_intervals: list[tuple[float, float]] | None = None
+    program_speech_intervals: list[tuple[float, float]] | None = None
     if enhance_info is not None:
         from director_os.core.qa_probe import AudioVerification
 
