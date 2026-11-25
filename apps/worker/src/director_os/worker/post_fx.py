@@ -980,6 +980,18 @@ def _certify_audio(shaped: np.ndarray | str | Path, work: Path, deps) -> Path:
     # trim corrects in the DECODE domain - it measures the error the
     # decoder itself reports and cancels it exactly, which converges
     # where a sample-domain trim bloomed +3.5 dB over its own input peak
+    # entering the trim ladder bumps the checkpoint to ROUNDS: a re-entry
+    # skips the dip rounds entirely and continues the trims from the last
+    # measured probe (the probe file is part of the resume state).
+    tmp_state = work / "certify_state.tmp.npz"
+    np.savez(
+        str(tmp_state),
+        current=np.ascontiguousarray(current, dtype=np.float32),
+        nch=nch,
+        round=CERTIFIED_ROUNDS,
+        fp=fingerprint,
+    )
+    tmp_state.replace(state)
     # (measured tape-1 v3: wav -1.79 dBFS -> encode +2.74 dBTP).
     for trim_idx in range(CERTIFIED_ROUNDS):
         decoded, _ = decode_pcm_channels(str(probe))
