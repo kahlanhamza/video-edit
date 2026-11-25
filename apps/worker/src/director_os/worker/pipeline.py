@@ -2009,7 +2009,7 @@ def _plan_documentary(
                 f"{plan.raw_count} raw, {plan.narration_count} narration, "
                 f"{plan.total_dur_s:.0f}s"
             )
-            timeline, report = session.execute(plan, scaffold)
+            timeline, report = session.execute(plan, scaffold, refine=(label != "authored_plan"))
             # SALVAGE BEFORE SCRAP: the word-law narration retime + hook order
             # fix are mechanical; throwing the director's program away and
             # shipping the stock fallback for them is how the owner ended up
