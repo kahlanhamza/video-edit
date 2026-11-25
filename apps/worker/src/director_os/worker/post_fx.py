@@ -980,6 +980,21 @@ def _certify_audio(shaped: np.ndarray | str | Path, work: Path, deps) -> Path:
     # trim corrects in the DECODE domain - it measures the error the
     # decoder itself reports and cancels it exactly, which converges
     # where a sample-domain trim bloomed +3.5 dB over its own input peak
+    # prime the measurement: a trim-ladder re-entry (adopted ROUNDS
+    # checkpoint) never ran a dip round, so the peak comes from the last
+    # probe on disk; with no probe at all, one encode establishes it.
+    if "true_peak_db" not in locals():
+        rebuilt = True
+        if probe.exists():
+            try:
+                true_peak_db, _ = _measure()
+                rebuilt = False
+            except Exception:
+                pass
+        if rebuilt:
+            _write_src()
+            _encode("post-fx audio certified probe rebuild")
+            true_peak_db, _ = _measure()
     # entering the trim ladder bumps the checkpoint to ROUNDS: a re-entry
     # skips the dip rounds entirely and continues the trims from the last
     # measured probe (the probe file is part of the resume state).
