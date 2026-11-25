@@ -1,11 +1,14 @@
 """Content safety law — the benign-footage gate (ADR-0013, owner directive 2026-11-24).
 
-The channel ships only benign incident categories (shoplifting, trespassing,
-first-amendment audits); extreme violence and gunfire are vetoed at plan
-time, before any clip is cut. Pinned here: the case gate refuses off-menu
-cases (the old OWI/DUI launch picks would be refused today), transcript
-windows carrying violent markers are excluded from raw-clip candidates, and
-seed ranges from a previous LLM plan are trimmed off veto ranges too.
+The channel ships only benign incident categories: shoplifting, trespassing,
+first-amendment audits, and DUI/OWI stops — the owner directive of
+2026-11-25 widened the niche to escalated-situation incident docs (the veto
+law stands: extreme violence and gunfire never ship, at plan time, before
+any clip is cut). Pinned here:
+the case gate refuses off-menu cases (crashes, pursuits, standoffs), DUI/OWI
+benign stops are on-menu, transcript windows carrying violent markers are
+excluded from raw-clip candidates, and seed ranges from a previous LLM plan
+are trimmed off veto ranges too.
 """
 
 from __future__ import annotations
@@ -32,6 +35,9 @@ from director_os.agent_runtime.fallback_cut import plan_fallback_blocks
         "she was banned from the property and would not leave",
         "first amendment audit of the police station lobby",
         "auditor recording the police in public",
+        "Eustis PD arrests Apopka officer Oscar Mayorga for DUI in his marked patrol car",
+        "OWI stop: arrested on suspicion of driving under the influence",
+        "field sobriety test shows the driver at 0.391 breath alcohol",
     ],
 )
 def test_on_menu_categories_are_allowed(facts: str):
@@ -44,10 +50,9 @@ def test_on_menu_categories_are_allowed(facts: str):
 @pytest.mark.parametrize(
     "facts",
     [
-        "OWI stop: impaired driving on the freeway, field sobriety test",
-        "DUI arrest after the crash investigation",
         "high-speed pursuit of a stolen vehicle ended in a PIT maneuver",
         "welfare check on an intoxicated man",
+        "one vehicle off the road into a ditch, no enforcement action",
     ],
 )
 def test_off_menu_cases_are_refused_in_strict_mode(facts: str):
@@ -90,7 +95,7 @@ def test_veto_only_mode_allows_off_menu_cases(monkeypatch: pytest.MonkeyPatch):
 
 def test_unknown_mode_env_falls_back_to_strict(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("CONTENT_POLICY_MODE", "banana")
-    verdict = evaluate_case("OWI stop, impaired driving")
+    verdict = evaluate_case("welfare check on an intoxicated man")
     assert not verdict.allowed
 
 
@@ -185,7 +190,9 @@ def _clean_transcript() -> dict:
 
 def test_planner_refuses_violent_case_facts():
     with pytest.raises(ContentPolicyError):
-        plan_fallback_blocks(2700.0, {"words": []}, case_facts="OWI impaired driving stop")
+        plan_fallback_blocks(
+            2700.0, {"words": []}, case_facts="welfare check on an intoxicated man"
+        )
 
 
 def test_planner_refuses_off_menu_case_facts():

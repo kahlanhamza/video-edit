@@ -1,0 +1,56 @@
+{
+  "subject_name": "Oscar Mayorga",
+  "age": 25,
+  "role_or_agency": "Apopka Police Department, Florida (officer arrested by Eustis PD)",
+  "incident_datetime": "July 4, 2022 (video released by Eustis PD; file dated 2022-07-06)",
+  "location": "Eustis, Florida roadside traffic stop, in his marked patrol car",
+  "inciting_reason": "Eustis police conducted a traffic stop on Apopka officer Oscar Mayorga, who was in uniform in his marked city car on suspicion of driving under the influence; Mayorga had been scheduled to work that evening",
+  "key_facts": [
+    {
+      "fact": "Body camera video released by the Eustis Police Department shows an Apopka police officer being arrested on suspicion of driving under the influence in his marked patrol car while wearing his uniform.",
+      "date": "2022-07-04",
+      "source_id": "wikimedia_commons",
+      "citation": "Eustis PD bodycam release, Wikimedia Commons (public domain)"
+    },
+    {
+      "fact": "Mayorga was 25 years old and was scheduled to work the evening of the stop.",
+      "date": "2022-07-06",
+      "source_id": "wikimedia_commons",
+      "citation": "Eustis PD release statement, Wikimedia Commons file description"
+    },
+    {
+      "fact": "Police said one of his two breath tests measured 0.391 g/210L — nearly five times over Florida's legal limit of 0.08.",
+      "date": "2022-07-04",
+      "source_id": "wikimedia_commons",
+      "citation": "Eustis PD release statement, Wikimedia Commons file description"
+    },
+    {
+      "fact": "The stop, field sobriety testing, arrest, and booking processing are all captured on the released body camera footage, including the officer's responses and the confrontation over driving his marked unit while impaired.",
+      "date": "2022-07-04",
+      "source_id": "raw_tape",
+      "citation": "The released 43:47 bodycam video itself (2627s)"
+    }
+  ],
+  "charges": ["DUI (driving under the influence)"],
+  "test_results": [
+    {
+      "test": "Breath test #1",
+      "result": "0.391 g/210L (≈4.9x the 0.08 legal limit)"
+    }
+  ],
+  "verdict_outcome": "Arrested on suspicion of DUI in his marked patrol car while in uniform; breath test 0.391 g/210L per the Eustis PD release. No criminal case outcome is documented on the release page — refer to 'suspicion of DUI' and the measured breath result; do not assert a conviction.",
+  "sources": [
+    {
+      "source_id": "wikimedia_commons",
+      "kind": "url",
+      "label": "Wikimedia Commons — 'Bodycam: Drunk Cop Arrested While On Duty. Eustis, FL. July 04, 2022.' (public domain, Eustis PD release)",
+      "citation": "commons.wikimedia.org/wiki/File:Bodycam-_Drunk_Cop_Arrested_While_On_Duty._Eustis,_FL._July_04,_2022..webm"
+    },
+    {
+      "source_id": "raw_tape",
+      "kind": "video",
+      "label": "The released body camera footage (2627s, 1080p30)",
+      "citation": "footage/eustis_bodycam.webm"
+    }
+  ]
+}

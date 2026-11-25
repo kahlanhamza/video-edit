@@ -1,9 +1,10 @@
 """Content safety law — the benign-footage gate (owner directive, 2026-11-24).
 
 The channel ships ONLY benign incident categories: shoplifting / retail
-theft, trespassing, and first-amendment audits. Extreme violence and gunfire
-are never shipped, and the menu excludes dangerous-incident veins (OWI/DUI
-stops, crashes, pursuits, standoffs, use-of-force cases).
+theft, trespassing, first-amendment audits, and DUI/OWI stops (owner
+directive 2026-11-25: the niche is escalated-situation incident docs, not
+one vein). Crashes, pursuits, standoffs and gunfire remain off-menu
+entirely, and extreme violence and gunfire are never shipped.
 
 Two layers, both driven by one truth: the words in the case facts and the
 transcript are the only honest signal available at plan time.
@@ -103,6 +104,16 @@ SAFE_CATEGORIES: dict[str, str] = {
         r"first amendment|auditor"
         r"|audit(ing|ed)? (the )?(police|station|lobby|city hall|officers|department)"
         r"|filming (in|at) public|recording (the )?police|filming (the )?police"
+    ),
+    # owner directive 2026-11-25: the menu is the ESCALATED-SITUATION niche,
+    # not just custody-avoidance incidents — a DUI/OWI stop (field sobriety,
+    # breath testing, the arrest itself) is ordinary arrest content: no
+    # violence, no pursuit, no crash. The veto layer above stays the hard
+    # wall for anything that turns violent.
+    "dui_owi_stop": (
+        r"\bdui\b|\bowi\b|\bdwi\b|driving under the influence"
+        r"|drunk (driving|cop)|impaired driving|breath(alizer)? tests?"
+        r"|field sobriety|\bsobriety\b|\bbac\b|blood alcohol"
     ),
 }
 

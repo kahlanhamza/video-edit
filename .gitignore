@@ -27,3 +27,5 @@ output/
 .eustis_pid
 bin/
 test-results/
+footage/
+download/
