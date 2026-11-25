@@ -42,8 +42,11 @@ def test_isolate_2bus_master_ships_its_calibrated_mix(monkeypatch, tmp_path):
     monkeypatch.setattr(post_fx, "_measure_snr", lambda wav: -40.2)
     monkeypatch.setattr(post_fx, "probe", lambda p: SimpleNamespace(duration_s=10.0))
 
+    mux_cmds: list[list[str]] = []
+
     def fake_run(cmd, what):
         calls.append(("mux", 0))
+        mux_cmds.append(cmd)
         Path(cmd[-1]).touch()
 
     monkeypatch.setattr(post_fx, "_run", fake_run)
@@ -63,6 +66,11 @@ def test_isolate_2bus_master_ships_its_calibrated_mix(monkeypatch, tmp_path):
 
     assert report.enhance_engine == "master_mix_2bus"
     assert report.ok
+    # SINGLE CODEC GENERATION law: the mux copies the master's calibrated AAC
+    # verbatim — re-encoding the extracted WAV re-rang the decoded peak to
+    # +2.27 dBFS and cost 1.1 dB of dialogue RMS (2026-11-25 full-tape runway).
+    assert mux_cmds and "-c:a" in mux_cmds[0] and "copy" in mux_cmds[0]
+    assert str(master) in mux_cmds[0]  # the audio rides the master's stream
     marker = tmp_path / "pipeline" / "pid2" / "post_fx" / "audio.done"
     assert marker.read_text() == "master_mix_2bus"
     extracts = [c for c in calls if c[0] == "extract"]
@@ -85,7 +93,11 @@ def test_loudnorm_mode_keeps_the_deepfilter_path(monkeypatch, tmp_path):
     monkeypatch.setattr(post_fx, "_measure_snr", lambda wav: None)
     monkeypatch.setattr(post_fx, "probe", lambda p: SimpleNamespace(duration_s=10.0))
 
+    loudnorm_mux: list[list[str]] = []
+
     def fake_run(cmd, what):
+        if "mux" in what:
+            loudnorm_mux.append(cmd)
         Path(cmd[-1]).touch()
 
     monkeypatch.setattr(post_fx, "_run", fake_run)
@@ -117,3 +129,6 @@ def test_loudnorm_mode_keeps_the_deepfilter_path(monkeypatch, tmp_path):
     report = post_fx.stage_post_fx(master, None, {}, "pid3", deps)
     assert enquenced
     assert report.enhance_engine == "deepfilternet3"
+    # the enhanced WAV (not the copy) is the loudnorm path's audio: re-encode
+    # stays, the copy law is 2-bus-only (the enhanced stem differs from the master)
+    assert loudnorm_mux and "copy" not in loudnorm_mux[0]

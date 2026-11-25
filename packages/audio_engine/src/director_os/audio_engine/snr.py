@@ -53,11 +53,21 @@ def noise_floor_db(
     sr: int = 48_000,
     speech_intervals: list[tuple[float, float]] | None = None,
     frame_s: float = FRAME_S,
+    restrict_windows: list[tuple[float, float]] | None = None,
 ) -> float:
-    """Robust noise floor: median 100 ms-frame RMS over NON-speech samples."""
+    """Robust noise floor: median 100 ms-frame RMS over NON-speech samples.
+
+    `restrict_windows` confines the measurement to those regions (the
+    enhanced kept windows). A full-tape master ships unenhanced gap ambience
+    by design — measuring the floor across the whole file compares the
+    enhancer against ambience the enhancer never touched (measured: floor
+    -27.5 -> -25.4 dB on a perfectly-enhanced kept band, delta +2.1) — the
+    clean-vs-raw comparison must stay region-quantized inside the windows.
+    """
     if pcm.size == 0:
         return -120.0
     speech = merge_intervals(speech_intervals or []) if speech_intervals else []
+    windows = merge_intervals(restrict_windows, pad_s=0.0) if restrict_windows else []
     frame_n = max(1, int(frame_s * sr))
     n_frames = pcm.size // frame_n
     if n_frames == 0:
@@ -70,7 +80,14 @@ def noise_floor_db(
     loud = np.zeros(n_frames, dtype=bool)
     for s, e in speech:
         loud |= (frame_t1 > s) & (frame_t0 < e)
-    quiet_rms = frame_rms[~loud]
+    inside = np.ones(n_frames, dtype=bool)
+    if windows:
+        inside[:] = False
+        for w0, w1 in windows:
+            inside |= (frame_t0 >= w0) & (frame_t0 < w1)
+    quiet_rms = frame_rms[~loud & inside]
+    if quiet_rms.size == 0:
+        quiet_rms = frame_rms[inside]
     if quiet_rms.size == 0:
         return rms_dbfs(pcm)
     floor = float(np.median(quiet_rms))
@@ -93,15 +110,37 @@ def measure_snr(
     path: str,
     speech_intervals: list[tuple[float, float]],
     sr: int = 48_000,
+    restrict_windows: list[tuple[float, float]] | None = None,
 ) -> dict:
-    """Decode one file -> {speech_rms_db, noise_floor_db, snr_db, duration_s}."""
+    """Decode one file -> {speech_rms_db, noise_floor_db, snr_db, duration_s}.
+
+    `restrict_windows` confines BOTH the speech RMS and the noise floor to
+    those regions — the raw-vs-clean comparison must measure the same
+    real-time segments on both files (the enhanced kept windows).
+    """
     pcm = decode_pcm_mono(path, sr)
-    speech = speech_rms_db(pcm, sr, speech_intervals)
-    floor = noise_floor_db(pcm, sr, speech_intervals)
+    speech = merge_intervals(speech_intervals or [])
+    if restrict_windows:
+        pieces: list[np.ndarray] = []
+        rebased: list[tuple[float, float]] = []
+        for w0, w1 in merge_intervals(restrict_windows, pad_s=0.0):
+            a, b = int(w0 * sr), min(int(w1 * sr), pcm.size)
+            if b <= a:
+                continue
+            pieces.append(pcm[a:b])
+            for s, e in speech:
+                s0, e0 = max(s, w0), min(e, w1)
+                if e0 - s0 >= 0.02:
+                    rebased.append((s0 - w0, e0 - w0))
+        if pieces:
+            pcm = np.concatenate(pieces)
+            speech = merge_intervals(rebased) if rebased else []
+    speech_db = speech_rms_db(pcm, sr, speech)
+    floor = noise_floor_db(pcm, sr, speech)
     return {
-        "speech_rms_db": speech,
+        "speech_rms_db": speech_db,
         "noise_floor_db": floor,
-        "snr_db": speech - floor,
+        "snr_db": speech_db - floor,
         "duration_s": pcm.size / sr if sr else 0.0,
         "samples": int(pcm.size),
     }

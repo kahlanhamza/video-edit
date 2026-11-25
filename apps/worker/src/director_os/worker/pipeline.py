@@ -2445,12 +2445,24 @@ def stage_qa(
                 f"  [qa] speech windows remapped raw->{speech_intervals[-1][1]:.1f}s "
                 f"master clock ({len(source_clock_speech)} -> {len(speech_intervals)} spans)"
             )
+        # SNR region-quantization: the floor comparison stays INSIDE the
+        # enhanced kept windows on both clocks (gap ambience ships raw).
+        master_windows: list[tuple[float, float]] = []
+        raw_windows: list[tuple[float, float]] = []
+        if enhance_info.kept_windows:
+            master_windows, raw_windows = master_clock_kept_windows(timeline, asset_id)
+            deps.log(
+                f"  [qa] SNR measurement quantized to {len(master_windows)} kept "
+                f"window(s) — gap ambience ships raw by design"
+            )
         audio_verification = AudioVerification(
             raw_audio_path=str(enhance_info.raw_reference_wav),
             enhancer_engine=enhance_info.engine,
             enhancer_neural=bool(enhance_info.neural),
             atten_lim_db=enhance_info.atten_lim_db,
             raw_clock_speech_intervals=source_clock_speech,
+            enhanced_windows=list(master_windows) or None,
+            raw_keep_windows=list(raw_windows) or None,
         )
     else:
         program_speech_intervals = speech_intervals
@@ -2526,21 +2538,16 @@ def kept_windows_from_timeline(timeline, asset_id: str) -> list[tuple[float, flo
     return windows
 
 
-def master_clock_speech_intervals(
-    source_intervals: list[tuple[float, float]],
-    timeline: TimelineSpec | None,
-    asset_id: str = "",
-    *,
-    include_narration_blocks: bool = False,
-) -> list[tuple[float, float]]:
-    """Raw-clock speech windows -> MASTER clock (raw clips only, gaps dropped).
+def _master_clock_maps(
+    timeline: TimelineSpec | None, asset_id: str, include_narration_blocks: bool = False
+) -> list[tuple[float, float, float]]:
+    """The master-track walk both remappers share: [(t_master, src0, dur), ...] in DAG order.
 
-    The QA acoustic law measures the SHIPPED master; a kept-band cut of a long
-    tape (2627s raw -> 782s master) must not be probed with source-clock
-    windows — beyond the master's duration they read silence/limiter noise
-    and fail SNR/RMS on perfectly-enhanced speech (full-tape runway 2026-11-25).
-    Narration windows are skipped — bus-1 dialogue is what the -12..-6 dBFS
-    law meters.
+    Raw-asset clips map master time to source time; narration blocks ride the
+    walk to advance the master clock and, in program-speech mode (the SNR
+    floor), map onto themselves — the TTS voice is speech, not noise, and the
+    floor must never sample it. Gaps advance the clock but contribute no
+    mapping (full-tape runway 2026-11-25).
     """
     from director_os.otio_engine.contract import NarratorClipMeta, RawClipMeta, parse_clip_meta
     from director_os.otio_engine.timeline import (
@@ -2550,11 +2557,11 @@ def master_clock_speech_intervals(
         track_by_name,
     )
 
-    if timeline is None or not source_intervals:
-        return list(source_intervals)
+    if timeline is None:
+        return []
     master = track_by_name(timeline, MASTER_TRACK)
     if master is None:
-        return list(source_intervals)
+        return []
     maps: list[tuple[float, float, float]] = []
     t_master = 0.0
     for item in master:
@@ -2575,14 +2582,34 @@ def master_clock_speech_intervals(
             # noise, and the floor must never sample it
             maps.append((t_master, t_master, dur))
         t_master += dur
+    return maps
+
+
+def master_clock_speech_intervals(
+    source_intervals: list[tuple[float, float]],
+    timeline: TimelineSpec | None,
+    asset_id: str = "",
+    *,
+    include_narration_blocks: bool = False,
+) -> list[tuple[float, float]]:
+    """Raw-clock speech windows -> MASTER clock (raw clips only, gaps dropped).
+
+    The QA acoustic law measures the SHIPPED master; a kept-band cut of a long
+    tape (2627s raw -> 782s master) must not be probed with source-clock
+    windows — beyond the master's duration they read silence/limiter noise
+    and fail SNR/RMS on perfectly-enhanced speech (full-tape runway 2026-11-25).
+    Narration windows are skipped — bus-1 dialogue is what the -12..-6 dBFS
+    law meters.
+    """
+    if timeline is None or not source_intervals:
+        return list(source_intervals)
+    maps = _master_clock_maps(timeline, asset_id, include_narration_blocks)
     if not maps:
         return list(source_intervals)
     remapped: list[tuple[float, float]] = []
     narration_master_windows: list[tuple[float, float]] = []
     for a, b in source_intervals:
         for m0, src0, dur in maps:
-            if src0 == m0 and dur and m0 in {w[0] for w in narration_master_windows}:
-                pass
             lo, hi = max(a, src0), min(b, src0 + dur)
             if hi - lo >= 0.05:
                 remapped.append((m0 + lo - src0, m0 + hi - src0))
@@ -2592,7 +2619,7 @@ def master_clock_speech_intervals(
     if include_narration_blocks:
         seen = set()
         for m0, src0, dur in maps:
-            if src0 == m0 and (m0, dur) not in seen:
+            if (m0, dur) not in seen:
                 seen.add((m0, dur))
                 narration_master_windows.append((m0, m0 + dur))
         remapped.extend(narration_master_windows)
@@ -2610,6 +2637,27 @@ def master_clock_speech_intervals(
             if hi - lo > 0:
                 pieces.append((lo, hi))
     return sorted(pieces)
+
+
+def master_clock_kept_windows(
+    timeline: TimelineSpec | None, asset_id: str
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """The kept enhance windows on BOTH clocks: (master, raw).
+
+    The SNR region-quantization law (2026-11-25): full-tape masters ship
+    unenhanced gap ambience by design — the clean-vs-raw floor comparison
+    must measure the same real-time segments on both files, i.e. stay inside
+    the windows the enhancer touched (master clock on the shipped file, raw
+    clock on the raw reference).
+    """
+    from director_os.audio_engine.leveling import merge_intervals
+
+    maps = _master_clock_maps(timeline, asset_id)
+    if not maps:
+        return [], []
+    master_windows = merge_intervals([(m0, m0 + dur) for m0, _s, dur in maps], pad_s=0.0)
+    raw_windows = merge_intervals([(src0, src0 + dur) for _m, src0, dur in maps], pad_s=0.0)
+    return master_windows, raw_windows
 
 
 # --------------------------------------------------------------------- runner

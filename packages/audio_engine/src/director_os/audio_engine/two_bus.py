@@ -66,6 +66,18 @@ MASTER_LIMITER_LINEAR = 0.8414  # -1.5 dBTP (creative ceiling, historical)
 MASTER_CEILING_DBFS = -2.5
 MASTER_CEILING_LINEAR = 0.7499
 ENCODE_HEADROOM_LIMITER_LINEAR = 0.7079  # -3.0 dBFS (historical, pre-numpy)
+# Codec reconstruction law (measured, 2026-11-25 on the real v7 Eustis mix):
+# AAC ring on limiter-flattened waveform is HUGE and bitrate-dependent —
+# 192k overshot the -2.5 dBFS master by up to +4.5 dB (decoded +2 dBFS, one
+# window +7 dB), 512k over +1.5 dB. Overshoot's driver is the flat ceiling
+# plateau MDCT cannot represent; encoder bandwidth cutoff does not help.
+# The shipped file must therefore be ONE codec generation from the design
+# mix (post-fx/finalize ship with -c:a copy) and the segment bitrate rides
+# 512k. Each 2-bus master is probe-calibrated: encode a probe, decode it,
+# trim the mix until the decoded peak fits CODEC_PROBE_TARGET_DBFS —
+# deterministic AAC overshoot compensation measured on the ACTUAL codec.
+SEGMENT_AAC_BITRATE_KBPS = 512
+CODEC_PROBE_TARGET_DBFS = -1.3  # 0.3 dB below the -1.0 dBTP QA gate
 # Timbre restoration law (measured, Nov 2026 — scripts/measure_tilt.py on the
 # real MossFormer2_SE_48K Kaggle harvest): neural extractors preserve low-mid
 # most and shave the top end hardest — presence 2-5 kHz lands -19.9 dB and air

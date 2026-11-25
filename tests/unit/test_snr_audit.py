@@ -396,3 +396,40 @@ class TestAuditAudioVerification:
         pcm = rng.normal(size=SR) * 0.9
         hot = _write_wav(tmp_path / "hot.wav", pcm.astype(np.float32))
         assert peak_true_dbfs(str(hot)) > -1.0
+
+
+def test_noise_floor_restricted_to_windows_ignores_outside_ambience():
+    """Region-quantized floor law (2026-11-25): full-tape masters ship raw gap
+    ambience by design — the floor comparison must stay inside the enhanced
+    windows, else the untouched gaps meter as 'remaining noise' (measured
+    floor -27.5 -> -25.4 dB, delta +2.1, on a perfectly-enhanced kept band)."""
+    sr = 48_000
+    rng = np.random.default_rng(7)
+    speech = [(1.0, 2.0)]  # speech only inside the window
+    loud_noise = 0.05
+    quiet_window_noise = 0.0005
+    pcm = rng.normal(0.0, loud_noise, size=int(6.0 * sr)).astype(np.float32)
+    win = slice(int(1.5 * sr), int(2.5 * sr))  # the enhanced window
+    pcm[win] = rng.normal(0.0, quiet_window_noise, size=win.stop - win.start).astype(np.float32)
+
+    whole = noise_floor_db(pcm, sr, speech)
+    quantized = noise_floor_db(pcm, sr, speech, restrict_windows=[(1.5, 2.5)])
+    assert whole > 20 * np.log10(loud_noise * 0.5) - 6.0  # poisoned by the gaps
+    assert quantized <= 20 * np.log10(quiet_window_noise) + 6.0  # inside the window
+
+
+def test_measure_snr_restrict_windows_rebases_speech(tmp_path):
+    """restrict_windows slices the file and rebases the word spans to the
+    slice — windows far into a long tape must measure the kept band, not
+    tape beyond the master's duration."""
+    sr = 48_000
+    rng = np.random.default_rng(3)
+    dur_s = 20.0
+    pcm = rng.normal(0.0, 0.01, size=int(dur_s * sr)).astype(np.float32)
+    span = slice(int(10.0 * sr), int(12.0 * sr))  # real speech at 10-12s raw clock
+    pcm[span] = rng.normal(0.0, 0.2, size=span.stop - span.start).astype(np.float32)
+    wav = _write_wav(tmp_path / "tape.wav", pcm)
+
+    out = measure_snr(str(wav), [(10.0, 12.0)], restrict_windows=[(10.0, 13.0)])
+    assert out["duration_s"] == pytest.approx(3.0, abs=0.02)  # only the slice decoded
+    assert out["snr_db"] > 14.0  # dialogue survives inside the quantized window

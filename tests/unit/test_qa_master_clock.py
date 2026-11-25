@@ -20,7 +20,10 @@ from director_os.otio_engine.timeline import (
     TrackSpec,
     build_timeline,
 )
-from director_os.worker.pipeline import master_clock_speech_intervals
+from director_os.worker.pipeline import (
+    master_clock_kept_windows,
+    master_clock_speech_intervals,
+)
 
 
 def _timeline(ranges: list[tuple[float, float]], asset_id: str = "a1"):
@@ -84,8 +87,8 @@ def _audio_checks(path: Path, verification: AudioVerification, intervals):
 def test_raw_reference_measured_on_raw_clock(monkeypatch, tmp_path):
     calls: list[tuple[str, list[tuple[float, float]]]] = []
 
-    def _fake(path: str, intervals):
-        calls.append((str(path), list(intervals)))
+    def _fake(path: str, intervals, restrict_windows=None):
+        calls.append((str(path), list(intervals), restrict_windows))
         return {"snr_db": 30.0, "noise_floor_db": -60.0}
 
     monkeypatch.setattr(snr_mod, "measure_snr", _fake)
@@ -111,7 +114,9 @@ def test_raw_reference_measured_on_raw_clock(monkeypatch, tmp_path):
     raw_call, clean_call = calls[0], calls[1]
     assert raw_call[0].endswith("raw_48k.wav")
     assert raw_call[1] == [(2500.0, 2510.0)]
+    assert raw_call[2] is None  # no kept windows -> whole-file measure (legacy 1:1)
     assert clean_call[1] == [(0.5, 6.0)]
+    assert clean_call[2] is None
     names = {c.name for c in checks}
     assert {
         "snr_verification",
@@ -127,7 +132,7 @@ def test_snr_check_reports_the_two_clocks(monkeypatch, tmp_path):
     the runway regression shipped 'raw_snr=6.8 clean_snr=8.8' on enhanced
     audio because both sides sampled the same wrong clock."""
 
-    def _fake(path: str, intervals):
+    def _fake(path: str, intervals, restrict_windows=None):
         if "raw_48k" in path:
             return {"snr_db": 20.0, "noise_floor_db": -55.0}
         return {"snr_db": 28.0, "noise_floor_db": -63.0}
@@ -154,3 +159,49 @@ def test_snr_check_reports_the_two_clocks(monkeypatch, tmp_path):
     snr = next(c for c in checks if c.name == "snr_verification")
     assert snr.ok
     assert "raw_snr=20.0dB" in snr.detail and "clean_snr=28.0dB" in snr.detail
+
+
+def test_kept_windows_map_to_both_clocks():
+    """The SNR region-quantization needs the kept band on BOTH clocks."""
+    timeline = _timeline([(100.0, 10.0), (200.0, 5.0), (300.0, 2.0)])
+    master_windows, raw_windows = master_clock_kept_windows(timeline, "a1")
+    assert master_windows == [(0.0, 17.0)]  # adjacent maps merge in master clock
+    assert raw_windows == [(100.0, 110.0), (200.0, 205.0), (300.0, 302.0)]
+
+
+def test_verification_quantizes_snr_to_kept_windows(monkeypatch, tmp_path):
+    """enhanced_windows/raw_keep_windows must reach measure_snr verbatim —
+    the shipped floor can never beat the raw floor while gap ambience (raw
+    by design) is allowed to meter as 'noise'."""
+    seen: dict[str, object] = {}
+
+    def _fake(path: str, intervals, restrict_windows=None):
+        seen[path] = restrict_windows
+        if "raw_48k" in path:
+            return {"snr_db": 20.0, "noise_floor_db": -55.0}
+        return {"snr_db": 30.0, "noise_floor_db": -60.0}
+
+    monkeypatch.setattr(snr_mod, "measure_snr", _fake)
+    monkeypatch.setattr(
+        snr_mod,
+        "speech_band_tilts",
+        lambda path, intervals: {
+            "tilt_presence_db": -14.0,
+            "tilt_air_db": -19.0,
+            "tilt_lowmid_db": 0.0,
+        },
+    )
+    monkeypatch.setattr(snr_mod, "speech_crest_db", lambda path, intervals: 10.0)
+    monkeypatch.setattr(snr_mod, "peak_true_dbfs", lambda path: -3.0)
+
+    verification = AudioVerification(
+        raw_audio_path=str(tmp_path / "raw_48k.wav"),
+        enhancer_engine="deepfilternet3",
+        raw_clock_speech_intervals=[(2500.0, 2510.0)],
+        enhanced_windows=[(0.0, 17.0)],
+        raw_keep_windows=[(100.0, 110.0), (200.0, 207.0)],
+    )
+    checks = _audio_checks(tmp_path / "final.mp4", verification, [(0.5, 6.0)])
+    assert seen[str(tmp_path / "raw_48k.wav")] == [(100.0, 110.0), (200.0, 207.0)]
+    assert seen[str(tmp_path / "final.mp4")] == [(0.0, 17.0)]
+    assert all(c.ok for c in checks)

@@ -58,12 +58,15 @@ from director_os.audio_engine.leveling import (
 )
 from director_os.audio_engine.snr import (
     measure_snr,
+    peak_true_dbfs,
     speech_band_tilts,
     speech_crest_db,
 )
 from director_os.audio_engine.two_bus import (
+    CODEC_PROBE_TARGET_DBFS,
     RUMBLE_HIGHPASS_HZ,
     SAMPLE_RATE,
+    SEGMENT_AAC_BITRATE_KBPS,
     apply_gate_inplace,
     bus1_tone_chain,
     duck_envelope,
@@ -75,8 +78,9 @@ from director_os.audio_engine.vad import SileroVad, speech_gate_intervals
 # dBFS. Bumping the version is MANDATORY on any mix/tone change — the cache
 # key must not let a re-render silently reuse a master mixed with the old
 # sound.
-ENHANCE_CACHE_VERSION = "v7"  # v7: limiter onset fix (v6 masters breached the
-# ceiling — true peak +5.4 dBFS — never reuse them)
+ENHANCE_CACHE_VERSION = "v8"  # v8: codec calibration law (v7 mixes weren't
+# probe-trimmed — 192k AAC overshot the ceiling by up to +4.5 dB on decode;
+# refine loop now targets the loudness CENTER, never a window edge)
 
 # --- speech-preservation rescue (ENHANCE_CACHE_VERSION v4) ---------------
 # A word span whose enhanced RMS dropped more than this below the precleaned
@@ -231,6 +235,8 @@ class _PassResult:
     enhancer_input: str
     gain_db: float
     rescued_spans: int = 0
+    codec_trim_db: float = 0.0
+    codec_probe_peak_dbfs: float = 0.0
 
 
 def _extract_raw_48k(src: Path, dst: Path, ss: float | None = None, t: float | None = None) -> None:
@@ -529,12 +535,13 @@ def _enhance_pass(
     # one-shot gain was computed, so spoken words can land outside the
     # -12..-6 window. The limiter response is concave (each +1 dB of gain
     # raises speech RMS only ~0.4 dB once it engages), so iterate until the
-    # window is met or the correction converges (max 8 passes).
-    from director_os.audio_engine.leveling import check_speech_window
-
+    # mix lands ON the target center — window entry is NOT enough: the codec
+    # generations and the codec-trim calibration below cost 0.3..1.0 dB of
+    # loudness, and a mix refined only to the -12 floor ships below the
+    # window (measured -12.8 shipped from a -11.74 mix, full-tape runway).
     for _ in range(8):
         mixed = measure_speech_levels(str(master), gate)
-        if check_speech_window(mixed["speech_rms_dbfs"]):
+        if abs(mixed["speech_rms_dbfs"] - DEFAULT_TARGET_DBFS) <= 0.3:
             break
         refined = round(gain_db + (DEFAULT_TARGET_DBFS - mixed["speech_rms_dbfs"]), 2)
         refined = max(-MAX_GAIN_DB, min(MAX_GAIN_DB, refined))
@@ -543,6 +550,17 @@ def _enhance_pass(
         run_two_bus_mix(bus1, raw_ref, master, refined)
         gain_db = refined
         log(f"  [audio] {tag}master gain refined -> {gain_db:+.1f} dB (post-limiter)")
+
+    # 8c) codec calibration — deterministic AAC overshoot compensation.
+    # The limiter's flat ceiling plateaus ring on decode: 192k AAC overshot
+    # the measured worst window by +4.5 dB (decoded +2 dBFS). Probe: encode
+    # at the SEGMENT bitrate, decode, trim the mix until the decoded peak
+    # fits CODEC_PROBE_TARGET_DBFS. Measures the ACTUAL codec on the ACTUAL
+    # mix — the shipped file rides ONE codec generation (post-fx mux copies
+    # the concat audio), so this probe predicts the shipped decode exactly.
+    calib = calibrate_mix_for_codec(
+        master, SEGMENT_AAC_BITRATE_KBPS, log=lambda m: log(f"  [audio] {tag}{m}")
+    )
 
     # 9) pass receipts
     raw_snr = measure_snr(str(raw_ref), gate)
@@ -575,6 +593,8 @@ def _enhance_pass(
         enhancer_input=enhancer_input,
         gain_db=gain_db,
         rescued_spans=rescued_spans,
+        codec_trim_db=float(calib["codec_trim_db"]),
+        codec_probe_peak_dbfs=float(calib["codec_probe_peak_dbfs"]),
     )
 
 
@@ -706,6 +726,81 @@ def _window_cache_dir(
     return root / f"w_{key}", key
 
 
+def calibrate_mix_for_codec(
+    master: Path,
+    bitrate_kbps: int = SEGMENT_AAC_BITRATE_KBPS,
+    log=print,
+    max_passes: int = 3,
+) -> dict:
+    """Deterministic AAC overshoot compensation measured on the ACTUAL codec.
+
+    The limiter's flat ceiling plateaus ring on decode — the reconstruction
+    error is bitrate-dependent and content-dependent (192k: up to +4.5 dB,
+    one window +7; 512k: up to +1.5). Encoding a probe, decoding its peak
+    and trimming the mix to CODEC_PROBE_TARGET_DBFS pins the shipped decode
+    peak for ANY content, sample-exact, without guessing an encoder constant.
+    The correction is EXACT per pass (linear scale -> ring shrinks with it),
+    converges in 1-2 passes; the final pass leaves the trim receipt.
+    """
+    probe = master.with_suffix(".codec_probe.mp4")
+    tmp = master.with_suffix(".codec_trim.wav")
+
+    def probe_peak_db() -> float:
+        _run(
+            [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(master),
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                "-c:a",
+                "aac",
+                "-b:a",
+                f"{bitrate_kbps}k",
+                str(probe),
+            ],
+            "codec probe encode",
+        )
+        return peak_true_dbfs(str(probe))
+
+    peak_db = probe_peak_db()
+    trim_db = 0.0
+    for _ in range(max_passes):
+        if peak_db <= CODEC_PROBE_TARGET_DBFS:
+            break
+        step = round(peak_db - CODEC_PROBE_TARGET_DBFS + 0.1, 2)
+        trim_db = round(trim_db - step, 2)
+        _run(
+            [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(master),
+                "-af",
+                f"volume={-step:g}dB",
+                "-c:a",
+                "pcm_s16le",
+                str(tmp),
+            ],
+            "codec trim",
+        )
+        tmp.replace(master)
+        peak_db = probe_peak_db()
+        log(f"codec calibration: trim {trim_db:+.2f} dB -> decoded {peak_db:+.2f} dBFS")
+    probe.unlink(missing_ok=True)
+    tmp.unlink(missing_ok=True)
+    return {"codec_trim_db": round(trim_db, 2), "codec_probe_peak_dbfs": round(peak_db, 2)}
+
+
 def _pass_to_receipt(p: _PassResult) -> dict:
     data = asdict(p)
     data["master"] = str(p.master)
@@ -730,6 +825,8 @@ def _pass_from_receipt(data: dict) -> _PassResult:
         enhancer_input=str(data["enhancer_input"]),
         gain_db=float(data["gain_db"]),
         rescued_spans=int(data.get("rescued_spans") or 0),
+        codec_trim_db=float(data.get("codec_trim_db") or 0.0),
+        codec_probe_peak_dbfs=float(data.get("codec_probe_peak_dbfs") or 0.0),
     )
 
 

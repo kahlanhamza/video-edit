@@ -228,6 +228,12 @@ class AudioVerification(BaseModel):
     max_delta_noise_db: float = -8.0
     min_snr_improvement_db: float = 6.0
     max_peak_dbtp: float = -1.0
+    # Enhanced kept windows per clock (SNR region-quantization, 2026-11-25):
+    # a full-tape master ships unenhanced gap ambience by design — the floor
+    # comparison must stay INSIDE the windows the enhancer touched, else the
+    # gap ambience (untouched) poisons the clean floor. None -> whole file.
+    enhanced_windows: list[tuple[float, float]] | None = None
+    raw_keep_windows: list[tuple[float, float]] | None = None
 
 
 def audit_technical(
@@ -467,8 +473,14 @@ def _audio_verification_checks(
                 if verification.raw_clock_speech_intervals
                 else clean_spans
             )
-            raw = measure_snr(verification.raw_audio_path, raw_spans)
-            clean = measure_snr(str(path), clean_spans)
+            raw = measure_snr(
+                verification.raw_audio_path,
+                raw_spans,
+                restrict_windows=verification.raw_keep_windows,
+            )
+            clean = measure_snr(
+                str(path), clean_spans, restrict_windows=verification.enhanced_windows
+            )
             delta_noise = clean["noise_floor_db"] - raw["noise_floor_db"]
             ok, gate_detail = snr_gate(
                 raw["snr_db"],

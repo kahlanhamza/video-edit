@@ -20,6 +20,7 @@ import shutil
 from pathlib import Path
 from typing import Literal
 
+from director_os.audio_engine.two_bus import SEGMENT_AAC_BITRATE_KBPS
 from director_os.core.models import AudioContract, BlurRegion, ZoomKeyframe
 from director_os.otio_engine.contract import FreezeCallout
 from pydantic import BaseModel, Field
@@ -47,7 +48,9 @@ class AudioRenderSpec(AudioContract):
     """Audio law inherited + validated (48 kHz / stereo — ADR-0005)."""
 
     codec: str = "aac"
-    bitrate_kbps: int = 192
+    # 512k (codec reconstruction law): 192k AAC overshot the -2.5 dBFS 2-bus
+    # master by up to +4.5 dB on decode — see two_bus.SEGMENT_AAC_BITRATE_KBPS.
+    bitrate_kbps: int = SEGMENT_AAC_BITRATE_KBPS
 
 
 class VideoRenderSpec(BaseModel):
