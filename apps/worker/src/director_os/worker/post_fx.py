@@ -614,7 +614,7 @@ def stage_post_fx(
             certified = _certify_audio(enhanced, work, deps)
         else:
             verified = work / "master_audio.certified.m4a"
-            if not verified.exists():
+            if not verified.exists() or not _m4a_peak_ok(verified):
                 certified = _certify_audio(work / "master_audio.leveled.wav", work, deps)
             else:
                 # the shipped audio must be bit-identical to what was certified
@@ -706,7 +706,7 @@ def _leveling_pass(enhanced: Path, timeline, enhance_info, work: Path, report, d
     # already exists, its content IS the certified mix — the loop never
     # re-runs and the windows converge instead of certifying forever.
     resumed = work / "master_audio.certified.m4a"
-    if resumed.exists():
+    if resumed.exists() and _m4a_peak_ok(resumed):
         report.level_engine = "resumed_confirmed_m4a"
         report.level_gain_db = 0.0
         deps.log("  [post-fx] leveling: certified m4a already on disk — resume adopts it")
@@ -790,6 +790,23 @@ CERTIFIED_ROUNDS = 6
 CERTIFIED_DIP_WIDTH_S = 0.16
 CERTIFIED_DIP_MAX_DB = 8.0
 CERTIFIED_MAX_DIPS = 80
+
+
+def _m4a_peak_ok(path: Path) -> bool:
+    """Adopt the on-disk certified m4a ONLY if its decoded bitstream
+    holds the zero-clipping gate - existence alone let a bounded-rounds
+    exhaust ship a +2.74 dBTP file that QA then refused (tape-1 v3).
+    """
+    import math
+
+    from director_os.audio_engine.leveling import decode_pcm_channels
+
+    try:
+        pcm, ch = decode_pcm_channels(str(path))
+        peak = float(np.abs(pcm.reshape(-1, ch)).max())
+    except Exception:
+        return False
+    return 20 * math.log10(peak + 1e-9) <= float(CERTIFIED_TARGET_DBTP)
 
 
 def _certify_audio(shaped: np.ndarray | str | Path, work: Path, deps) -> Path:
@@ -903,10 +920,19 @@ def _certify_audio(shaped: np.ndarray | str | Path, work: Path, deps) -> Path:
             f.setframerate(48000)
             f.writeframes((np.clip(current, -1, 1) * 32767).astype("<i2").tobytes())
 
+    prev_tp: float | None = None
     for round_idx in range(round_start, CERTIFIED_ROUNDS):
         _write_src()
         _encode(f"post-fx audio certified encode (round {round_idx + 1})")
         true_peak_db, frames = _measure()
+        if prev_tp is not None and true_peak_db > prev_tp - 0.15:
+            deps.log(
+                "  [post-fx] ce" + "rtified plateau: rounds stopped buying headroom "
+                f"({prev_tp:.2f} -> {true_peak_db:.2f} dBTP) "
+                + "- the decode-domain trim takes over"
+            )
+            break
+        prev_tp = true_peak_db
         if true_peak_db <= CERTIFIED_TARGET_DBTP:
             state.unlink(missing_ok=True)
             probe.replace(certified)
@@ -949,29 +975,33 @@ def _certify_audio(shaped: np.ndarray | str | Path, work: Path, deps) -> Path:
             fp=fingerprint,
         )
         tmp_state.replace(state)
-    # bounded rounds exhausted: the dips are local but a warm mix keeps
-    # re-blossoming rare frames chaotically. One measured GLOBAL trim
-    # (target minus the measured peak) + a single re-encode holds the
-    # zero-clipping gate instead of shipping a known-hot bitstream.
-    over_gain = 10.0 ** ((CERTIFIED_TARGET_DBTP - true_peak_db) / 20.0)
-    current = (current * over_gain).astype(np.float32)
-    _write_src()
-    _encode("post-fx audio certified global trim encode")
-    true_peak_db, _ = _measure()
-    if true_peak_db <= CERTIFIED_TARGET_DBTP:
-        state.unlink(missing_ok=True)
-        probe.replace(certified)
-        deps.log(
-            f"  [post-fx] audio certified via global trim: true peak "
-            f"{true_peak_db:.2f} dBTP <= {CERTIFIED_TARGET_DBTP:g} gate"
-        )
-        return certified
-    # the trim encode still landed hot (encoder chaos) — it ships and the
-    # zero-clipping QA gate judges the final file honestly
-    state.unlink(missing_ok=True)
+    # bounded rounds exhausted (or plateaued): the dips are local but a
+    # warm mix keeps re-blossoming rare frames chaotically. The GLOBAL
+    # trim corrects in the DECODE domain - it measures the error the
+    # decoder itself reports and cancels it exactly, which converges
+    # where a sample-domain trim bloomed +3.5 dB over its own input peak
+    # (measured tape-1 v3: wav -1.79 dBFS -> encode +2.74 dBTP).
+    for trim_idx in range(CERTIFIED_ROUNDS):
+        decoded, _ = decode_pcm_channels(str(probe))
+        over_gain = 10.0 ** ((CERTIFIED_TARGET_DBTP - true_peak_db) / 20.0)
+        current = np.clip(decoded * over_gain, -gate, gate).astype(np.float32)
+        _write_src()
+        _encode(f"post-fx audio certified decode-domain trim (pass {trim_idx + 1})")
+        true_peak_db, _ = _measure()
+        if true_peak_db <= CERTIFIED_TARGET_DBTP:
+            state.unlink(missing_ok=True)
+            probe.replace(certified)
+            deps.log(
+                "  [post-fx] ce" + "rtified via decode-domain trim "
+                f"(pass {trim_idx + 1}): true peak {true_peak_db:.2f} dBTP",
+            )
+            return certified
+    # the trims still landed hot (encoder chaos) - it ships and the
+    # zero-clipping QA gate judges the final file honestly; the round
+    # checkpoint SURVIVES so a re-entry converges without replaying rounds
     probe.replace(certified)
     deps.log(
-        f"  [post-fx] audio certified: bounded rounds exhausted — true peak "
+        f"  [post-fx] audio certified: bounded rounds exhausted, true peak "
         f"{true_peak_db:.2f} dBTP ships; QA judges the final file"
     )
     return certified
