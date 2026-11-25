@@ -2389,6 +2389,7 @@ def stage_qa(
     *,
     timeline=None,
     source_duration_s: float = 0.0,
+    asset_id: str = "",
 ) -> AuditReport:
     """Deterministic QA + the 2-bus acoustic verification (SNR/clipping/engine).
 
@@ -2403,13 +2404,25 @@ def stage_qa(
         from director_os.core.qa_probe import AudioVerification
 
         # the -12..-6 speech window + SNR/clipping gates are the 2-BUS law —
-        # legacy loudnorm_48k renders keep their integrated-loudness law
-        speech_intervals = list(enhance_info.speech_intervals)
+        # legacy loudnorm_48k renders keep their integrated-loudness law.
+        # CLOCK LAW (full-tape runway): the enhance receipt's speech windows
+        # ride the RAW asset clock; the audits probe the SHIPPED master — a
+        # kept-band cut (2627s raw -> 782s master) must remap them or read
+        # silence/sirens at wrong positions. The raw reference keeps the raw
+        # clock, so the raw-vs-clean comparison stays region-quantized.
+        source_clock_speech = list(enhance_info.speech_intervals)
+        speech_intervals = master_clock_speech_intervals(source_clock_speech, timeline, asset_id)
+        if speech_intervals != source_clock_speech:
+            deps.log(
+                f"  [qa] speech windows remapped raw->{speech_intervals[-1][1]:.1f}s "
+                f"master clock ({len(source_clock_speech)} -> {len(speech_intervals)} spans)"
+            )
         audio_verification = AudioVerification(
             raw_audio_path=str(enhance_info.raw_reference_wav),
             enhancer_engine=enhance_info.engine,
             enhancer_neural=bool(enhance_info.neural),
             atten_lim_db=enhance_info.atten_lim_db,
+            raw_clock_speech_intervals=source_clock_speech,
         )
     audit = audit_technical(
         final_path,
@@ -2480,6 +2493,72 @@ def kept_windows_from_timeline(timeline, asset_id: str) -> list[tuple[float, flo
         start_s = item.source_range.start_time.to_seconds() if item.source_range else 0.0
         windows.append((start_s, start_s + dur))
     return windows
+
+
+def master_clock_speech_intervals(
+    source_intervals: list[tuple[float, float]],
+    timeline: TimelineSpec | None,
+    asset_id: str,
+) -> list[tuple[float, float]]:
+    """Raw-clock speech windows -> MASTER clock (raw clips only, gaps dropped).
+
+    The QA acoustic law measures the SHIPPED master; a kept-band cut of a long
+    tape (2627s raw -> 782s master) must not be probed with source-clock
+    windows — beyond the master's duration they read silence/limiter noise
+    and fail SNR/RMS on perfectly-enhanced speech (full-tape runway 2026-11-25).
+    Narration windows are skipped — bus-1 dialogue is what the -12..-6 dBFS
+    law meters.
+    """
+    from director_os.otio_engine.contract import RawClipMeta, parse_clip_meta
+    from director_os.otio_engine.timeline import (
+        MASTER_TRACK,
+        is_gap,
+        item_duration_s,
+        track_by_name,
+    )
+
+    if timeline is None or not source_intervals:
+        return list(source_intervals)
+    master = track_by_name(timeline, MASTER_TRACK)
+    if master is None:
+        return list(source_intervals)
+    maps: list[tuple[float, float, float]] = []
+    t_master = 0.0
+    for item in master:
+        dur = item_duration_s(item)
+        if dur <= 0:
+            continue
+        if is_gap(item):
+            t_master += dur
+            continue
+        meta = parse_clip_meta(item)
+        sr = getattr(item, "source_range", None)
+        src0 = sr.start_time.to_seconds() if sr is not None else 0.0
+        if isinstance(meta, RawClipMeta) and meta.asset_id == asset_id:
+            maps.append((t_master, src0, dur))
+        t_master += dur
+    if not maps:
+        return list(source_intervals)
+    remapped: list[tuple[float, float]] = []
+    for a, b in source_intervals:
+        for m0, src0, dur in maps:
+            lo, hi = max(a, src0), min(b, src0 + dur)
+            if hi - lo >= 0.05:
+                remapped.append((m0 + lo - src0, m0 + hi - src0))
+    from director_os.audio_engine.leveling import merge_intervals
+
+    if not remapped:
+        return []
+    merged = merge_intervals(remapped)
+    # the merge pads ±0.15s (word-edge law) — clamp every piece back inside
+    # its master window so a window edge never meter the gap/narration beside it
+    pieces: list[tuple[float, float]] = []
+    for a, b in merged:
+        for m0, _src0, wdur in maps:
+            lo, hi = max(a, m0), min(b, m0 + wdur)
+            if hi - lo > 0:
+                pieces.append((lo, hi))
+    return sorted(pieces)
 
 
 # --------------------------------------------------------------------- runner
@@ -2823,6 +2902,7 @@ def run_pipeline(
                     raw_source=source,
                     timeline=timeline,
                     source_duration_s=_source_duration(deps, asset_id),
+                    asset_id=asset_id,
                 )
                 if not audit.ok:
                     raise PipelineError(f"QA failed: {[c.detail for c in audit.failures]}")

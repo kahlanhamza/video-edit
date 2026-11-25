@@ -223,6 +223,11 @@ class AudioVerification(BaseModel):
     max_delta_noise_db: float = -8.0
     min_snr_improvement_db: float = 6.0
     max_peak_dbtp: float = -1.0
+    # RAW-CLOCK speech windows for the raw reference (full-tape runway):
+    # the final master is a kept-band cut on the MASTER clock — its windows
+    # point at different tape regions. None -> speech_intervals serve both
+    # (source == master clock, the legacy 1:1 render).
+    raw_clock_speech_intervals: list[tuple[float, float]] | None = None
 
 
 def audit_technical(
@@ -398,7 +403,8 @@ def _audio_verification_checks(
 
     if speech_intervals:
         try:
-            raw = measure_snr(verification.raw_audio_path, speech_intervals)
+            raw_intervals = verification.raw_clock_speech_intervals or speech_intervals
+            raw = measure_snr(verification.raw_audio_path, raw_intervals)
             clean = measure_snr(str(path), speech_intervals)
             delta_noise = clean["noise_floor_db"] - raw["noise_floor_db"]
             ok, gate_detail = snr_gate(
