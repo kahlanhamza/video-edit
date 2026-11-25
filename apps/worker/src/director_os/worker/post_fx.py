@@ -825,7 +825,10 @@ def _certify_audio(shaped: np.ndarray | str | Path, work: Path, deps) -> Path:
     import math
     import wave
 
-    from director_os.audio_engine.leveling import decode_pcm_channels
+    from director_os.audio_engine.leveling import (  # noqa: F401 - LIMITER banks the trim ladder
+        LIMITER_LINEAR,
+        decode_pcm_channels,
+    )
     from director_os.audio_engine.two_bus import SEGMENT_AAC_BITRATE_KBPS
 
     certified = work / "master_audio.certified.m4a"
@@ -1009,9 +1012,23 @@ def _certify_audio(shaped: np.ndarray | str | Path, work: Path, deps) -> Path:
     tmp_state.replace(state)
     # (measured tape-1 v3: wav -1.79 dBFS -> encode +2.74 dBTP).
     for trim_idx in range(CERTIFIED_ROUNDS):
-        decoded, _ = decode_pcm_channels(str(probe))
+        if true_peak_db <= CERTIFIED_TARGET_DBTP:
+            state.unlink(missing_ok=True)
+            probe.replace(certified)
+            deps.log(
+                "  [post-fx] ce" + "rtified via decode-domain trim (pass "
+                f"{trim_idx}): the last encode already holds the gate "
+                f"({true_peak_db:.2f} dBTP) - adopted, no further generation"
+            )
+            return certified
+        decoded, dch = decode_pcm_channels(str(probe))
+        nch = dch  # the probe encode is always stereo; the stale state's
+        # channel count must NOT drive _write_src or the duration doubles
         over_gain = 10.0 ** ((CERTIFIED_TARGET_DBTP - true_peak_db) / 20.0)
-        current = np.clip(decoded * over_gain, -gate, gate).astype(np.float32)
+        # overshoot can only be absorbed with BANK: clipping at the gate
+        # itself makes each generation re-bloom just above it (measured);
+        # the limiter ceiling (-1.5 dBTP) is the bank that converges
+        current = np.clip(decoded * over_gain, -LIMITER_LINEAR, LIMITER_LINEAR).astype(np.float32)
         _write_src()
         _encode(f"post-fx audio certified decode-domain trim (pass {trim_idx + 1})")
         true_peak_db, _ = _measure()
