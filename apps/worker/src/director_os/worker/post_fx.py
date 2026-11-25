@@ -355,7 +355,7 @@ def _speech_regions(wav: Path) -> list[tuple[float, float]]:
         return []
 
 
-def _extract_master_audio(master: Path, work: Path) -> Path:
+def _extract_master_audio(master: Path, work: Path, channels: int = 1) -> Path:
     wav = work / "master_audio.wav"
     _run(
         [
@@ -367,7 +367,7 @@ def _extract_master_audio(master: Path, work: Path) -> Path:
             str(master),
             "-vn",
             "-ac",
-            "1",
+            str(channels),
             "-ar",
             "48000",
             "-c:a",
@@ -474,9 +474,30 @@ def stage_post_fx(
 
     # ---- 3. audio enhancement on the master mix
     if marks["audio"].exists():
-        enhanced = work / "master_audio.enhanced.wav"
         report.enhance_engine = marks["audio"].read_text()
+        enhanced = (
+            _extract_master_audio(master, work, channels=2)
+            if report.enhance_engine == "master_mix_2bus"
+            else work / "master_audio.enhanced.wav"
+        )
         deps.log(f"  [post-fx] audio enhance cached ({report.enhance_engine})")
+    elif getattr(deps, "audio_mode", None) == "isolate_2bus":
+        # THE 2-BUS MIX LAW (full-tape runway 2026-11-25): on isolate_2bus the
+        # render already carries the neural-extracted Bus-1 (kept-window
+        # receipts: refinement loop to −11 dBFS dialogue RMS, timbre
+        # restoration EQ, −14 dB duck architecture, −1.5 dBTP limiter). A
+        # SECOND deep-filter pass over the MIX has no loudness target and no
+        # bus law — it re-flattens the calibrated dialogue level (measured
+        # −17.4 dBFS RMS / SNR 12.0 on a legal mix) and re-bakes whatever it
+        # hallucinates over the narrator. The mix IS the enhanced audio.
+        enhanced = _extract_master_audio(master, work, channels=2)
+        report.enhance_engine = "master_mix_2bus"
+        report.snr_after_db = _measure_snr(enhanced)
+        marks["audio"].write_text(report.enhance_engine)
+        deps.log(
+            "  [post-fx] audio: isolate_2bus master ships its calibrated 2-bus "
+            f"mix — no re-enhance (SNR on mix: {report.snr_after_db} dB)"
+        )
     else:
         from director_os.audio_engine.enhance import DeepFilterCliEnhancer
 
