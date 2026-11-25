@@ -84,6 +84,11 @@ class SegmentRenderSpec(BaseModel):
     # part of the cache key, so a re-enhance re-renders exactly these segments.
     enhanced_audio_path: str | None = None
     enhanced_audio_digest: str | None = None
+    # where the enhanced WAV slice starts. The 2-bus master rides the ASSET
+    # clock; `source_start_s` rides the clock of the file actually sliced (a
+    # per-clip baked redaction file starts at 0:00). None -> slice the WAV at
+    # `source_start_s` (raw-source segments: both clocks are the asset clock).
+    enhanced_audio_start_s: float | None = Field(default=None, ge=0.0)
     # --- per-clip baked redaction source (tracked blur baked BEFORE the DAG):
     # the segment cuts from a pre-blurred clip file; `source_digest` (derived
     # from the plan digest + clip range, not a file read) rides the cache key
