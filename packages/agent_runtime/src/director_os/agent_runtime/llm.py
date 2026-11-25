@@ -797,9 +797,24 @@ def build_backend(
         )
     if not model:
         raise LLMBackendError("LLM_MODEL is required when LLM_API_KEY is set")
+    from director_os.agent_runtime.pydantic_brain import PydanticAIBackend, brain_name
+
+    brain = brain_name(s)
     if base_url:
         if provider == "meta" or "api.meta.ai" in base_url:
+            # legacy only: the spend ledger + training gate are safety devices,
+            # not transport details — the brain must not route around them
             return _meta_backend(api_key, model, registry, niche, base_url)
+        if brain == "pydantic_ai":
+            return PydanticAIBackend(
+                api_key,
+                model,
+                registry,
+                niche,
+                base_url=base_url,
+                fallback_models=_env_model_list(s.llm_fallback_models) or None,
+                prompt_char_budget=_groq_prompt_budget(base_url),
+            )
         return OpenAICompatBackend(
             api_key,
             model,
@@ -811,6 +826,21 @@ def build_backend(
         )
     if provider == "meta":
         return _meta_backend(api_key, model, registry, niche, META_DEFAULT_BASE)
+    if brain == "pydantic_ai":
+        return PydanticAIBackend(
+            api_key,
+            model,
+            registry,
+            niche,
+            fallback_models=[
+                m
+                for m in _env_model_list(
+                    os.getenv("GEMINI_FALLBACK_MODELS", DEFAULT_FALLBACK_MODELS)
+                )
+                if m != model
+            ]
+            or None,
+        )
     return GeminiRestBackend(api_key, model, registry, niche)
 
 
@@ -925,9 +955,11 @@ def build_backend_chain(
     Single configured tier -> that backend bare (zero overhead); several ->
     ``FailoverBackend``. Raises only when NOTHING is configured.
     """
+    from director_os.agent_runtime.pydantic_brain import PydanticAIBackend, brain_name
     from director_os.core.config import get_settings
 
     s = get_settings()
+    brain = brain_name(s)
     tiers: list[Any] = []
     if s.llm_api_key or overrides.get("llm_api_key"):
         tiers.append(build_backend(registry, niche, **overrides))
@@ -938,34 +970,63 @@ def build_backend_chain(
             for t in tiers
         )
         if not already:
-            tiers.append(
-                OpenAICompatBackend(
-                    s.openrouter_api_key,
-                    s.openrouter_model or "nvidia/nemotron-3-ultra:free",
-                    registry,
-                    niche,
-                    base_url=s.openrouter_base_url,
-                    # the tier IS the fallback: its own chain rides
-                    # OPENROUTER_FALLBACK_MODELS (catalog-rotation proof)
-                    fallback_models=_env_model_list(s.openrouter_fallback_models) or None,
+            if brain == "pydantic_ai":
+                tiers.append(
+                    PydanticAIBackend(
+                        s.openrouter_api_key,
+                        s.openrouter_model or "nvidia/nemotron-3-ultra:free",
+                        registry,
+                        niche,
+                        base_url=s.openrouter_base_url,
+                        # the tier IS the fallback: its own chain rides
+                        # OPENROUTER_FALLBACK_MODELS (catalog-rotation proof)
+                        fallback_models=_env_model_list(s.openrouter_fallback_models) or None,
+                    )
                 )
-            )
+            else:
+                tiers.append(
+                    OpenAICompatBackend(
+                        s.openrouter_api_key,
+                        s.openrouter_model or "nvidia/nemotron-3-ultra:free",
+                        registry,
+                        niche,
+                        base_url=s.openrouter_base_url,
+                        # the tier IS the fallback: its own chain rides
+                        # OPENROUTER_FALLBACK_MODELS (catalog-rotation proof)
+                        fallback_models=_env_model_list(s.openrouter_fallback_models) or None,
+                    )
+                )
     # The last-resort Gemini tier only makes sense on a REAL AI Studio key —
     # a Groq `gsk_`/OpenRouter `sk-or-` key would just 401 there.
     gemini_key = s.vision_api_key or (
         s.llm_api_key if s.llm_api_key.startswith(("AQ.", "AIza")) else ""
     )
-    if gemini_key and not any(isinstance(t, GeminiRestBackend) for t in tiers):
+    if gemini_key and not any(
+        isinstance(t, GeminiRestBackend) or (isinstance(t, PydanticAIBackend) and not t.base_url)
+        for t in tiers
+    ):
         model = s.vision_model or "gemini-3.5-flash-lite"
-        tiers.append(
-            GeminiRestBackend(
-                gemini_key,
-                model,
-                registry,
-                niche,
-                fallback_models=_env_model_list(s.gemini_fallback_models) or None,
+        gemini_fallbacks = _env_model_list(s.gemini_fallback_models) or None
+        if brain == "pydantic_ai":
+            tiers.append(
+                PydanticAIBackend(
+                    gemini_key,
+                    model,
+                    registry,
+                    niche,
+                    fallback_models=[m for m in (gemini_fallbacks or []) if m != model] or None,
+                )
             )
-        )
+        else:
+            tiers.append(
+                GeminiRestBackend(
+                    gemini_key,
+                    model,
+                    registry,
+                    niche,
+                    fallback_models=_env_model_list(s.gemini_fallback_models) or None,
+                )
+            )
     if not tiers:
         raise LLMBackendError(
             "LLM not configured: set LLM_API_KEY (optionally OPENROUTER_API_KEY / "

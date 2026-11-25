@@ -5,6 +5,7 @@ description = "DirectorOS agent runtime: typed tool registry, director editing t
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.7",
+    "pydantic-ai>=2.67.0",
     "director-os-core",
     "director-os-otio-engine",
     "director-os-subtitles",
