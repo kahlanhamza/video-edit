@@ -126,3 +126,31 @@ def test_two_law_restore_no_spans_is_a_noop(tmp_path):
     out = _two_law_restore(cand, work, _deps(work), None)
     assert out == cand
     assert cand.read_bytes() == before
+
+
+def test_program_fingerprint_follows_the_program(tmp_path):
+    import opentimelineio as otio
+    from director_os.worker.post_fx import _program_fingerprint
+    from opentimelineio.opentime import RationalTime, TimeRange
+
+    master = tmp_path / "master.mp4"
+    master.write_bytes(b"x" * 128)
+
+    def _tl(dur: float):
+        tl = otio.schema.Timeline()
+        tr = otio.schema.Track(name="V1_master")
+        tr.append(
+            otio.schema.Clip(
+                name="a",
+                source_range=TimeRange(
+                    start_time=RationalTime(0.0, 30.0), duration=RationalTime(dur, 30.0)
+                ),
+            )
+        )
+        tl.tracks.append(tr)
+        return tl
+
+    a = _program_fingerprint(_tl(10.0), master)
+    b = _program_fingerprint(_tl(12.0), master)
+    a2 = _program_fingerprint(_tl(10.0), master)
+    assert a == a2 and a != b

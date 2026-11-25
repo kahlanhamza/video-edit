@@ -240,6 +240,7 @@ def apply_repairs(
     *,
     resolution: tuple[int, int] = (1920, 1080),
     log: Any = None,
+    min_final_s: float | None = None,
 ) -> tuple[list[str], list[str]]:
     """Dispatch capped repairs through the SAME DirectorToolbox registry.
 
@@ -275,6 +276,39 @@ def apply_repairs(
             continue
         tool, args = bound
         try:
+            if min_final_s is not None:
+                # DURATION LAW (measured v30): a reviewer repair that drops the
+                # re-rendered master below the QA duration floor must be
+                # refused BEFORE the render, not discovered by QA afterwards
+                # over a wasted encode. The repair is dispatched on a COPY and
+                # the master-track length is measured there.
+                import copy
+
+                from director_os.otio_engine.timeline import (
+                    MASTER_TRACK,
+                    is_gap,
+                    item_duration_s,
+                    track_by_name,
+                )
+
+                probe_tl = copy.deepcopy(timeline)
+                probe_registry = build_director_registry(
+                    DirectorToolbox(probe_tl, project_id, resolution)
+                )
+                probe_registry.dispatch(tool, args)
+                track = track_by_name(probe_tl, MASTER_TRACK)
+                total = (
+                    sum(item_duration_s(it) for it in track if not is_gap(it))
+                    if track is not None
+                    else None
+                )
+                if total is not None and total < float(min_final_s):
+                    refused.append(
+                        f"{tool} #{r.item_index}: DURATION LAW - repairs would shorten the "
+                        f"master to {total:.1f}s, below the QA floor {float(min_final_s):.1f}s; "
+                        "refused without burning the re-render"
+                    )
+                    continue
             result = registry.dispatch(tool, args)
             detail = str((result or {}).get("detail", "")) if isinstance(result, dict) else ""
             applied.append(f"{tool} #{r.item_index}: {r.reason or detail}")

@@ -462,3 +462,36 @@ def test_build_review_backend_accepts_fulfilled_port(tmp_path):
     backend = _fake_backend(ReviewVerdict())
     deps = _deps(tmp_path, backend=backend)
     assert build_review_backend(deps) is backend
+
+
+def test_apply_repairs_duration_floor_refused_before_render(timeline):
+    from director_os.otio_engine.timeline import track_by_name
+
+    applied, refused = apply_repairs(
+        timeline,
+        PROJECT,
+        [_rr(kind="remove_clip", item_index=1, reason="dead air")],
+        min_final_s=20.0,
+    )
+    assert applied == []
+    assert refused and "DURATION LAW" in refused[0]
+    items = list(track_by_name(timeline, MASTER_TRACK))
+    assert len(items) == 4  # the program is untouched - no re-render is burned
+
+
+def test_apply_repairs_duration_floor_allows_safe_repairs(timeline):
+    applied, refused = apply_repairs(
+        timeline,
+        PROJECT,
+        [
+            ReviewRepair(
+                kind="trim_raw",
+                item_index=1,
+                new_start_s=10.0,
+                new_dur_s=6.0,
+                reason="tighten dead air",
+            )
+        ],
+        min_final_s=20.0,
+    )
+    assert refused == [] and len(applied) == 1

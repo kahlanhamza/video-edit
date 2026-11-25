@@ -3019,7 +3019,14 @@ def run_pipeline(
                 break
             from director_os.worker.review_pass import stage_review
 
-            review = stage_review(final_for_qa, timeline, [], project_id, deps)
+            review = stage_review(
+                final_for_qa,
+                timeline,
+                [],
+                project_id,
+                deps,
+                source_duration_s=_source_duration(deps, asset_id),
+            )
             if review.status != "applied":
                 break
             _persist_timeline_version(

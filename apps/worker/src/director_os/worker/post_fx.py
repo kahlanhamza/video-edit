@@ -109,6 +109,60 @@ def _markers(work: Path) -> dict[str, Path]:
     }
 
 
+def _audio_duration_s(path: Path) -> float | None:
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        return float(r.stdout.strip().splitlines()[0])
+    except Exception:  # noqa: BLE001 - probe failures void the comparison, not the run
+        return None
+
+
+def _timeline_master_dur_s(timeline) -> float | None:
+    try:
+        from director_os.otio_engine.timeline import (
+            MASTER_TRACK,
+            is_gap,
+            item_duration_s,
+            track_by_name,
+        )
+
+        track = track_by_name(timeline, MASTER_TRACK)
+        if track is None:
+            return None
+        return sum(item_duration_s(it) for it in track if not is_gap(it))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _program_fingerprint(timeline, master: Path) -> str:
+    import hashlib
+
+    try:
+        import opentimelineio as otio
+
+        tl_txt = otio.adapters.write_to_string(timeline, "otio_json")
+    except Exception:  # noqa: BLE001 - worst case: repr digest
+        tl_txt = repr(timeline)[:20000]
+    dur = _audio_duration_s(master)
+    size = master.stat().st_size if master.exists() else 0
+    seed = f"{tl_txt}\n{master.name}|{dur}|{size}"
+    return hashlib.sha1(seed.encode("utf-8", "replace")).hexdigest()[:20]
+
+
 # the sandbox watchdog kills long processes: the blur render is CHUNKED
 # (~150s of master per chunk, one .done marker each) so a killed run resumes
 # at the exact chunk instead of re-rendering 10 minutes of frames
@@ -460,6 +514,20 @@ def stage_post_fx(
     marks = _markers(work)
     report = PostFxReport()
 
+    # the marks key on the PROGRAM, not on the work dir: a re-timed master
+    # (new timeline version, new mix) must never inherit the previous
+    # program's cached passes (measured v30: the 599.9s review cut adopted
+    # the 766s program's entire cache and re-gained the wrong certified m4a)
+    fp_path = work / "program.fp"
+    fp = _program_fingerprint(timeline, master)
+    if fp_path.exists() and fp_path.read_text().strip() != fp:
+        deps.log("  [post-fx] program changed (re-timed master) - invalidating stale post-fx marks")
+        for _m in marks.values():
+            _m.unlink(missing_ok=True)
+        for _stale in work.glob("blur_chunk_*.done"):
+            _stale.unlink(missing_ok=True)
+    fp_path.write_text(fp)
+
     # ---- 1. captions
     if marks["captions"].exists():
         report.n_caption_cues = int(marks["captions"].read_text() or 0)
@@ -635,7 +703,11 @@ def stage_post_fx(
     # both laws on the final certified audio (peak + loudness) - the cached
     # resume path must never adopt a file the QA window would refuse
     certified = _two_law_restore(
-        certified, work, deps, _master_speech_spans(enhance_info, timeline)
+        certified,
+        work,
+        deps,
+        _master_speech_spans(enhance_info, timeline),
+        expected_s=_timeline_master_dur_s(timeline),
     )
     # the certified audio: encoded ONCE standalone (inside the leveling pass
     # or right above — never both), its true peak measured in its own
@@ -833,6 +905,7 @@ def _two_law_restore(
     work: Path,
     deps,
     speech_spans: list[tuple[float, float]] | None,
+    expected_s: float | None = None,
 ) -> Path:
     """Both laws on the certified audio: true peak AND loudness.
 
@@ -849,6 +922,26 @@ def _two_law_restore(
     untouched candidate. Exhausting the passes fails LOUD - a law-violating
     file is never shipped, and QA judges a file this pass already proved.
     """
+    leveled = work / "master_audio.leveled.wav"
+    if leveled.exists():
+        cand_dur = _audio_duration_s(candidate)
+        lev_dur = _audio_duration_s(leveled)
+        if cand_dur is not None and lev_dur is not None and abs(cand_dur - lev_dur) > 1.0:
+            raise PostFxError(
+                f"two-law duration parity refused: candidate {cand_dur:.2f}s vs the "
+                f"program's leveled mix {lev_dur:.2f}s - a certified file from a "
+                "DIFFERENT program was offered; rebuilding this program's own "
+                "certification instead of re-gaining a foreign file"
+            )
+    if expected_s is not None:
+        cand_dur = _audio_duration_s(candidate)
+        if cand_dur is not None and abs(cand_dur - expected_s) > 1.5:
+            raise PostFxError(
+                f"two-law duration parity refused: candidate {cand_dur:.2f}s vs this "
+                f"program's master length {expected_s:.2f}s - the certified audio and "
+                "the video must be the SAME program; adoption without parity would "
+                "mux a foreign track (measured v30)"
+            )
     if not speech_spans:
         return candidate
     import math

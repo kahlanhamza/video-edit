@@ -189,6 +189,7 @@ def stage_review(
     audit_failures: list[str],
     project_id: str,
     deps: Any,
+    source_duration_s: float | None = None,
 ) -> ReviewOutcome:
     """The agentic review: LOOK (on demand) -> judge -> repair (maybe).
 
@@ -299,8 +300,17 @@ def stage_review(
         getattr(deps, "log", lambda _m: None)(f"  [review] {outcome.summary}")
         return outcome
 
+    min_final_s: float | None = None
+    if source_duration_s:
+        from director_os.agent_runtime.doc_scale import doc_scale
+
+        min_final_s = doc_scale(float(source_duration_s)).min_final_s
     applied, refused = apply_repairs(
-        timeline, project_id, verdict.repairs, log=getattr(deps, "log", None)
+        timeline,
+        project_id,
+        verdict.repairs,
+        log=getattr(deps, "log", None),
+        min_final_s=min_final_s,
     )
     outcome.applied = applied
     outcome.refused = refused
