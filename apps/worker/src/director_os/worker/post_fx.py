@@ -632,6 +632,11 @@ def stage_post_fx(
             # chaotic bitstream
             certified = out
 
+    # both laws on the final certified audio (peak + loudness) - the cached
+    # resume path must never adopt a file the QA window would refuse
+    certified = _two_law_restore(
+        certified, work, deps, _master_speech_spans(enhance_info, timeline)
+    )
     # the certified audio: encoded ONCE standalone (inside the leveling pass
     # or right above — never both), its true peak measured in its own
     # bitstream; the mux STREAM-COPIES it — a re-encode is a chaotic
@@ -767,7 +772,7 @@ def _leveling_pass(enhanced: Path, timeline, enhance_info, work: Path, report, d
     # the wav is durable BEFORE the certify rounds — a window killed inside
     # certify re-enters, finds the m4a only when the rounds COMPLETED, and
     # otherwise re-encodes from this byte-identical shaped mix
-    certified = _certify_audio(leveled, work, deps)
+    certified = _certify_audio(leveled, work, deps, speech_spans=spans)
     report.certified_audio = True
     deps.log(
         f"  [post-fx] leveling: dialogue {measured:.1f} dBFS -> target "
@@ -786,6 +791,8 @@ def _leveling_pass(enhanced: Path, timeline, enhance_info, work: Path, report, d
 # the zero-clipping gate, and the mux CARRIES THAT ENCODE (-c:a copy): the
 # shipped audio is bit-identical to the certified file.
 CERTIFIED_TARGET_DBTP = -1.0
+RESTORE_TARGET_DBFS = -11.5
+RESTORE_CEILING_DBTP = -2.0
 CERTIFIED_ROUNDS = 6
 CERTIFIED_DIP_WIDTH_S = 0.16
 CERTIFIED_DIP_MAX_DB = 8.0
@@ -809,7 +816,152 @@ def _m4a_peak_ok(path: Path) -> bool:
     return 20 * math.log10(peak + 1e-9) <= float(CERTIFIED_TARGET_DBTP)
 
 
-def _certify_audio(shaped: np.ndarray | str | Path, work: Path, deps) -> Path:
+def _master_speech_spans(enhance_info, timeline) -> list[tuple[float, float]] | None:
+    """The master-clock dialogue spans the loudness law meters (QA parity)."""
+    if enhance_info is None or timeline is None:
+        return None
+    spans = [tuple(x) for x in (enhance_info.speech_intervals or [])]
+    if not spans:
+        return None
+    from director_os.worker.pipeline import master_clock_speech_intervals
+
+    return master_clock_speech_intervals(spans, timeline) or None
+
+
+def _two_law_restore(
+    candidate: Path,
+    work: Path,
+    deps,
+    speech_spans: list[tuple[float, float]] | None,
+) -> Path:
+    """Both laws on the certified audio: true peak AND loudness.
+
+    The peak ladder above optimizes ONLY the true-peak gate; on a wall-limited
+    low-crest mix its repeated descale gains cost the program its loudness
+    (measured tape-1 v3: dialogue -11.09 dBFS leveled -> -14.87 shipped, a
+    uniform -3.78 dB at crest +3.7 - QA refused at the speech window).
+    This law re-gains the decoded candidate toward the dialogue target with
+    the proven soft limiter (ceiling_limit_pcm) riding a LOWER rail
+    (-2.0 dBTP: 1 dB of margin for the AAC ring below the -1.0 gate).
+    The candidate is atomically replaced ONLY when a measured encode holds
+    BOTH laws. Bounded; a killed window restarts deterministically from the
+    untouched candidate. Exhausting the passes fails LOUD - a law-violating
+    file is never shipped, and QA judges a file this pass already proved.
+    """
+    if not speech_spans:
+        return candidate
+    import math
+    import wave
+
+    from director_os.audio_engine.leveling import (
+        SPEECH_LO_DBFS,
+        ceiling_limit_pcm,
+        decode_pcm_channels,
+        merge_intervals,
+        rms_dbfs,
+    )
+    from director_os.audio_engine.two_bus import SEGMENT_AAC_BITRATE_KBPS
+
+    merged = merge_intervals(list(speech_spans))
+    sr = 48000
+    gate_lin = 10 ** (CERTIFIED_TARGET_DBTP / 20.0)
+    rail_lin = 10 ** (RESTORE_CEILING_DBTP / 20.0)
+    gen = work / "restore_gen.m4a"
+    gen_src = work / "restore_gen_src.wav"
+
+    def _laws(path: Path) -> tuple[float, float]:
+        pcm, ch = decode_pcm_channels(str(path))
+        frames = pcm.reshape(-1, ch) if ch > 1 else pcm.reshape(-1, 1)
+        peak = 20 * math.log10(float(np.abs(frames).max()) + 1e-9)
+        mono = frames.mean(axis=1) if ch > 1 else frames[:, 0]
+        slices = [mono[int(s * sr) : min(int(e * sr), mono.size)] for s, e in merged]
+        speech = (
+            rms_dbfs(np.concatenate([x for x in slices if x.size]))
+            if any(x.size for x in slices)
+            else -120.0
+        )
+        return peak, speech
+
+    cur = candidate
+    peak_db, speech_db = -120.0, -120.0
+    for pass_idx in range(6):
+        try:
+            peak_db, speech_db = _laws(cur)
+        except Exception:  # noqa: BLE001 - a killed encode left a corrupt gen
+            if cur == candidate:
+                raise
+            cur = candidate
+            continue
+        peak_ok = peak_db <= CERTIFIED_TARGET_DBTP
+        speech_ok = speech_db >= SPEECH_LO_DBFS
+        if peak_ok and speech_ok:
+            if cur != candidate:
+                cur.replace(candidate)
+            deps.log(
+                f"  [post-fx] audio two-law ok: true peak {peak_db:.2f} dBTP, "
+                f"dialogue {speech_db:.1f} dBFS (floor {SPEECH_LO_DBFS:g})"
+            )
+            return candidate
+        if speech_ok:
+            need_db = CERTIFIED_TARGET_DBTP - peak_db
+        else:
+            need_db = max(0.0, RESTORE_TARGET_DBFS - speech_db)
+        pcm, ch = decode_pcm_channels(str(cur))
+        mono = pcm.reshape(-1, ch).mean(axis=1) if ch > 1 else pcm
+        limit = min(rail_lin, gate_lin) if need_db > 0 else gate_lin
+        shaped = ceiling_limit_pcm(
+            (mono * 10 ** (need_db / 20.0)).astype(np.float32),
+            sr,
+            limit,
+            channels=1,
+            release_ms=20,
+        )
+        with wave.open(str(gen_src), "wb") as f:
+            f.setnchannels(1)
+            f.setsampwidth(2)
+            f.setframerate(sr)
+            f.writeframes((np.clip(shaped, -1, 1) * 32767).astype("<i2").tobytes())
+        _run(
+            [
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-i",
+                str(gen_src),
+                "-af",
+                "pan=stereo|c0=c0|c1=c0",
+                "-c:a",
+                "aac",
+                "-b:a",
+                f"{SEGMENT_AAC_BITRATE_KBPS}k",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                str(gen),
+            ],
+            "post-fx audio two-law restore encode",
+        )
+        deps.log(
+            f"  [post-fx] audio two-law restore pass {pass_idx + 1}: "
+            f"peak {peak_db:.2f} dBTP toward the {RESTORE_CEILING_DBTP:g} rail, "
+            f"dialogue {speech_db:.1f} -> {RESTORE_TARGET_DBFS:g} dBFS target"
+        )
+        cur = gen
+    raise PostFxError(
+        "two-law certify did not converge: last candidate peak "
+        f"{peak_db:.2f} dBTP (gate {CERTIFIED_TARGET_DBTP:g}), dialogue {speech_db:.1f} dBFS "
+        f"(floor {SPEECH_LO_DBFS:g}) - refusing to ship"
+    )
+
+
+def _certify_audio(
+    shaped: np.ndarray | str | Path,
+    work: Path,
+    deps,
+    speech_spans: list[tuple[float, float]] | None = None,
+) -> Path:
     """Encode the shaped mix ONCE, dip over-gate spots, re-encode until the
     standalone encode's true peak holds the zero-clipping gate, and return
     the certified m4a. The mux then copies it (-c:a copy) — the shipped
@@ -943,7 +1095,7 @@ def _certify_audio(shaped: np.ndarray | str | Path, work: Path, deps) -> Path:
                 f"  [post-fx] audio certified round {round_idx + 1}: true peak "
                 f"{true_peak_db:.2f} dBTP <= {CERTIFIED_TARGET_DBTP:g} gate"
             )
-            return certified
+            return _two_law_restore(certified, work, deps, speech_spans)
 
         over = np.flatnonzero(frames > gate)
         splits = np.where(np.diff(over) > int(0.25 * 48000))[0] + 1
@@ -1020,7 +1172,7 @@ def _certify_audio(shaped: np.ndarray | str | Path, work: Path, deps) -> Path:
                 f"{trim_idx}): the last encode already holds the gate "
                 f"({true_peak_db:.2f} dBTP) - adopted, no further generation"
             )
-            return certified
+            return _two_law_restore(certified, work, deps, speech_spans)
         decoded, dch = decode_pcm_channels(str(probe))
         nch = dch  # the probe encode is always stereo; the stale state's
         # channel count must NOT drive _write_src or the duration doubles
@@ -1039,16 +1191,17 @@ def _certify_audio(shaped: np.ndarray | str | Path, work: Path, deps) -> Path:
                 "  [post-fx] ce" + "rtified via decode-domain trim "
                 f"(pass {trim_idx + 1}): true peak {true_peak_db:.2f} dBTP",
             )
-            return certified
+            return _two_law_restore(certified, work, deps, speech_spans)
     # the trims still landed hot (encoder chaos) - it ships and the
     # zero-clipping QA gate judges the final file honestly; the round
     # checkpoint SURVIVES so a re-entry converges without replaying rounds
     probe.replace(certified)
     deps.log(
         f"  [post-fx] audio certified: bounded rounds exhausted, true peak "
-        f"{true_peak_db:.2f} dBTP ships; QA judges the final file"
+        f"{true_peak_db:.2f} dBTP ships; QA judges the final file - the two-law"
+        f" pass first restores the dialogue"
     )
-    return certified
+    return _two_law_restore(certified, work, deps, speech_spans)
 
 
 def _measure_snr(wav: Path) -> float | None:
