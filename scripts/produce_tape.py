@@ -96,8 +96,15 @@ def deps_sessions_from(settings):
     return _sessions()
 
 
-def make_transcribe(settings):
-    """Gladia callable on a clean 16k mono WAV (small upload)."""
+def make_transcribe(settings, sessions=None):
+    """Gladia callable on a clean 16k mono WAV (small upload).
+
+    With `sessions`, the (provider, sha256) ASR cache wraps the client —
+    the owner's standing law (2026-11-23): never upload the same bytes
+    twice. A 43-minute wav re-extracted + re-uploaded inside every kill
+    window (bare client) NEVER converges: the job id is persisted BEFORE
+    polling, so the next window adopts the SAME Gladia id and only polls.
+    """
     from director_os.perception.gladia import GladiaClient
 
     gladia = GladiaClient(api_key=settings.gladia_api_key, contact_email=settings.contact_email)
@@ -122,8 +129,12 @@ def make_transcribe(settings):
             check=True,
             capture_output=True,
         )
-        print(f"  [asr] uploading {wav.stat().st_size / 1e6:.1f} MB 16k mono wav to Gladia...")
-        return gladia.transcribe(wav, asset_id)
+        print(f"  [asr] preparing {wav.stat().st_size / 1e6:.1f} MB 16k mono wav for Gladia...")
+        if sessions is None:
+            return gladia.transcribe(wav, asset_id)
+        from director_os.perception.asr_cache import CachedTranscriber
+
+        return CachedTranscriber(gladia, sessions, log=print).transcribe(wav, asset_id)
 
     return transcribe
 
@@ -279,13 +290,16 @@ def main() -> int:
 
     deps = make_deps(
         settings.database_url,
-        transcribe=None if args.skip_asr else make_transcribe(settings),
+        transcribe=None,
         video=VideoRenderSpec(w=w, h=h, fps=30),
         redact_backend="yunet",
         vision_enrich=False,
         llm_direct=not args.no_llm,
         log=lambda m: print(m),
     )
+
+    if not args.skip_asr and deps.transcribe is None:
+        deps.transcribe = make_transcribe(deps.settings, sessions=deps.sessions)
 
     if args.project_id:
         pid = args.project_id

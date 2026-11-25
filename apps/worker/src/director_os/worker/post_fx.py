@@ -701,6 +701,17 @@ def _leveling_pass(enhanced: Path, timeline, enhance_info, work: Path, report, d
 
     ceiling = LIMITER_LINEAR
 
+    # the resume seam: a previous window may have died INSIDE the certify
+    # rounds (round feed-encode of a 766s mix is ~71s each). If the master_audio.certified.m4a
+    # already exists, its content IS the certified mix — the loop never
+    # re-runs and the windows converge instead of certifying forever.
+    resumed = work / "master_audio.certified.m4a"
+    if resumed.exists():
+        report.level_engine = "resumed_confirmed_m4a"
+        report.level_gain_db = 0.0
+        deps.log("  [post-fx] leveling: certified m4a already on disk — resume adopts it")
+        return resumed
+
     pcm = decode_pcm_mono(enhanced)
     sr = 48000
     merged = merge_intervals(spans)
@@ -746,15 +757,18 @@ def _leveling_pass(enhanced: Path, timeline, enhance_info, work: Path, report, d
     # the encode's own true peak holds the zero-clipping gate; the mux then
     # STREAM-COPIES the certified m4a (a re-encode is an uncertifiable
     # chaotic bitstream — measured, tape-1 v2).
-    certified = _certify_audio(shaped, work, deps)
-    report.certified_audio = True
-
+    shaped_to_write = np.clip(shaped, -1, 1)
     leveled = work / "master_audio.leveled.wav"
     with wave.open(str(leveled), "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(sr)
-        w.writeframes((np.clip(shaped, -1, 1) * 32767).astype("<i2").tobytes())
+        w.writeframes((shaped_to_write * 32767).astype("<i2").tobytes())
+    # the wav is durable BEFORE the certify rounds — a window killed inside
+    # certify re-enters, finds the m4a only when the rounds COMPLETED, and
+    # otherwise re-encodes from this byte-identical shaped mix
+    certified = _certify_audio(leveled, work, deps)
+    report.certified_audio = True
     deps.log(
         f"  [post-fx] leveling: dialogue {measured:.1f} dBFS -> target "
         f"{DEFAULT_TARGET_DBFS:g} (gain {gain_total:+.1f} dB refined, "
