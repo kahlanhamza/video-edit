@@ -792,7 +792,7 @@ def _leveling_pass(enhanced: Path, timeline, enhance_info, work: Path, report, d
 # shipped audio is bit-identical to the certified file.
 CERTIFIED_TARGET_DBTP = -1.0
 RESTORE_TARGET_DBFS = -11.5
-RESTORE_CEILING_DBTP = -2.0
+RESTORE_CEILING_DBTP = -1.8
 CERTIFIED_ROUNDS = 6
 CERTIFIED_DIP_WIDTH_S = 0.16
 CERTIFIED_DIP_MAX_DB = 8.0
@@ -840,9 +840,10 @@ def _two_law_restore(
     low-crest mix its repeated descale gains cost the program its loudness
     (measured tape-1 v3: dialogue -11.09 dBFS leveled -> -14.87 shipped, a
     uniform -3.78 dB at crest +3.7 - QA refused at the speech window).
-    This law re-gains the decoded candidate toward the dialogue target with
-    the proven soft limiter (ceiling_limit_pcm) riding a LOWER rail
-    (-2.0 dBTP: 1 dB of margin for the AAC ring below the -1.0 gate).
+    This law re-gains the decoded candidate toward the dialogue target and
+    HARD-clips at a lower rail (-1.8 dBTP): soft limiter plates keep the AAC
+    ring loose (+0.7..+1.7 dB generation to generation) while the strict
+    clip plate is the shape whose ring is measured stable (+0.04 dB).
     The candidate is atomically replaced ONLY when a measured encode holds
     BOTH laws. Bounded; a killed window restarts deterministically from the
     untouched candidate. Exhausting the passes fails LOUD - a law-violating
@@ -855,7 +856,6 @@ def _two_law_restore(
 
     from director_os.audio_engine.leveling import (
         SPEECH_LO_DBFS,
-        ceiling_limit_pcm,
         decode_pcm_channels,
         merge_intervals,
         rms_dbfs,
@@ -884,7 +884,7 @@ def _two_law_restore(
 
     cur = candidate
     peak_db, speech_db = -120.0, -120.0
-    for pass_idx in range(6):
+    for pass_idx in range(12):
         try:
             peak_db, speech_db = _laws(cur)
         except Exception:  # noqa: BLE001 - a killed encode left a corrupt gen
@@ -909,13 +909,13 @@ def _two_law_restore(
         pcm, ch = decode_pcm_channels(str(cur))
         mono = pcm.reshape(-1, ch).mean(axis=1) if ch > 1 else pcm
         limit = min(rail_lin, gate_lin) if need_db > 0 else gate_lin
-        shaped = ceiling_limit_pcm(
-            (mono * 10 ** (need_db / 20.0)).astype(np.float32),
-            sr,
-            limit,
-            channels=1,
-            release_ms=20,
-        )
+        # HARD clip at the rail, never a soft limiter: the wall-limited shape
+        # keeps a look-ahead limiter globally engaged (the concave response -
+        # a +2.6 dB request realized +0.3), and soft plates ring the AAC
+        # encoder +0.7..+1.7 dB generation to generation, so no candidate can
+        # hold both laws. The strict plate is the shape whose ring is
+        # MEASURED STABLE (+0.04 dB twice on tape-1 v3: -1.5 clip -> -1.46 TP).
+        shaped = np.clip(mono * 10 ** (need_db / 20.0), -limit, limit).astype(np.float32)
         with wave.open(str(gen_src), "wb") as f:
             f.setnchannels(1)
             f.setsampwidth(2)
