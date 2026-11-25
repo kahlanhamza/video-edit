@@ -231,7 +231,17 @@ def render_segment(spec: SegmentRenderSpec, src_path: str | None, out_path: str 
     cmd = build_segment_cmd(spec, src_path, out_path)
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        raise RenderError(f"segment render failed ({out_path}):\n{r.stderr[-2000:]}")
+        # the failing command is part of the receipt: an empty stderr with no
+        # command line is a maze (measured: a silent empty-body failure on the
+        # Eustis t2 render)
+        import shlex
+
+        raise RenderError(
+            f"segment render failed (rc={r.returncode}, {out_path}):\n"
+            + " ".join(shlex.quote(str(c)) for c in cmd)[:1600]
+            + "\nSTDERR: "
+            + r.stderr[-1500:]
+        )
 
 
 def render_one(seg: SegmentRender, cache: SegmentCache) -> Path:
