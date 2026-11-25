@@ -212,3 +212,91 @@ def test_a1_trimmed_block_shifts_narration_stamps_by_vo_in():
     assert all(b.start_ms >= 0 for b in narr)
     first_word_ms = narr[0].words[0].start_ms
     assert 0 <= first_word_ms < 1_000  # shifted into the block, not at stem 1.9s->400ms
+
+
+def test_proofread_garble_mask_renders_inaudible_tag():
+    """A supervisor-masked word renders *inaudible* — tagged, never dropped.
+
+    Measured live: 19 masked words in the Eustis proofread vanished silently
+    (the words_src text filter), so the runbook §2.1 caption-truth law had no
+    representation in the pipeline burn.
+    """
+    from director_os.otio_engine.timeline import build_timeline as _bt
+
+    spec = TimelineSpec(
+        name="garble",
+        fps=30,
+        width=640,
+        height=360,
+        tracks=[
+            TrackSpec(
+                name="V1_master",
+                items=[
+                    ClipSpec(
+                        name="raw1",
+                        source_start_s=100.0,
+                        dur_s=10.0,
+                        meta=RawClipMeta(asset_id="a"),
+                    ),
+                ],
+            ),
+            TrackSpec(name="V2_overlay_cards", items=[GapSpec(dur_s=10.0)]),
+        ],
+    )
+    tl = _bt(spec)
+    transcript = {
+        "proofread": {
+            "words": [
+                {"text": "get", "start_s": 101.0, "end_s": 101.4, "speaker": "Officer"},
+                {"text": "", "start_s": 101.5, "end_s": 102.2, "speaker": "Officer"},
+                {"text": "", "start_s": 102.3, "end_s": 103.0, "speaker": "Officer"},
+                {"text": "on the ground", "start_s": 103.1, "end_s": 103.8, "speaker": "Officer"},
+            ],
+            "supervised": True,
+        }
+    }
+    beats, stats = build_master_caption_cues(tl, transcript, {})
+    joined = " ".join(b.text for b in beats)
+    assert "*inaudible*" in joined
+    assert "on the ground" in joined
+    assert stats["raw"] >= 2
+    # masked words keep their real timings (the supervisor's word-lock law)
+    tag_beat = next(b for b in beats if "*inaudible*" in b.text)
+    tag_word = next(w for w in tag_beat.words if w.word == "*inaudible*")
+    assert tag_word.start_ms == 1500
+    assert tag_word.end_ms == 2200
+
+
+def test_raw_asr_fallback_never_grows_tags():
+    """Without a proofread pass the raw-ASR fallback path is untouched."""
+    from director_os.otio_engine.timeline import build_timeline as _bt
+
+    spec = TimelineSpec(
+        name="rawonly",
+        fps=30,
+        width=640,
+        height=360,
+        tracks=[
+            TrackSpec(
+                name="V1_master",
+                items=[
+                    ClipSpec(
+                        name="raw1",
+                        source_start_s=100.0,
+                        dur_s=10.0,
+                        meta=RawClipMeta(asset_id="a"),
+                    ),
+                ],
+            ),
+            TrackSpec(name="V2_overlay_cards", items=[GapSpec(dur_s=10.0)]),
+        ],
+    )
+    tl = _bt(spec)
+    transcript = {
+        "words": [
+            {"text": "visible speech", "start_s": 101.0, "end_s": 101.8, "speaker": "Officer"},
+        ]
+    }
+    beats, _ = build_master_caption_cues(tl, transcript, {})
+    assert [b.text for b in beats] == ["visible speech"]
+    assert not any("inaudible" in b.text for b in beats)
