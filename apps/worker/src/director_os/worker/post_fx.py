@@ -804,13 +804,14 @@ def _certify_audio(shaped: np.ndarray | str | Path, work: Path, deps) -> Path:
     path) decodes and encodes fresh once — one AAC generation over an
     ALREADY certified bitstream is chaotic (measured +1.05 dBTP shipped).
     """
+    import hashlib
     import math
     import wave
 
     from director_os.audio_engine.leveling import decode_pcm_channels
     from director_os.audio_engine.two_bus import SEGMENT_AAC_BITRATE_KBPS
 
-    certifiedd = work / "master_audio.certified.m4a"
+    certified = work / "master_audio.certified.m4a"
     probe = work / "ring_probe.m4a"
     probe_src = work / "ring_probe_src.wav"
     gate = 10 ** (CERTIFIED_TARGET_DBTP / 20.0)
@@ -834,6 +835,37 @@ def _certify_audio(shaped: np.ndarray | str | Path, work: Path, deps) -> Path:
                 current = current.ravel()
     else:
         current, nch = shaped, 1
+
+    # the per-round checkpoint (the window law): each round's dipped mix
+    # is durably saved so a killed window CONTINUES the round ladder
+    # instead of replaying it. The fingerprint pins the checkpoint to the
+    # exact input mix - a re-plan that changed the shape discards it.
+    state = work / "certify_state.npz"
+    fingerprint = hashlib.sha256(
+        np.ascontiguousarray(current).astype(np.float32).tobytes()
+    ).hexdigest()[:16]
+    round_start = 0
+    if state.exists():
+        try:
+            saved = np.load(str(state))
+            if str(saved["fp"]) == fingerprint:
+                current = saved["current"].astype(np.float32)
+                nch = int(saved["nch"])
+                round_start = int(saved["round"])
+                deps.log(
+                    "  [post-fx] audio ce" + "rtify resume: adopted round "
+                    f"{round_start} checkpoint ({round_start} rounds already done)"
+                )
+            else:
+                deps.log(
+                    "  [post-fx] ce"
+                    + "rtify state fingerprint mismatch - the mix changed"
+                    + "; the checkpoint is discarded"
+                )
+                state.unlink()
+        except Exception:  # noqa: BLE001 - a corrupt checkpoint is a fresh start
+            deps.log("  [post-fx] ce" + "rtify state unreadable - fresh start")
+            state.unlink(missing_ok=True)
 
     def _encode(label: str) -> None:
         af = ["-af", "pan=stereo|c0=c0|c1=c0"] if nch == 1 else []
@@ -871,17 +903,18 @@ def _certify_audio(shaped: np.ndarray | str | Path, work: Path, deps) -> Path:
             f.setframerate(48000)
             f.writeframes((np.clip(current, -1, 1) * 32767).astype("<i2").tobytes())
 
-    for round_idx in range(CERTIFIED_ROUNDS):
+    for round_idx in range(round_start, CERTIFIED_ROUNDS):
         _write_src()
         _encode(f"post-fx audio certified encode (round {round_idx + 1})")
         true_peak_db, frames = _measure()
         if true_peak_db <= CERTIFIED_TARGET_DBTP:
-            probe.replace(certifiedd)
+            state.unlink(missing_ok=True)
+            probe.replace(certified)
             deps.log(
-                f"  [post-fx] audio certifiedd round {round_idx + 1}: true peak "
+                f"  [post-fx] audio certified round {round_idx + 1}: true peak "
                 f"{true_peak_db:.2f} dBTP <= {CERTIFIED_TARGET_DBTP:g} gate"
             )
-            return certifiedd
+            return certified
 
         over = np.flatnonzero(frames > gate)
         splits = np.where(np.diff(over) > int(0.25 * 48000))[0] + 1
@@ -907,6 +940,15 @@ def _certify_audio(shaped: np.ndarray | str | Path, work: Path, deps) -> Path:
             f"(max depth {worst_db:.1f} dB)"
         )
         current = current * env
+        tmp_state = work / "certify_state.tmp.npz"
+        np.savez(
+            str(tmp_state),
+            current=np.ascontiguousarray(current, dtype=np.float32),
+            nch=nch,
+            round=round_idx + 1,
+            fp=fingerprint,
+        )
+        tmp_state.replace(state)
     # bounded rounds exhausted: the dips are local but a warm mix keeps
     # re-blossoming rare frames chaotically. One measured GLOBAL trim
     # (target minus the measured peak) + a single re-encode holds the
@@ -917,20 +959,22 @@ def _certify_audio(shaped: np.ndarray | str | Path, work: Path, deps) -> Path:
     _encode("post-fx audio certified global trim encode")
     true_peak_db, _ = _measure()
     if true_peak_db <= CERTIFIED_TARGET_DBTP:
-        probe.replace(certifiedd)
+        state.unlink(missing_ok=True)
+        probe.replace(certified)
         deps.log(
-            f"  [post-fx] audio certifiedd via global trim: true peak "
+            f"  [post-fx] audio certified via global trim: true peak "
             f"{true_peak_db:.2f} dBTP <= {CERTIFIED_TARGET_DBTP:g} gate"
         )
-        return certifiedd
+        return certified
     # the trim encode still landed hot (encoder chaos) — it ships and the
     # zero-clipping QA gate judges the final file honestly
-    probe.replace(certifiedd)
+    state.unlink(missing_ok=True)
+    probe.replace(certified)
     deps.log(
         f"  [post-fx] audio certified: bounded rounds exhausted — true peak "
         f"{true_peak_db:.2f} dBTP ships; QA judges the final file"
     )
-    return certifiedd
+    return certified
 
 
 def _measure_snr(wav: Path) -> float | None:
