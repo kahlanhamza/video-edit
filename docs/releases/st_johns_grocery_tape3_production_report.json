@@ -1,0 +1,54 @@
+{
+  "tape": "Tape 3 - St. Johns County FL: the half-gallon of milk (Publix bodycam)",
+  "slug": "st_johns_grocery_tape3",
+  "engine": "HyperFrames 0.9.104 (heygen-com/hyperframes) - HTML composition rendered deterministically to MP4; LLM (Z.ai GLM) acted as editorial brain",
+  "owner_recipe": "upload/notebook89ea144f9a (2).ipynb (uploaded 2026-11-28) - Gladia Solaria-3 ASR, owner-written edit plan + narration, edge-tts en-US-BrianMultilingualNeural +5%, DeepFilterNet3 + EQ chain, two-lane role-colored karaoke captions, watermark delogo",
+  "source": {
+    "file": "florida_grocery_source.webm (Wikimedia Commons, FL MAN ARREST CAM / St. Johns County FL)",
+    "duration_s": 909.649,
+    "geometry": "1920x1080@30 VP9/Opus",
+    "note": "incident date on bodycam: 2025-08-28; AXON BODY 3 units X60AA277P/X60AA069L/X60AA389L/X60AA738P visible"
+  },
+  "master": {
+    "file": "st_johns_grocery_tape3_master_1080p_final.mp4",
+    "duration_s": 436.433,
+    "geometry": "1920x1080@30",
+    "bytes": 914785276,
+    "codec": "h264 + aac 48000Hz stereo, faststart"
+  },
+  "laws": {
+    "raw_share": 0.334,
+    "raw_share_floor": 0.32,
+    "raw_in_master_s": 303.4,
+    "master_duration_s": 436.427,
+    "narration_words": 434,
+    "caption_chunks": 408,
+    "caption_styles": ["Officer #FFFFFF", "Suspect #FFD84D", "Witness #7CFF9E", "Narrator #70E4FF"],
+    "chapters": ["00:00 Cold Open", "00:22 Act 1", "00:50 Act 2", "01:35 Act 3", "02:30 Act 4", "03:18 Act 5", "04:59 Act 6", "06:14 Outro"]
+  },
+  "seven_point_quality_response": {
+    "duration_raw_share": "master 7m16s; raw share 0.334 >= 0.32 law",
+    "narration_not_eustis": "owner's notebook narration texts used verbatim (fresh writing, edge-tts BrianMultilingualNeural)",
+    "blur_tracking": "yuNet per-frame face sweep (opencv_face_detection_yunet_2023mar), temporal track association (<=15f gaps interpolated), tracked 51px boxblur burned per frame - verified visually on master frames",
+    "audio_enhancement": "DeepFilterNet3 denoise + EQ (300Hz -2.5, 2.8kHz +2.5, 4.5kHz +2.0, treble 6.8kHz +2.0) + compressor + ambience bed + limiter; field chain highpass 85Hz + loudnorm -16LUFS; narration silenced+limited; profanity spans muted with 1kHz tone (3 spans)",
+    "caption_sync": "word-level events on master clock (Gladia word timestamps for field speech, faster-whisper base.en for TTS), karaoke word-opacity sync in HTML, chunked/placed per notebook two-lane rule",
+    "watermark_topleft": "Lens & Law channel watermark (owner asset lens-and-law-overlay-1920x1080-top-left.png) full-duration overlay scene, z-index above footage below captions",
+    "third_party_watermark": "FL MAN ARREST CAM / ST JOHNS COUNTY, FL delogo x=4:y=976:w=536:h=100 on every part"
+  },
+  "hyperframes_project": {
+    "structure": "index.html (32 timed videos, track 1) + compositions/wm.html (watermark scene, track 2) + compositions/caps.html (408 caption groups + 2033 word-sync tweens, track 3)",
+    "check_gate": "hyperframes check --json OVERALL ok=true: lint 0 err, runtime 0 err, layout 0 err, contrast 0 err, craft 0 err (180 caption-pace warnings inherent to speech-paced captions)",
+    "render": "delivery quality, 2 workers, 13093 frames, 40m58s wall"
+  },
+  "documented_deviations": [
+    "no hflip: notebook mirrors all footage, which would land the AXON date bar on the top-left and collide with the owner-mandated top-left watermark; hflip dropped, everything else kept",
+    "1920x1080 parts instead of notebook 720p final (HyperFrames project is 1080p; source is 1080p)",
+    "block 28 (Outro raw 672.7-694.0, 21.3s plan) shipped as 7.23s: the earlier killed pack run truncated the packed asset and its source intermediates were cleaned before the truncation was detected; Wikimedia 4K re-download failed (rate-limit + corrupt resume), so the tape ships with the shorter block; captions clamped accordingly; raw share still 0.334 >= 0.32",
+    "audible profanity mute+tone added (notebook computes bleep spans but renders audio untouched)"
+  ],
+  "qa": {
+    "ffprobe": "duration 436.433s matches root data-duration 436.427s (drift 0.006s); 1920x1080@30; aac 48k stereo",
+    "audio_levels": "mean -25.2 dB, max -8.8 dB (no clipping)",
+    "decoded_frames": "13093/13093 captured, artifact validated by engine"
+  }
+}
