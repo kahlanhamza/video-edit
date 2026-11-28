@@ -74,6 +74,15 @@ ignore = ["SIM108", "B008"]
 # ffmpeg filter graphs. Re-wrapping changes bytes that already shipped and
 # passed acceptance, so line-length is relaxed for these files only.
 "scripts/postfx_v3.py" = ["E501"]
+# Tape 3 (HyperFrames) pipeline scripts: single-line DATA literals are verified
+# content - the owner's verbatim narration plan (re-wrapping changes shipped
+# bytes), ffmpeg filter graphs, ASS style-header lines - and the scripts read
+# config/data with short one-shot open() calls. Same rationale as postfx_v3.
+"scripts/tape3_plan.py" = ["E501", "SIM115"]
+"scripts/tape3_build.py" = ["E501", "SIM115"]
+"scripts/tape3_captions.py" = ["E501", "SIM115"]
+"scripts/tape3_hf_gen.py" = ["E501", "SIM115"]
+"scripts/tape3_validate.py" = ["E501", "SIM115"]
 "scripts/agent_evals.py" = ["E501"]
 "scripts/agent_session_me.py" = ["E501"]
 "tests/unit/test_inspection_tools.py" = ["E501"]

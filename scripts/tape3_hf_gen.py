@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Generate the HyperFrames project for tape 3 (root + scenes structure)."""
-import json, os
+
+import json
+import os
 
 WORK = "/home/z/my-project/work_v2"
 PROJ = f"{WORK}/tape3_hf"
@@ -19,8 +21,10 @@ STYLE_COLOR = {
 }
 LANE_BOTTOM = {0: 69, 1: 144}
 
+
 def esc(t):
     return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
 
 # ---------- index.html ----------
 videos = []
@@ -88,7 +92,8 @@ index_html = f"""<!doctype html>
   </body>
 </html>
 """
-open(f"{PROJ}/index.html", "w").write(index_html)
+with open(f"{PROJ}/index.html", "w") as f:
+    f.write(index_html)
 
 # ---------- compositions/wm.html ----------
 wm_html = """<template>
@@ -106,7 +111,8 @@ wm_html = """<template>
 </template>
 """
 os.makedirs(f"{PROJ}/compositions", exist_ok=True)
-open(f"{PROJ}/compositions/wm.html", "w").write(wm_html)
+with open(f"{PROJ}/compositions/wm.html", "w") as f:
+    f.write(wm_html)
 
 # ---------- compositions/caps.html ----------
 groups_html = []
@@ -170,5 +176,8 @@ caps_html = f"""<template>
   </script>
 </template>
 """
-open(f"{PROJ}/compositions/caps.html", "w").write(caps_html)
-print(f"index.html: {len(videos)} videos; wm.html; caps.html: {len(groups_html)} groups, total {total}s")
+with open(f"{PROJ}/compositions/caps.html", "w") as f:
+    f.write(caps_html)
+print(
+    f"index.html: {len(videos)} videos; wm.html; caps.html: {len(groups_html)} groups, total {total}s"
+)
